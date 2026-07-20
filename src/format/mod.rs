@@ -3,9 +3,10 @@
 //! Each input format (EPUB, SRT, VTT today; txt / docx later) implements
 //! [`Document`]: it parses the file into translatable [`Segment`]s (plain
 //! text) and knows how to write translations back. The translation engine
-//! ([`crate::engine`]) is format-agnostic — with one caveat: subtitle formats
-//! set [`Document::batched`] so the engine translates their cues in contextual
-//! batches rather than independently (see [`crate::engine`]).
+//! ([`crate::engine`]) is format-agnostic — each format merely hints at a
+//! [`Strategy`] via [`Document::strategy`]: self-contained blocks (EPUB) go
+//! out one per request, while short-flow segments (subtitle cues) ride in
+//! contextual batches aligned strictly one-to-one (see [`crate::engine`]).
 
 use crate::format::epub::EpubDoc;
 use crate::format::subtitle::ass::Ass;
@@ -41,6 +42,33 @@ pub enum OutputMode {
     Replace,
 }
 
+/// How the engine translates a document's segments.
+///
+/// A format picks its default via [`Document::strategy`]. Self-contained blocks
+/// (EPUB paragraphs) translate one per request ([`Strategy::Independent`]);
+/// short segments that only make sense in the surrounding flow (subtitle cues,
+/// continuous prose) translate [`Strategy::Batched`] so the model sees context
+/// and returns exactly one translation per segment, in order — no merge/split.
+///
+/// This is a *translation strategy*, orthogonal to format grammar: a novel
+/// (block-structured like EPUB) may still prefer [`Strategy::Batched`] for
+/// cross-paragraph coherence. The CLI can override the batch parameters.
+#[derive(Clone, Copy, Debug)]
+pub enum Strategy {
+    /// One segment per request, no surrounding context. The default.
+    Independent,
+    /// Translate `batch_size` consecutive segments per request, each batch
+    /// preceded by `context` read-only segments for fluency across boundaries.
+    /// The model returns exactly one translation per segment, in order (see
+    /// [`crate::translate::translate_batch`]).
+    Batched {
+        /// Segments sent per request and aligned strictly one-to-one.
+        batch_size: usize,
+        /// Read-only preceding segments riding along for context (not emitted).
+        context: usize,
+    },
+}
+
 /// A format backend: owns the parsed document and any rewrite intermediate
 /// state, and knows how to extract translatable segments and write them back.
 pub trait Document {
@@ -63,15 +91,12 @@ pub trait Document {
         mode: OutputMode,
     ) -> Result<()>;
 
-    /// Whether this document's segments must be translated in contiguous,
-    /// context-carrying batches rather than independently. `false` (the
-    /// default) suits formats whose segments are self-contained blocks (EPUB).
-    /// Subtitle formats override to `true`: their cues are short and only make
-    /// sense in the surrounding flow, so the engine batches them behind one
-    /// prompt and aligns the result strictly one-to-one (no merge/split). See
-    /// [`crate::engine::Engine::translate_subtitles`].
-    fn batched(&self) -> bool {
-        false
+    /// The translation strategy this format prefers. Default
+    /// [`Strategy::Independent`] (self-contained blocks). Subtitle formats
+    /// override to [`Strategy::Batched`]; the CLI may override the parameters.
+    /// See [`crate::engine::Engine::translate`].
+    fn strategy(&self) -> Strategy {
+        Strategy::Independent
     }
 }
 

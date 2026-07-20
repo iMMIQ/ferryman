@@ -2,10 +2,10 @@
 //!
 //! Subtitles are NOT translated cue-by-cue: each cue is short and only makes
 //! sense in the flow around it, so sending one line per request would starve
-//! the model of context and produce disjoint output. Instead the engine
-//! ([`crate::engine::Engine::translate_subtitles`]) batches consecutive cues
-//! behind ONE prompt, and a single shared prompt + `#N` numbered-block
-//! alignment scheme (validated on Hy-MT2) guarantees a strict **one-to-one
+//! the model of context and produce disjoint output. Instead the format opts
+//! into [`crate::format::Strategy::Batched`] (see [`Document::strategy`]), and
+//! the engine batches consecutive cues behind ONE prompt with a `<cN>` delimiter
+//! alignment scheme (validated on Hy-MT2) that guarantees a strict **one-to-one
 //! correspondence**: the model returns exactly as many translations as it
 //! received, in order, never merging or splitting. See
 //! [`crate::translate::translate_batch`].
@@ -20,7 +20,7 @@
 //! grammars (ASS, LRC): override [`SubFormat::parse`] / [`SubFormat::render`]
 //! and the rest of the pipeline keeps working unchanged.
 
-use crate::format::{Document, OutputMode, Segment, SegmentId};
+use crate::format::{Document, OutputMode, Segment, SegmentId, Strategy};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
@@ -237,10 +237,14 @@ impl<F: SubFormat> Document for SubtitleDoc<F> {
         Ok(())
     }
 
-    /// Subtitles must be translated in contextual batches, not independently —
-    /// see the module docs. Signals [`crate::engine::Engine::translate_subtitles`].
-    fn batched(&self) -> bool {
-        true
+    /// Subtitles translate in contextual batches, not independently — see the
+    /// module docs. Defaults match the validated Hy-MT2 settings; the CLI may
+    /// override the parameters.
+    fn strategy(&self) -> Strategy {
+        Strategy::Batched {
+            batch_size: 25,
+            context: 5,
+        }
     }
 }
 
@@ -363,8 +367,8 @@ Second cue.
         assert_eq!(segs[0].text, "Hello world.");
         assert_eq!(segs[1].id, 3);
         assert_eq!(segs[1].text, "Second cue.");
-        // batched mode requested.
-        assert!(doc.batched());
+        // batched strategy requested.
+        assert!(matches!(doc.strategy(), Strategy::Batched { .. }));
     }
 
     #[test]

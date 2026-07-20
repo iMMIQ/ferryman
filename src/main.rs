@@ -16,7 +16,7 @@ mod translate;
 
 use crate::cache::Cache;
 use crate::engine::Engine;
-use crate::format::OutputMode;
+use crate::format::{OutputMode, Strategy};
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
@@ -362,13 +362,17 @@ async fn main() -> Result<()> {
         cli.target
     );
 
-    let out = if doc.batched() {
-        engine
-            .translate_subtitles(&segments, cli.subtitle_batch_size, cli.subtitle_context, cli.limit)
-            .await
-    } else {
-        engine.translate(&segments, cli.limit).await
+    // The format picks Independent vs Batched via its strategy(); the CLI
+    // supplies the batch parameters (size / context window) when batching is
+    // requested. Formats that stay Independent ignore them.
+    let strategy = match doc.strategy() {
+        Strategy::Independent => Strategy::Independent,
+        Strategy::Batched { .. } => Strategy::Batched {
+            batch_size: cli.subtitle_batch_size,
+            context: cli.subtitle_context,
+        },
     };
+    let out = engine.translate(&segments, strategy, cli.limit).await;
     if out.cancelled {
         eprintln!("interrupted (Ctrl-C): writing the partial output gathered so far");
     }

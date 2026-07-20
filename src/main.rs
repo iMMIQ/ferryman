@@ -15,8 +15,8 @@ mod html;
 mod translate;
 
 use crate::cache::Cache;
-use crate::engine::Engine;
-use crate::format::{OutputMode, Strategy};
+use crate::engine::{Engine, Unit};
+use crate::format::{Document, OutputMode, Segment, SegmentId, Strategy};
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -351,79 +351,80 @@ fn resolve_output(input: &Path, in_place: bool, explicit: Option<&Path>) -> Path
     }
 }
 
-/// Per-file translation knobs, resolved once from the CLI and reused across the
-/// batch (keeps [`translate_file`] under clippy's argument-count threshold).
-struct TranslateOpts {
-    batch_size: usize,
-    context: usize,
-    mode: OutputMode,
-    limit: Option<usize>,
-}
-
-/// Outcome of translating one file (for the batch summary).
-struct FileOutcome {
-    cancelled: bool,
-}
-
-/// Open, translate, and write a single file. A file-level failure (can't open /
-/// write) returns `Err` so the caller can skip it without aborting the batch;
-/// block-level translation failures stay inside ([`Engine`] counts them, never
-/// errors). On Ctrl-C it writes the partial output and returns `cancelled`.
-async fn translate_file(
-    engine: &Engine,
-    input: &Path,
-    out_path: &Path,
+/// One opened input file awaiting its (post-drain) write.
+struct FileSlot {
+    doc: Box<dyn Document>,
+    out_path: PathBuf,
     in_place: bool,
-    opts: &TranslateOpts,
-) -> Result<FileOutcome> {
-    let mut doc = format::open(input, None)
-        .with_context(|| format!("open {}", input.display()))?;
-    let segments = doc.segments();
-    eprintln!(
-        "\n{}: {} block(s) -> {} [{}]",
-        input.display(),
-        segments.len(),
-        out_path.display(),
-        doc.format_name()
-    );
+    input: PathBuf,
+}
 
-    // The format picks Independent vs Batched via its strategy(); the CLI
-    // supplies the batch parameters when batching is requested.
-    let strategy = match doc.strategy() {
-        Strategy::Independent => Strategy::Independent,
-        Strategy::Batched { .. } => Strategy::Batched {
-            batch_size: opts.batch_size,
-            context: opts.context,
-        },
-    };
-    let out = engine.translate(&segments, strategy, opts.limit).await;
-    if out.cancelled {
-        eprintln!("interrupted (Ctrl-C): writing the partial output gathered so far");
+/// Turn a file's segments into self-contained [`Unit`]s for the shared pool.
+///
+/// `Independent` → one [`Unit::Single`] per segment; `Batched` → contiguous
+/// batches of `batch_size` cues, each carrying `context` read-only preceding
+/// cues (same file, in order). `budget` is the global `--limit`: each emitted
+/// segment decrements it, and the last batch of a Batched file is shrunk to fit
+/// (the `<cN>` delimiter scheme is count-agnostic, so a short final batch is
+/// fine). When the budget hits zero the file stops emitting — so `--limit` caps
+/// the whole batch, not each file.
+fn build_units(
+    file: usize,
+    segments: &[Segment],
+    strategy: Strategy,
+    budget: &mut Option<usize>,
+) -> Vec<Unit> {
+    /// How many of `want` segments the budget still allows, decrementing it.
+    fn allow(budget: &mut Option<usize>, want: usize) -> usize {
+        match budget {
+            Some(b) => {
+                let c = want.min(*b);
+                *b -= c;
+                c
+            }
+            None => want,
+        }
     }
 
-    // In-place writes a sibling temp first, then atomically renames over the
-    // original — a crash mid-write can't truncate the source.
-    let write_target = if in_place {
-        inplace_temp(out_path)
-    } else {
-        out_path.to_path_buf()
-    };
-    doc.write(&out.translations, &write_target, opts.mode)
-        .with_context(|| format!("write {}", write_target.display()))?;
-    if in_place {
-        std::fs::rename(&write_target, out_path)
-            .with_context(|| format!("rename into place {}", out_path.display()))?;
+    let mut units = Vec::new();
+    match strategy {
+        Strategy::Independent => {
+            for seg in segments {
+                if allow(budget, 1) == 0 {
+                    break;
+                }
+                units.push(Unit::Single {
+                    file,
+                    id: seg.id,
+                    text: seg.text.clone(),
+                });
+            }
+        }
+        Strategy::Batched { batch_size, context } => {
+            let batch_size = batch_size.max(1); // guard against a nonsensical 0.
+            let mut i = 0;
+            while i < segments.len() {
+                let want = batch_size.min(segments.len() - i);
+                let n = allow(budget, want);
+                if n == 0 {
+                    break;
+                }
+                let end = i + n;
+                let ctx_start = i.saturating_sub(context);
+                units.push(Unit::Batch {
+                    file,
+                    ids: segments[i..end].iter().map(|s| s.id).collect(),
+                    cues: segments[i..end].iter().map(|s| s.text.clone()).collect(),
+                    context: segments[ctx_start..i]
+                        .iter()
+                        .map(|s| s.text.clone())
+                        .collect(),
+                });
+                i = end;
+            }
+        }
     }
-
-    eprintln!(
-        "done: {} translated, {} failed -> {}",
-        out.translated,
-        out.failed,
-        out_path.display()
-    );
-    Ok(FileOutcome {
-        cancelled: out.cancelled,
-    })
+    units
 }
 
 #[tokio::main]
@@ -538,46 +539,273 @@ async fn main() -> Result<()> {
         vec![cli.input.clone()]
     };
 
-    // --- per-file loop: one file's failure never aborts the batch ---
-    // The engine (and any --serve container) are set up once above and reused
-    // across the whole batch. A Ctrl-C writes the current file's partial output
-    // and stops the batch.
-    let opts = TranslateOpts {
-        batch_size: cli.subtitle_batch_size,
-        context: cli.subtitle_context,
-        mode: cli.mode,
-        limit: cli.limit,
-    };
-    let mut ok = 0usize;
-    let mut failed_files: Vec<(PathBuf, String)> = Vec::new();
-    let mut cancelled = false;
+    // --- open every file, build a flat shared work pool ---
+    // Each file's segments become self-contained Units (Independent => one
+    // Single per segment; Batched => batches with in-file context). All units
+    // across all files drain through ONE concurrency pool in engine.run, so
+    // small files and file tails no longer leave the GPU idle. A file that
+    // fails to open is logged and skipped, never aborting the batch.
+    let mut slots: Vec<FileSlot> = Vec::new();
+    let mut units: Vec<Unit> = Vec::new();
+    let mut budget = cli.limit; // global cap across the whole batch (None = unlimited).
+    let mut open_failed: Vec<(PathBuf, String)> = Vec::new();
     for input in &inputs {
-        let out_path = resolve_output(input, cli.in_place, cli.output.as_deref());
-        match translate_file(&engine, input, &out_path, cli.in_place, &opts).await {
-            Ok(fo) => {
-                ok += 1;
-                if fo.cancelled {
-                    cancelled = true;
-                    break;
+        let doc = match format::open(input, None) {
+            Ok(d) => d,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                eprintln!("error: open {}: {} — skipping", input.display(), msg);
+                open_failed.push((input.clone(), msg));
+                continue;
+            }
+        };
+        let segments = doc.segments();
+        eprintln!(
+            "{}: {} block(s) [{}]",
+            input.display(),
+            segments.len(),
+            doc.format_name()
+        );
+        // Format picks Independent vs Batched; the CLI supplies batch params.
+        let strategy = match doc.strategy() {
+            Strategy::Independent => Strategy::Independent,
+            Strategy::Batched { .. } => Strategy::Batched {
+                batch_size: cli.subtitle_batch_size,
+                context: cli.subtitle_context,
+            },
+        };
+        let file_idx = slots.len();
+        units.extend(build_units(file_idx, &segments, strategy, &mut budget));
+        slots.push(FileSlot {
+            doc,
+            out_path: resolve_output(input, cli.in_place, cli.output.as_deref()),
+            in_place: cli.in_place,
+            input: input.clone(),
+        });
+    }
+
+    // --- drain the whole batch through one shared concurrency pool ---
+    let total_segments: usize = units.iter().map(Unit::attempted).sum();
+    eprintln!(
+        "batch: {} file(s), {} unit(s), {} segment(s)",
+        slots.len(),
+        units.len(),
+        total_segments
+    );
+    let run_out = engine.run(units, total_segments).await;
+
+    // --- partition results per file, write each (post-drain) ---
+    // Writes happen after the drain (not progressively): the old per-file loop
+    // already drained-then-wrote each file, so collapsing N (drain+write) pairs
+    // into one drain + one write phase is wall-clock-neutral and keeps the drain
+    // free of write stalls. Subset semantics (missing ids => unchanged) handle
+    // partial / Ctrl-C output. A write failure is logged and skipped.
+    let mut per_file: Vec<Vec<(SegmentId, String)>> = vec![Vec::new(); slots.len()];
+    for ud in run_out.done {
+        if let Some(slot) = per_file.get_mut(ud.file) {
+            slot.extend(ud.pairs);
+        }
+    }
+    for pairs in per_file.iter_mut() {
+        pairs.sort_by_key(|(id, _)| *id);
+    }
+
+    let mut ok = 0usize;
+    let mut write_failed: Vec<(PathBuf, String)> = Vec::new();
+    for (i, slot) in slots.iter_mut().enumerate() {
+        let pairs = &per_file[i];
+        let write_target = if slot.in_place {
+            inplace_temp(&slot.out_path)
+        } else {
+            slot.out_path.clone()
+        };
+        match slot.doc.write(pairs, &write_target, cli.mode) {
+            Ok(()) => {
+                if slot.in_place {
+                    if let Err(e) = std::fs::rename(&write_target, &slot.out_path) {
+                        let msg = format!("rename into place {}: {}", slot.out_path.display(), e);
+                        eprintln!("error: {}", msg);
+                        write_failed.push((slot.input.clone(), msg));
+                        continue;
+                    }
                 }
+                eprintln!(
+                    "wrote: {} ({} block(s) translated){}",
+                    slot.out_path.display(),
+                    pairs.len(),
+                    if run_out.cancelled { " [partial]" } else { "" }
+                );
+                ok += 1;
             }
             Err(e) => {
                 let msg = format!("{e:#}");
-                eprintln!("error: {} — skipping", msg);
-                failed_files.push((input.clone(), msg));
+                eprintln!("error: write {}: {} — skipping", slot.out_path.display(), msg);
+                write_failed.push((slot.input.clone(), msg));
             }
         }
     }
 
     // --- batch summary ---
+    let failed_files = open_failed.len() + write_failed.len();
     eprintln!(
-        "\nbatch: {} file(s) ok, {} failed{}",
+        "\nbatch: {} file(s) ok, {} failed; {} segment(s) translated, {} failed{}",
         ok,
-        failed_files.len(),
-        if cancelled { " (interrupted)" } else { "" }
+        failed_files,
+        run_out.translated,
+        run_out.failed,
+        if run_out.cancelled { " (interrupted)" } else { "" }
     );
-    for (p, m) in &failed_files {
+    for (p, m) in open_failed.iter().chain(write_failed.iter()) {
         eprintln!("  failed: {} ({})", p.display(), m);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seg(id: usize, text: &str) -> Segment {
+        Segment {
+            id,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn independent_emits_one_single_per_segment() {
+        let segs = vec![seg(0, "a"), seg(1, "b"), seg(2, "c")];
+        let units = build_units(7, &segs, Strategy::Independent, &mut None);
+        assert_eq!(units.len(), 3);
+        assert!(units
+            .iter()
+            .all(|u| matches!(u, Unit::Single { file: 7, .. })));
+        let ids: Vec<_> = units
+            .iter()
+            .map(|u| match u {
+                Unit::Single { id, .. } => *id,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn batched_slices_into_batches_with_context() {
+        // batch_size 2, context 1, 5 segments -> batches of 2,2,1.
+        let segs = vec![
+            seg(0, "a"),
+            seg(1, "b"),
+            seg(2, "c"),
+            seg(3, "d"),
+            seg(4, "e"),
+        ];
+        let units = build_units(
+            0,
+            &segs,
+            Strategy::Batched {
+                batch_size: 2,
+                context: 1,
+            },
+            &mut None,
+        );
+        assert_eq!(units.len(), 3);
+        // batch 0 (starts at i=0): cues a,b; context = segs[0..0] = none.
+        match &units[0] {
+            Unit::Batch { ids, cues, context, .. } => {
+                assert_eq!(*ids, vec![0, 1]);
+                assert_eq!(*cues, vec!["a".to_string(), "b".to_string()]);
+                assert!(context.is_empty());
+            }
+            _ => panic!("expected Batch"),
+        }
+        // batch 1 (starts at i=2): cues c,d; context = segs[1..2] = [b].
+        match &units[1] {
+            Unit::Batch { cues, context, .. } => {
+                assert_eq!(*cues, vec!["c".to_string(), "d".to_string()]);
+                assert_eq!(*context, vec!["b".to_string()]);
+            }
+            _ => panic!("expected Batch"),
+        }
+        // batch 2 (starts at i=4): shrunk to cue e; context = segs[3..4] = [d].
+        match &units[2] {
+            Unit::Batch { cues, context, .. } => {
+                assert_eq!(*cues, vec!["e".to_string()]);
+                assert_eq!(*context, vec!["d".to_string()]);
+            }
+            _ => panic!("expected Batch"),
+        }
+    }
+
+    #[test]
+    fn limit_shrinks_last_batch_to_fit() {
+        // batch_size 25, limit 3 -> a single batch of 3 (not 25).
+        let segs: Vec<_> = (0..10).map(|i| seg(i, "x")).collect();
+        let units = build_units(
+            0,
+            &segs,
+            Strategy::Batched {
+                batch_size: 25,
+                context: 5,
+            },
+            &mut Some(3),
+        );
+        assert_eq!(units.len(), 1);
+        match &units[0] {
+            Unit::Batch { cues, .. } => assert_eq!(cues.len(), 3),
+            _ => panic!("expected Batch"),
+        }
+    }
+
+    #[test]
+    fn limit_caps_total_across_independent() {
+        let segs: Vec<_> = (0..5).map(|i| seg(i, "x")).collect();
+        let units = build_units(0, &segs, Strategy::Independent, &mut Some(2));
+        assert_eq!(units.len(), 2);
+    }
+
+    #[test]
+    fn empty_segments_emit_nothing() {
+        let units = build_units(
+            0,
+            &[],
+            Strategy::Batched {
+                batch_size: 25,
+                context: 5,
+            },
+            &mut None,
+        );
+        assert!(units.is_empty());
+        let units = build_units(0, &[], Strategy::Independent, &mut None);
+        assert!(units.is_empty());
+    }
+
+    #[test]
+    fn budget_shared_across_files() {
+        // Two files sharing one global budget (mirrors main's loop): file 0
+        // consumes all 3, file 1 gets nothing.
+        let segs: Vec<_> = (0..5).map(|i| seg(i, "x")).collect();
+        let mut budget = Some(3);
+        let u1 = build_units(0, &segs, Strategy::Independent, &mut budget);
+        let u2 = build_units(1, &segs, Strategy::Independent, &mut budget);
+        assert_eq!(u1.len(), 3);
+        assert_eq!(u2.len(), 0);
+        assert_eq!(budget, Some(0));
+    }
+
+    #[test]
+    fn attempted_sums_to_segment_count() {
+        let segs: Vec<_> = (0..5).map(|i| seg(i, "x")).collect();
+        let units = build_units(
+            0,
+            &segs,
+            Strategy::Batched {
+                batch_size: 2,
+                context: 0,
+            },
+            &mut None,
+        );
+        let total: usize = units.iter().map(Unit::attempted).sum();
+        assert_eq!(total, 5);
+    }
 }

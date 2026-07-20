@@ -1,36 +1,36 @@
-//! Format-agnostic translation engine.
+//! Format-agnostic translation engine — one shared concurrency pool.
 //!
-//! Takes a flat list of [`Segment`]s and translates them concurrently via the
-//! LLM, with a progress bar and a global `--limit`. Extracted from `main` so
-//! adding a new format needs no change here — the engine only ever sees plain
-//! text, plus a [`Strategy`] telling it how to batch the work.
+//! The caller ([`crate::main`]) turns every input file's segments into
+//! self-contained [`Unit`]s (an Independent segment → [`Unit::Single`]; a
+//! Batched slice → [`Unit::Batch`] carrying its own in-file context) and hands
+//! the whole flattened batch to [`Engine::run`]. All units — across every file
+//! — drain through **one** `buffer_unordered(concurrency)` pool, so small files
+//! and file tails no longer leave the GPU idle the way a per-file loop does.
 //!
 //! - **Concurrency** is bounded by [`StreamExt::buffer_unordered`] (no separate
 //!   `Semaphore`): only `concurrency` requests are in flight at once, and
-//!   completed results stream in as soon as they're ready instead of waiting
-//!   on the whole batch.
+//!   completed results stream in as soon as they're ready.
 //! - **Caching**: translations are persisted on disk ([`crate::cache::Cache`])
 //!   so re-runs skip already-translated blocks and a Ctrl-C'd run keeps every
 //!   block that finished. Cache hits are short-circuited before any HTTP call.
-//! - **Cancellation**: Ctrl-C stops dispatching new requests, drops the few
-//!   in-flight HTTP futures, and returns a partial [`EngineOut`] so `main` can
+//! - **Cancellation**: Ctrl-C stops dispatching new units, drops the few
+//!   in-flight HTTP futures, and returns a partial [`RunOut`] so `main` can
 //!   still write what completed.
 //!
-//! ## One method, two strategies
+//! ## Why the caller builds units
 //!
-//! [`Engine::translate`] handles both [`Strategy::Independent`] (one segment per
-//! request, via [`translate::translate`]) and [`Strategy::Batched`] (N segments
-//! per request with context, via [`translate::translate_batch`]). The two paths
-//! share one drain loop, cache, and Ctrl-C race; only the per-item future and
-//! the request shape differ. Batching is a translation strategy orthogonal to
-//! format grammar — any format may opt in via [`crate::format::Document::strategy`].
+//! A unit is self-contained — [`translate::translate`] (one segment) and
+//! [`translate::translate_batch`] (N cues + read-only context) are stateless
+//! borrowed calls with no cross-unit dependency. The only batching constraint
+//! is *within* a file (a batch's context is the same file's preceding cues), so
+//! the caller builds per-file units and flattens them; the engine stays a dumb
+//! executor that knows nothing about files, formats, or strategies.
 
 use crate::cache::Cache;
-use crate::format::{Segment, SegmentId, Strategy};
+use crate::format::SegmentId;
 use crate::translate;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::pin::Pin;
 
 pub struct Engine {
     client: reqwest::Client,
@@ -41,28 +41,66 @@ pub struct Engine {
     cache: Option<Cache>,
 }
 
-/// Outcome of an [`Engine::translate`] run.
-pub struct EngineOut {
-    /// `(segment_id, translation)` for every segment that succeeded, sorted by
-    /// id (the stream completes out of order; `Document::write` is order-
-    /// independent but a sorted output stays diff-stable across runs).
-    pub translations: Vec<(SegmentId, String)>,
-    /// Count of segments translated successfully (including cache hits).
-    pub translated: usize,
-    /// Count of segments whose translation failed (already logged).
-    pub failed: usize,
-    /// True if the run was interrupted by Ctrl-C. `translations` then holds the
-    /// partial set; `main` still writes it so completed work isn't lost.
-    pub cancelled: bool,
+/// One self-contained unit of translation work. The caller tags each with its
+/// file index so results can be routed back; the engine never inspects `file`.
+#[derive(Clone, Debug)]
+pub enum Unit {
+    /// One Independent segment → one `translate()` call.
+    Single {
+        file: usize,
+        id: SegmentId,
+        text: String,
+    },
+    /// One Batched slice → one `translate_batch()` call. `context` is read-only
+    /// preceding cues from the same file (not translated, not emitted).
+    Batch {
+        file: usize,
+        ids: Vec<SegmentId>,
+        cues: Vec<String>,
+        context: Vec<String>,
+    },
 }
 
-/// One dispatched unit of work, normalized across strategies: `attempted`
-/// segments went out, `pairs` came back translated. An Independent item has
-/// `attempted == 1`; a Batched request has `attempted == N`. The drain loop
-/// only needs these two counts — `failed += attempted - pairs.len()`.
-struct ItemOutcome {
-    attempted: usize,
-    pairs: Vec<(SegmentId, String)>,
+impl Unit {
+    /// How many segments this unit attempts (1 for Single, `cues.len()` for
+    /// Batch). The drain loop advances the progress bar by this much.
+    pub fn attempted(&self) -> usize {
+        match self {
+            Unit::Single { .. } => 1,
+            Unit::Batch { cues, .. } => cues.len(),
+        }
+    }
+
+    fn file(&self) -> usize {
+        match self {
+            Unit::Single { file, .. } | Unit::Batch { file, .. } => *file,
+        }
+    }
+}
+
+/// Outcome of executing one [`Unit`]: `attempted` segments went out, `pairs`
+/// came back translated. A Single has `attempted == 1`; a Batch has
+/// `attempted == cues.len()`. The gap is the failed/skipped count.
+#[derive(Debug)]
+pub struct UnitDone {
+    pub file: usize,
+    pub attempted: usize,
+    pub pairs: Vec<(SegmentId, String)>,
+}
+
+/// Outcome of [`Engine::run`]. `done` is in **completion order** (the stream
+/// completes out of order); the caller partitions by `file` and sorts each
+/// file's pairs by id for a diff-stable write.
+#[derive(Debug)]
+pub struct RunOut {
+    pub done: Vec<UnitDone>,
+    /// Count of segments translated successfully (including cache hits).
+    pub translated: usize,
+    /// Count of segments whose translation failed (already logged per unit).
+    pub failed: usize,
+    /// True if the run was interrupted by Ctrl-C. `done` then holds the partial
+    /// set; `main` still writes it so completed work isn't lost.
+    pub cancelled: bool,
 }
 
 impl Engine {
@@ -84,39 +122,132 @@ impl Engine {
         }
     }
 
-    /// Translate `segments` per `strategy`.
-    ///
-    /// [`Strategy::Independent`] sends one segment per request (self-contained
-    /// blocks, e.g. EPUB paragraphs); [`Strategy::Batched`] sends `batch_size`
-    /// consecutive segments per request, each preceded by `context` read-only
-    /// segments, and aligns the result strictly one-to-one (subtitle cues,
-    /// continuous prose). `limit` caps the total translated (applied by
-    /// truncating before fan-out; cache hits consume the budget just like
-    /// misses).
-    ///
-    /// Single failures are logged and counted, never bubbled — one bad block
-    /// can't abort the run. On Ctrl-C the run stops early and returns the
-    /// partial result with [`EngineOut::cancelled`] set.
-    ///
-    /// Both strategies share one concurrency bound, one cache, one Ctrl-C race,
-    /// and one drain loop; only the per-item future differs. The two stream
-    /// sources are boxed behind a common `dyn Stream<Item = ItemOutcome>` so
-    /// the drain is unified — a single heap allocation, negligible next to the
-    /// HTTP work each item drives.
-    pub async fn translate(
-        &self,
-        segments: &[Segment],
-        strategy: Strategy,
-        limit: Option<usize>,
-    ) -> EngineOut {
-        // --limit takes the first N segments in document order regardless of
-        // cache hit/miss.
-        let work: &[Segment] = match limit {
-            Some(n) => &segments[..n.min(segments.len())],
-            None => segments,
-        };
+    /// Execute one [`Unit`]: cache fast-path, then `translate`/`translate_batch`,
+    /// caching the wins. Never returns `Err` — a single segment or batch failure
+    /// is logged and counted (empty `pairs`), never bubbled, so one bad unit
+    /// can't abort the batch.
+    async fn exec_unit(&self, unit: Unit) -> UnitDone {
+        let client = &self.client;
+        let endpoint = &self.endpoint;
+        let model = &self.model;
+        let target = &self.target;
+        let cache = &self.cache;
+        let file = unit.file();
 
-        let pb = ProgressBar::new(work.len() as u64);
+        match unit {
+            // Independent: one segment per request, cache checked and filled
+            // around a single translate() call.
+            Unit::Single { id, text, .. } => {
+                let key = cache.as_ref().map(|c| c.key(model, target, &text));
+                if let (Some(c), Some(k)) = (cache.as_ref(), key.as_deref()) {
+                    if let Some(v) = c.get(k) {
+                        return UnitDone {
+                            file,
+                            attempted: 1,
+                            pairs: vec![(id, v)],
+                        };
+                    }
+                }
+                match translate::translate(client, endpoint, model, &text, target).await {
+                    Ok(tr) => {
+                        // Put before returning: even if the future is dropped
+                        // right after (Ctrl-C between completion and drain),
+                        // the next run finds the cache populated.
+                        if let (Some(c), Some(k)) = (cache.as_ref(), key.as_deref()) {
+                            c.put(k, &tr);
+                        }
+                        UnitDone {
+                            file,
+                            attempted: 1,
+                            pairs: vec![(id, tr)],
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warn: segment {} failed: {}", id, e);
+                        UnitDone {
+                            file,
+                            attempted: 1,
+                            pairs: vec![],
+                        }
+                    }
+                }
+            }
+
+            // Batched: N cues per request with read-only context. An all-cached
+            // fast path skips the HTTP round-trip; otherwise translate_batch
+            // returns one Option per cue (Some = done, None = the model
+            // skipped/failed that cue, kept original by the writer). A partial
+            // batch still yields every cue it could — one degenerate cue costs
+            // only itself.
+            Unit::Batch {
+                ids, cues, context, ..
+            } => {
+                let n = cues.len();
+                if n == 0 {
+                    return UnitDone {
+                        file,
+                        attempted: 0,
+                        pairs: vec![],
+                    };
+                }
+                let cue_refs: Vec<&str> = cues.iter().map(|s| s.as_str()).collect();
+                let ctx_refs: Vec<&str> = context.iter().map(|s| s.as_str()).collect();
+                // Per-cue cache keys (shared by the get fast-path and the put).
+                let keys: Vec<Option<String>> = cue_refs
+                    .iter()
+                    .map(|t| cache.as_ref().map(|c| c.key(model, target, t)))
+                    .collect();
+
+                // All-cached fast path: skip the HTTP round-trip entirely.
+                let cached: Vec<Option<String>> = keys
+                    .iter()
+                    .map(|k| k.as_deref().and_then(|kk| cache.as_ref().and_then(|c| c.get(kk))))
+                    .collect();
+                if cached.iter().all(|v| v.is_some()) {
+                    let pairs = ids
+                        .into_iter()
+                        .zip(cached.into_iter().map(|v| v.unwrap()))
+                        .collect();
+                    return UnitDone {
+                        file,
+                        attempted: n,
+                        pairs,
+                    };
+                }
+
+                let trs =
+                    translate::translate_batch(client, endpoint, model, &cue_refs, &ctx_refs, target)
+                        .await;
+                let mut pairs = Vec::with_capacity(n);
+                for idx in 0..n {
+                    if let Some(tr) = &trs[idx] {
+                        if let (Some(c), Some(k)) = (cache.as_ref(), keys[idx].as_deref()) {
+                            c.put(k, tr);
+                        }
+                        pairs.push((ids[idx], tr.clone()));
+                    }
+                }
+                UnitDone {
+                    file,
+                    attempted: n,
+                    pairs,
+                }
+            }
+        }
+    }
+
+    /// Drain `units` through one shared concurrency pool with one progress bar
+    /// and one Ctrl-C race, returning every completed [`UnitDone`] (in
+    /// completion order — the caller partitions by `file` and sorts).
+    ///
+    /// `total_segments` is the post-`--limit` sum of [`Unit::attempted`] across
+    /// all units, so the progress bar reaches 100%. Single failures are logged
+    /// and counted inside [`exec_unit`], never bubbled. On Ctrl-C the run stops
+    /// early and returns the partial result with [`RunOut::cancelled`] set;
+    /// every completed translation is already on disk via the cache, so a re-run
+    /// picks up where it left off.
+    pub async fn run(&self, units: Vec<Unit>, total_segments: usize) -> RunOut {
+        let pb = ProgressBar::new(total_segments as u64);
         pb.set_style(
             ProgressStyle::with_template(
                 "  [{bar:20.cyan/blue}] {pos}/{len} ({elapsed}) {msg}",
@@ -124,165 +255,24 @@ impl Engine {
             .unwrap()
             .progress_chars("=>-"),
         );
-        pb.set_message(format!("translating {} segment(s)", work.len()));
+        pb.set_message(format!(
+            "translating {} segment(s) in {} unit(s)",
+            total_segments,
+            units.len()
+        ));
 
-        // Borrow &self once; the per-item closures capture these by ref, so
-        // endpoint/model/target are never cloned per segment.
-        let client = &self.client;
-        let endpoint = &self.endpoint;
-        let model = &self.model;
-        let target = &self.target;
-        let cache = &self.cache;
+        let mut stream = stream::iter(units)
+            .map(|u| self.exec_unit(u))
+            .buffer_unordered(self.concurrency);
 
-        let mut stream: Pin<Box<dyn stream::Stream<Item = ItemOutcome> + Send>> = match strategy {
-            Strategy::Independent => Box::pin(
-                stream::iter(work.iter())
-                    .map(|seg| {
-                        let text = &seg.text;
-                        // Hash once; shared by the get() and put() below.
-                        let key = cache.as_ref().map(|c| c.key(model, target, text));
-                        async move {
-                            // Cache hit short-circuit — no HTTP, no slot held beyond µs.
-                            if let (Some(c), Some(k)) = (cache.as_ref(), key.as_deref()) {
-                                if let Some(v) = c.get(k) {
-                                    return ItemOutcome {
-                                        attempted: 1,
-                                        pairs: vec![(seg.id, v)],
-                                    };
-                                }
-                            }
-                            match translate::translate(client, endpoint, model, text, target).await {
-                                Ok(tr) => {
-                                    // Put before returning: even if the future is
-                                    // dropped right after (Ctrl-C between completion
-                                    // and drain), the next run finds the cache
-                                    // populated.
-                                    if let (Some(c), Some(k)) = (cache.as_ref(), key.as_deref()) {
-                                        c.put(k, &tr);
-                                    }
-                                    ItemOutcome {
-                                        attempted: 1,
-                                        pairs: vec![(seg.id, tr)],
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("warn: segment {} failed: {}", seg.id, e);
-                                    ItemOutcome {
-                                        attempted: 1,
-                                        pairs: vec![],
-                                    }
-                                }
-                            }
-                        }
-                    })
-                    .buffer_unordered(self.concurrency),
-            ),
-            Strategy::Batched {
-                batch_size,
-                context,
-            } => {
-                let batch_size = batch_size.max(1); // guard against a nonsensical 0.
-
-                // Slice the work into contiguous batches. Each batch carries its
-                // own context = the `context` segments immediately preceding it
-                // (from `work`), kept separate so the model sees continuity
-                // without those lines being numbered, translated, or counted.
-                struct Batch {
-                    ids: Vec<SegmentId>,
-                    cues: Vec<String>,
-                    context: Vec<String>,
-                }
-                let mut batches: Vec<Batch> = Vec::new();
-                let mut i = 0;
-                while i < work.len() {
-                    let end = (i + batch_size).min(work.len());
-                    let ctx_start = i.saturating_sub(context);
-                    batches.push(Batch {
-                        ids: work[i..end].iter().map(|s| s.id).collect(),
-                        cues: work[i..end].iter().map(|s| s.text.clone()).collect(),
-                        context: work[ctx_start..i].iter().map(|s| s.text.clone()).collect(),
-                    });
-                    i = end;
-                }
-                pb.set_message(format!(
-                    "translating {} segment(s) in {} batch(es)",
-                    work.len(),
-                    batches.len()
-                ));
-
-                Box::pin(
-                    stream::iter(batches)
-                        .map(|b| {
-                            let n = b.cues.len();
-                            async move {
-                                // References live inside the block so they borrow the moved `b`.
-                                let cue_refs: Vec<&str> = b.cues.iter().map(|s| s.as_str()).collect();
-                                let ctx_refs: Vec<&str> =
-                                    b.context.iter().map(|s| s.as_str()).collect();
-                                // Per-cue cache keys (shared by the get fast-path and the put).
-                                let keys: Vec<Option<String>> = cue_refs
-                                    .iter()
-                                    .map(|t| cache.as_ref().map(|c| c.key(model, target, t)))
-                                    .collect();
-
-                                // All-cached fast path: skip the HTTP round-trip entirely.
-                                let cached: Vec<Option<String>> = keys
-                                    .iter()
-                                    .map(|k| {
-                                        k.as_deref()
-                                            .and_then(|kk| cache.as_ref().and_then(|c| c.get(kk)))
-                                    })
-                                    .collect();
-                                if cached.iter().all(|v| v.is_some()) {
-                                    let pairs = b
-                                        .ids
-                                        .into_iter()
-                                        .zip(cached.into_iter().map(|v| v.unwrap()))
-                                        .collect();
-                                    return ItemOutcome {
-                                        attempted: n,
-                                        pairs,
-                                    };
-                                }
-
-                                // translate_batch returns one Option per cue: Some = done,
-                                // None = the model skipped/failed that cue (kept original by
-                                // the writer). Cache the wins; a partial batch still yields
-                                // every cue it could — one degenerate cue costs only itself.
-                                let trs = translate::translate_batch(
-                                    client, endpoint, model, &cue_refs, &ctx_refs, target,
-                                )
-                                .await;
-                                let mut pairs = Vec::with_capacity(n);
-                                for idx in 0..n {
-                                    if let Some(tr) = &trs[idx] {
-                                        if let (Some(c), Some(k)) =
-                                            (cache.as_ref(), keys[idx].as_deref())
-                                        {
-                                            c.put(k, tr);
-                                        }
-                                        pairs.push((b.ids[idx], tr.clone()));
-                                    }
-                                }
-                                ItemOutcome {
-                                    attempted: n,
-                                    pairs,
-                                }
-                            }
-                        })
-                        .buffer_unordered(self.concurrency),
-                )
-            }
-        };
-
-        let mut translations = Vec::new();
+        let mut done = Vec::new();
         let mut translated = 0usize;
         let mut failed = 0usize;
         let mut cancelled = false;
 
         // Race the drain loop against Ctrl-C. On signal we stop dispatching new
-        // requests, drop the stream (cancelling the few in-flight HTTP futures —
-        // a dropped reqwest future closes its connection), and return partial.
+        // units, drop the stream (cancelling the few in-flight HTTP futures — a
+        // dropped reqwest future closes its connection), and return partial.
         let cancel = tokio::signal::ctrl_c();
         tokio::pin!(cancel);
 
@@ -296,14 +286,13 @@ impl Engine {
                 }
                 item = stream.next() => match item {
                     None => break,
-                    // `attempted` went out; `pairs` came back. The gap (attempted
-                    // - pairs.len()) is the failed/skipped count — one degenerate
-                    // cue in a batch costs only itself, never the whole batch.
+                    // `attempted` went out; `pairs` came back. The gap
+                    // (attempted - pairs.len()) is the failed/skipped count.
                     Some(out) => {
                         translated += out.pairs.len();
                         failed += out.attempted - out.pairs.len();
-                        translations.extend(out.pairs);
                         pb.inc(out.attempted as u64);
+                        done.push(out);
                     }
                 }
             }
@@ -311,10 +300,8 @@ impl Engine {
         drop(stream);
         pb.finish_and_clear();
 
-        // Items complete out of order; sort for stable diffs.
-        translations.sort_by_key(|(id, _)| *id);
-        EngineOut {
-            translations,
+        RunOut {
+            done,
             translated,
             failed,
             cancelled,

@@ -99,7 +99,7 @@ pub trait Document {
     /// The translation strategy this format prefers. Default
     /// [`Strategy::Independent`] (self-contained blocks). Subtitle formats
     /// override to [`Strategy::Batched`]; the CLI may override the parameters.
-    /// See [`crate::engine::Engine::translate`].
+    /// See [`crate::engine::Engine::run`].
     fn strategy(&self) -> Strategy {
         Strategy::Independent
     }
@@ -148,7 +148,7 @@ impl Format {
 /// Open a document, dispatching on extension (or an explicit `hint`). This is
 /// the only place a new format needs wiring up: add a [`Format`] variant, an
 /// arm here, and the backend file.
-pub fn open(path: &Path, hint: Option<Format>) -> Result<Box<dyn Document>> {
+pub fn open(path: &Path, hint: Option<Format>) -> Result<Box<dyn Document + Send>> {
     let fmt = match hint {
         Some(f) => f,
         None => Format::from_path(path)?,

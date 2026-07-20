@@ -1,12 +1,17 @@
-//! ferryman — translate a document into bilingual (original + translation)
+//! ferryman — translate documents into bilingual (original + translation)
 //! output via a vLLM-served model. EPUB, SRT, VTT, ASS, LRC, TXT and MD ship
 //! today; docx is planned — plug a new format into `src/format/` and it just works.
 //!
 //! The original formatting is preserved byte-for-byte (via lol_html for EPUB;
 //! cue timing/structure is preserved verbatim for subtitles); after each
 //! translated block a styled sibling carrying the translation is inserted.
+//!
+//! A single file or a whole directory goes through [`batch::run_batch`]: one
+//! shared concurrency pool, files opened lazily and written the moment they
+//! finish — so memory tracks the files *in flight*, not the size of the input.
 
 mod archive;
+mod batch;
 mod cache;
 mod container;
 mod engine;
@@ -14,12 +19,13 @@ mod format;
 mod html;
 mod translate;
 
+use crate::batch::{collect_inputs, run_batch, BatchOpts, OUTPUT_SUFFIX};
 use crate::cache::Cache;
-use crate::engine::{Engine, Unit};
-use crate::format::{Document, OutputMode, Segment, SegmentId, Strategy};
-use anyhow::{Context, Result};
+use crate::engine::Engine;
+use crate::format::OutputMode;
+use anyhow::Result;
 use clap::Parser;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -31,7 +37,10 @@ struct Cli {
     /// Input file or directory. A file is translated directly (format
     /// auto-detected from the extension). A directory is walked recursively and
     /// every supported file (epub, srt, vtt, ass, lrc, txt, md) is translated;
-    /// unsupported files and ferryman's own suffixed outputs are skipped.
+    /// unsupported files and ferryman's own suffixed outputs are skipped. Files
+    /// are opened lazily and written as they finish, so memory stays bounded by
+    /// the concurrency window — for a very large EPUB library, run it in
+    /// subdirectory batches.
     #[arg(long, short = 'i')]
     input: PathBuf,
 
@@ -61,19 +70,20 @@ struct Cli {
     #[arg(long, default_value = "中文")]
     target: String,
 
-    /// Optional cap on total translated blocks (for quick testing).
+    /// Optional cap on total translated blocks across the whole batch (testing).
     #[arg(long)]
     limit: Option<usize>,
 
-    /// Subtitle cues per translation request (subtitle inputs only). Batching
-    /// keeps cross-cue context and orders the result strictly one-to-one; the
-    /// model returns one translation per cue, no merge/split. (default: 25)
+    /// Segments per translation request when a format batches (subtitles, txt,
+    /// md). Batching keeps cross-segment context and orders the result strictly
+    /// one-to-one; the model returns one translation per segment, no merge/split.
+    /// (default: 25)
     #[arg(long, default_value_t = 25)]
     subtitle_batch_size: usize,
 
-    /// Number of preceding cues sent as read-only context with each subtitle
-    /// batch (not translated, not emitted) — keeps the translation fluent
-    /// across cue boundaries. (default: 5)
+    /// Number of preceding segments sent as read-only context with each batch
+    /// (not translated, not emitted) — keeps the translation fluent across
+    /// boundaries. (default: 5)
     #[arg(long, default_value_t = 5)]
     subtitle_context: usize,
 
@@ -273,160 +283,6 @@ fn model_root() -> String {
         .unwrap_or_else(|_| "model".to_string())
 }
 
-/// Suffix inserted before the extension when neither `--output` nor `--in-place`
-/// is given: `book.epub` → `book.bilingual.epub`. Also doubles as the marker
-/// the directory walk skips, so re-running a dir doesn't retranslate its output.
-const OUTPUT_SUFFIX: &str = "bilingual";
-
-/// Recursively collect every supported, non-output file under `root`, sorted
-/// for deterministic ordering. Symlinks are skipped (avoids cycles).
-fn collect_inputs(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    visit(root, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn visit(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let meta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?;
-    if meta.is_dir() {
-        for entry in std::fs::read_dir(path)
-            .with_context(|| format!("read dir {}", path.display()))?
-        {
-            visit(&entry?.path(), out)?;
-        }
-    } else if meta.is_file() {
-        // Keep the filter in sync with supported formats via from_path, and
-        // skip our own suffixed outputs so re-running a dir doesn't retranslate
-        // them. (book.bilingual.epub → stem's last dot-segment == "bilingual".)
-        if format::Format::from_path(path).is_ok() && !is_suffix_output(path) {
-            out.push(path.to_path_buf());
-        }
-    }
-    Ok(())
-}
-
-/// Is `path` one of our suffixed outputs? The last dot-segment of the file stem
-/// equals [`OUTPUT_SUFFIX`] (`book.bilingual` → `bilingual`).
-fn is_suffix_output(path: &Path) -> bool {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .and_then(|stem| stem.rsplit('.').next())
-        .is_some_and(|last| last == OUTPUT_SUFFIX)
-}
-
-/// `book.epub` → `book.bilingual.epub` (same directory). Used when neither
-/// `--output` nor `--in-place` is given.
-fn suffix_path(path: &Path) -> PathBuf {
-    let mut name = path.file_stem().map(|s| s.to_os_string()).unwrap_or_default();
-    name.push(".");
-    name.push(OUTPUT_SUFFIX);
-    if let Some(ext) = path.extension() {
-        name.push(".");
-        name.push(ext);
-    }
-    path.with_file_name(name)
-}
-
-/// Hidden sibling temp file used for atomic in-place writes.
-fn inplace_temp(target: &Path) -> PathBuf {
-    let mut name = target
-        .file_name()
-        .map(|s| s.to_os_string())
-        .unwrap_or_default();
-    name.push(".ferryman-tmp");
-    target.with_file_name(name)
-}
-
-/// Resolve a file's output path: explicit `--output`, in-place, or a suffixed
-/// sibling next to the source.
-fn resolve_output(input: &Path, in_place: bool, explicit: Option<&Path>) -> PathBuf {
-    if in_place {
-        input.to_path_buf()
-    } else if let Some(o) = explicit {
-        o.to_path_buf()
-    } else {
-        suffix_path(input)
-    }
-}
-
-/// One opened input file awaiting its (post-drain) write.
-struct FileSlot {
-    doc: Box<dyn Document>,
-    out_path: PathBuf,
-    in_place: bool,
-    input: PathBuf,
-}
-
-/// Turn a file's segments into self-contained [`Unit`]s for the shared pool.
-///
-/// `Independent` → one [`Unit::Single`] per segment; `Batched` → contiguous
-/// batches of `batch_size` cues, each carrying `context` read-only preceding
-/// cues (same file, in order). `budget` is the global `--limit`: each emitted
-/// segment decrements it, and the last batch of a Batched file is shrunk to fit
-/// (the `<cN>` delimiter scheme is count-agnostic, so a short final batch is
-/// fine). When the budget hits zero the file stops emitting — so `--limit` caps
-/// the whole batch, not each file.
-fn build_units(
-    file: usize,
-    segments: &[Segment],
-    strategy: Strategy,
-    budget: &mut Option<usize>,
-) -> Vec<Unit> {
-    /// How many of `want` segments the budget still allows, decrementing it.
-    fn allow(budget: &mut Option<usize>, want: usize) -> usize {
-        match budget {
-            Some(b) => {
-                let c = want.min(*b);
-                *b -= c;
-                c
-            }
-            None => want,
-        }
-    }
-
-    let mut units = Vec::new();
-    match strategy {
-        Strategy::Independent => {
-            for seg in segments {
-                if allow(budget, 1) == 0 {
-                    break;
-                }
-                units.push(Unit::Single {
-                    file,
-                    id: seg.id,
-                    text: seg.text.clone(),
-                });
-            }
-        }
-        Strategy::Batched { batch_size, context } => {
-            let batch_size = batch_size.max(1); // guard against a nonsensical 0.
-            let mut i = 0;
-            while i < segments.len() {
-                let want = batch_size.min(segments.len() - i);
-                let n = allow(budget, want);
-                if n == 0 {
-                    break;
-                }
-                let end = i + n;
-                let ctx_start = i.saturating_sub(context);
-                units.push(Unit::Batch {
-                    file,
-                    ids: segments[i..end].iter().map(|s| s.id).collect(),
-                    cues: segments[i..end].iter().map(|s| s.text.clone()).collect(),
-                    context: segments[ctx_start..i]
-                        .iter()
-                        .map(|s| s.text.clone())
-                        .collect(),
-                });
-                i = end;
-            }
-        }
-    }
-    units
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -503,10 +359,6 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| serve_model.clone())
     };
 
-    // --- format-agnostic translation pipeline ---
-    // Open the input (dispatches on extension), pull its segments, translate
-    // them all in one concurrent batch, write the result back in the input's
-    // own format. Adding a format never touches anything below this line.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(cli.timeout))
         .build()?;
@@ -539,273 +391,30 @@ async fn main() -> Result<()> {
         vec![cli.input.clone()]
     };
 
-    // --- open every file, build a flat shared work pool ---
-    // Each file's segments become self-contained Units (Independent => one
-    // Single per segment; Batched => batches with in-file context). All units
-    // across all files drain through ONE concurrency pool in engine.run, so
-    // small files and file tails no longer leave the GPU idle. A file that
-    // fails to open is logged and skipped, never aborting the batch.
-    let mut slots: Vec<FileSlot> = Vec::new();
-    let mut units: Vec<Unit> = Vec::new();
-    let mut budget = cli.limit; // global cap across the whole batch (None = unlimited).
-    let mut open_failed: Vec<(PathBuf, String)> = Vec::new();
-    for input in &inputs {
-        let doc = match format::open(input, None) {
-            Ok(d) => d,
-            Err(e) => {
-                let msg = format!("{e:#}");
-                eprintln!("error: open {}: {} — skipping", input.display(), msg);
-                open_failed.push((input.clone(), msg));
-                continue;
-            }
-        };
-        let segments = doc.segments();
-        eprintln!(
-            "{}: {} block(s) [{}]",
-            input.display(),
-            segments.len(),
-            doc.format_name()
-        );
-        // Format picks Independent vs Batched; the CLI supplies batch params.
-        let strategy = match doc.strategy() {
-            Strategy::Independent => Strategy::Independent,
-            Strategy::Batched { .. } => Strategy::Batched {
-                batch_size: cli.subtitle_batch_size,
-                context: cli.subtitle_context,
-            },
-        };
-        let file_idx = slots.len();
-        units.extend(build_units(file_idx, &segments, strategy, &mut budget));
-        slots.push(FileSlot {
-            doc,
-            out_path: resolve_output(input, cli.in_place, cli.output.as_deref()),
-            in_place: cli.in_place,
-            input: input.clone(),
-        });
-    }
+    // --- run the queue: lazy open + shared pool + progressive write ---
+    // batch.rs opens files only as pool slots free up, and writes each file the
+    // instant it finishes (releasing its parsed IR). Memory therefore tracks the
+    // files in flight (~the concurrency window), not the whole directory.
+    let opts = BatchOpts {
+        mode: cli.mode,
+        in_place: cli.in_place,
+        output: cli.output.clone(),
+        batch_size: cli.subtitle_batch_size,
+        context: cli.subtitle_context,
+        limit: cli.limit,
+    };
+    let summary = run_batch(&engine, inputs, opts).await;
 
-    // --- drain the whole batch through one shared concurrency pool ---
-    let total_segments: usize = units.iter().map(Unit::attempted).sum();
-    eprintln!(
-        "batch: {} file(s), {} unit(s), {} segment(s)",
-        slots.len(),
-        units.len(),
-        total_segments
-    );
-    let run_out = engine.run(units, total_segments).await;
-
-    // --- partition results per file, write each (post-drain) ---
-    // Writes happen after the drain (not progressively): the old per-file loop
-    // already drained-then-wrote each file, so collapsing N (drain+write) pairs
-    // into one drain + one write phase is wall-clock-neutral and keeps the drain
-    // free of write stalls. Subset semantics (missing ids => unchanged) handle
-    // partial / Ctrl-C output. A write failure is logged and skipped.
-    let mut per_file: Vec<Vec<(SegmentId, String)>> = vec![Vec::new(); slots.len()];
-    for ud in run_out.done {
-        if let Some(slot) = per_file.get_mut(ud.file) {
-            slot.extend(ud.pairs);
-        }
-    }
-    for pairs in per_file.iter_mut() {
-        pairs.sort_by_key(|(id, _)| *id);
-    }
-
-    let mut ok = 0usize;
-    let mut write_failed: Vec<(PathBuf, String)> = Vec::new();
-    for (i, slot) in slots.iter_mut().enumerate() {
-        let pairs = &per_file[i];
-        let write_target = if slot.in_place {
-            inplace_temp(&slot.out_path)
-        } else {
-            slot.out_path.clone()
-        };
-        match slot.doc.write(pairs, &write_target, cli.mode) {
-            Ok(()) => {
-                if slot.in_place {
-                    if let Err(e) = std::fs::rename(&write_target, &slot.out_path) {
-                        let msg = format!("rename into place {}: {}", slot.out_path.display(), e);
-                        eprintln!("error: {}", msg);
-                        write_failed.push((slot.input.clone(), msg));
-                        continue;
-                    }
-                }
-                eprintln!(
-                    "wrote: {} ({} block(s) translated){}",
-                    slot.out_path.display(),
-                    pairs.len(),
-                    if run_out.cancelled { " [partial]" } else { "" }
-                );
-                ok += 1;
-            }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                eprintln!("error: write {}: {} — skipping", slot.out_path.display(), msg);
-                write_failed.push((slot.input.clone(), msg));
-            }
-        }
-    }
-
-    // --- batch summary ---
-    let failed_files = open_failed.len() + write_failed.len();
     eprintln!(
         "\nbatch: {} file(s) ok, {} failed; {} segment(s) translated, {} failed{}",
-        ok,
-        failed_files,
-        run_out.translated,
-        run_out.failed,
-        if run_out.cancelled { " (interrupted)" } else { "" }
+        summary.ok_files,
+        summary.failed_files.len(),
+        summary.translated,
+        summary.failed,
+        if summary.cancelled { " (interrupted)" } else { "" }
     );
-    for (p, m) in open_failed.iter().chain(write_failed.iter()) {
+    for (p, m) in &summary.failed_files {
         eprintln!("  failed: {} ({})", p.display(), m);
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn seg(id: usize, text: &str) -> Segment {
-        Segment {
-            id,
-            text: text.to_string(),
-        }
-    }
-
-    #[test]
-    fn independent_emits_one_single_per_segment() {
-        let segs = vec![seg(0, "a"), seg(1, "b"), seg(2, "c")];
-        let units = build_units(7, &segs, Strategy::Independent, &mut None);
-        assert_eq!(units.len(), 3);
-        assert!(units
-            .iter()
-            .all(|u| matches!(u, Unit::Single { file: 7, .. })));
-        let ids: Vec<_> = units
-            .iter()
-            .map(|u| match u {
-                Unit::Single { id, .. } => *id,
-                _ => unreachable!(),
-            })
-            .collect();
-        assert_eq!(ids, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn batched_slices_into_batches_with_context() {
-        // batch_size 2, context 1, 5 segments -> batches of 2,2,1.
-        let segs = vec![
-            seg(0, "a"),
-            seg(1, "b"),
-            seg(2, "c"),
-            seg(3, "d"),
-            seg(4, "e"),
-        ];
-        let units = build_units(
-            0,
-            &segs,
-            Strategy::Batched {
-                batch_size: 2,
-                context: 1,
-            },
-            &mut None,
-        );
-        assert_eq!(units.len(), 3);
-        // batch 0 (starts at i=0): cues a,b; context = segs[0..0] = none.
-        match &units[0] {
-            Unit::Batch { ids, cues, context, .. } => {
-                assert_eq!(*ids, vec![0, 1]);
-                assert_eq!(*cues, vec!["a".to_string(), "b".to_string()]);
-                assert!(context.is_empty());
-            }
-            _ => panic!("expected Batch"),
-        }
-        // batch 1 (starts at i=2): cues c,d; context = segs[1..2] = [b].
-        match &units[1] {
-            Unit::Batch { cues, context, .. } => {
-                assert_eq!(*cues, vec!["c".to_string(), "d".to_string()]);
-                assert_eq!(*context, vec!["b".to_string()]);
-            }
-            _ => panic!("expected Batch"),
-        }
-        // batch 2 (starts at i=4): shrunk to cue e; context = segs[3..4] = [d].
-        match &units[2] {
-            Unit::Batch { cues, context, .. } => {
-                assert_eq!(*cues, vec!["e".to_string()]);
-                assert_eq!(*context, vec!["d".to_string()]);
-            }
-            _ => panic!("expected Batch"),
-        }
-    }
-
-    #[test]
-    fn limit_shrinks_last_batch_to_fit() {
-        // batch_size 25, limit 3 -> a single batch of 3 (not 25).
-        let segs: Vec<_> = (0..10).map(|i| seg(i, "x")).collect();
-        let units = build_units(
-            0,
-            &segs,
-            Strategy::Batched {
-                batch_size: 25,
-                context: 5,
-            },
-            &mut Some(3),
-        );
-        assert_eq!(units.len(), 1);
-        match &units[0] {
-            Unit::Batch { cues, .. } => assert_eq!(cues.len(), 3),
-            _ => panic!("expected Batch"),
-        }
-    }
-
-    #[test]
-    fn limit_caps_total_across_independent() {
-        let segs: Vec<_> = (0..5).map(|i| seg(i, "x")).collect();
-        let units = build_units(0, &segs, Strategy::Independent, &mut Some(2));
-        assert_eq!(units.len(), 2);
-    }
-
-    #[test]
-    fn empty_segments_emit_nothing() {
-        let units = build_units(
-            0,
-            &[],
-            Strategy::Batched {
-                batch_size: 25,
-                context: 5,
-            },
-            &mut None,
-        );
-        assert!(units.is_empty());
-        let units = build_units(0, &[], Strategy::Independent, &mut None);
-        assert!(units.is_empty());
-    }
-
-    #[test]
-    fn budget_shared_across_files() {
-        // Two files sharing one global budget (mirrors main's loop): file 0
-        // consumes all 3, file 1 gets nothing.
-        let segs: Vec<_> = (0..5).map(|i| seg(i, "x")).collect();
-        let mut budget = Some(3);
-        let u1 = build_units(0, &segs, Strategy::Independent, &mut budget);
-        let u2 = build_units(1, &segs, Strategy::Independent, &mut budget);
-        assert_eq!(u1.len(), 3);
-        assert_eq!(u2.len(), 0);
-        assert_eq!(budget, Some(0));
-    }
-
-    #[test]
-    fn attempted_sums_to_segment_count() {
-        let segs: Vec<_> = (0..5).map(|i| seg(i, "x")).collect();
-        let units = build_units(
-            0,
-            &segs,
-            Strategy::Batched {
-                batch_size: 2,
-                context: 0,
-            },
-            &mut None,
-        );
-        let total: usize = units.iter().map(Unit::attempted).sum();
-        assert_eq!(total, 5);
-    }
 }

@@ -1,10 +1,11 @@
 //! ferryman — translate documents into bilingual (original + translation)
-//! output via a vLLM-served model. EPUB, SRT, VTT, ASS, LRC, TXT and MD ship
-//! today; docx is planned — plug a new format into `src/format/` and it just works.
+//! output via a vLLM-served model. EPUB, DOCX, SRT, VTT, ASS, LRC, TXT and MD
+//! ship today — plug a new format into `src/format/` and it just works.
 //!
 //! The original formatting is preserved byte-for-byte (via lol_html for EPUB;
-//! cue timing/structure is preserved verbatim for subtitles); after each
-//! translated block a styled sibling carrying the translation is inserted.
+//! surgical paragraph splice for DOCX; cue timing/structure is preserved
+//! verbatim for subtitles); after each translated block a styled sibling
+//! carrying the translation is inserted.
 //!
 //! A single file or a whole directory goes through [`batch::run_batch`]: one
 //! shared concurrency pool, files opened lazily and written the moment they
@@ -31,16 +32,16 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(
     name = "ferryman",
-    about = "Translate a document into a bilingual side-by-side output via vLLM (EPUB, SRT, VTT, ASS, LRC, TXT, MD)"
+    about = "Translate a document into a bilingual side-by-side output via vLLM (EPUB, DOCX, SRT, VTT, ASS, LRC, TXT, MD)"
 )]
 struct Cli {
     /// Input file or directory. A file is translated directly (format
     /// auto-detected from the extension). A directory is walked recursively and
-    /// every supported file (epub, srt, vtt, ass, lrc, txt, md) is translated;
-    /// unsupported files and ferryman's own suffixed outputs are skipped. Files
-    /// are opened lazily and written as they finish, so memory stays bounded by
-    /// the concurrency window — for a very large EPUB library, run it in
-    /// subdirectory batches.
+    /// every supported file (epub, docx, srt, vtt, ass, lrc, txt, md) is
+    /// translated; unsupported files and ferryman's own suffixed outputs are
+    /// skipped. Files are opened lazily and written as they finish, so memory
+    /// stays bounded by the concurrency window — for a very large EPUB/DOCX
+    /// library, run it in subdirectory batches.
     #[arg(long, short = 'i')]
     input: PathBuf,
 

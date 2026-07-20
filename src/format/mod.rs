@@ -1,13 +1,14 @@
 //! Format-agnostic document abstraction.
 //!
-//! Each input format (EPUB, SRT, VTT today; txt / docx later) implements
+//! Each input format (EPUB, DOCX, SRT, VTT, txt) implements
 //! [`Document`]: it parses the file into translatable [`Segment`]s (plain
 //! text) and knows how to write translations back. The translation engine
 //! ([`crate::engine`]) is format-agnostic — each format merely hints at a
-//! [`Strategy`] via [`Document::strategy`]: self-contained blocks (EPUB) go
-//! out one per request, while short-flow segments (subtitle cues) ride in
+//! [`Strategy`] via [`Document::strategy`]: self-contained blocks (EPUB, DOCX)
+//! go out one per request, while short-flow segments (subtitle cues) ride in
 //! contextual batches aligned strictly one-to-one (see [`crate::engine`]).
 
+use crate::format::docx::DocxDoc;
 use crate::format::epub::EpubDoc;
 use crate::format::md::MdDoc;
 use crate::format::subtitle::ass::Ass;
@@ -19,6 +20,7 @@ use crate::format::txt::TxtDoc;
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
+pub mod docx;
 pub mod epub;
 pub mod md;
 pub mod subtitle;
@@ -116,7 +118,7 @@ pub enum Format {
     Lrc,
     Txt,
     Md,
-    // TODO: Docx, …
+    Docx,
 }
 
 impl Format {
@@ -135,9 +137,9 @@ impl Format {
             Some("lrc") => Ok(Format::Lrc),
             Some("txt") => Ok(Format::Txt),
             Some("md") | Some("markdown") => Ok(Format::Md),
-            // TODO: "docx" => …
+            Some("docx") => Ok(Format::Docx),
             other => Err(anyhow!(
-                "unsupported input format {:?} ({}); supported: epub, srt, vtt, ass, lrc, txt, md",
+                "unsupported input format {:?} ({}); supported: epub, docx, srt, vtt, ass, lrc, txt, md",
                 other.unwrap_or("(none)"),
                 path.display()
             )),
@@ -161,6 +163,7 @@ pub fn open(path: &Path, hint: Option<Format>) -> Result<Box<dyn Document + Send
         Format::Lrc => Ok(Box::new(SubtitleDoc::<Lrc>::open(path)?)),
         Format::Txt => Ok(Box::new(TxtDoc::open(path)?)),
         Format::Md => Ok(Box::new(MdDoc::open(path)?)),
+        Format::Docx => Ok(Box::new(DocxDoc::open(path)?)),
     }
 }
 
@@ -178,7 +181,7 @@ mod tests {
 
     #[test]
     fn from_path_rejects_unknown_and_missing_extension() {
-        assert!(Format::from_path(Path::new("book.docx")).is_err());
+        assert!(Format::from_path(Path::new("book.rtf")).is_err());
         assert!(Format::from_path(Path::new("noext")).is_err());
     }
 
@@ -196,5 +199,7 @@ mod tests {
         assert_eq!(Format::from_path(Path::new("BOOK.TXT")).unwrap(), Format::Txt);
         assert_eq!(Format::from_path(Path::new("doc.md")).unwrap(), Format::Md);
         assert_eq!(Format::from_path(Path::new("NOTES.MARKDOWN")).unwrap(), Format::Md);
+        assert_eq!(Format::from_path(Path::new("report.docx")).unwrap(), Format::Docx);
+        assert_eq!(Format::from_path(Path::new("REPORT.DOCX")).unwrap(), Format::Docx);
     }
 }

@@ -92,11 +92,32 @@ and point at it — the preset still picks the right model id:
 ./target/release/ferryman -i book.epub -o out.epub --preset 30b-fp8
 ```
 
+### Directory / batch mode
+
+Point `--input` at a directory to translate a whole library in one go. It walks
+recursively, picks up every supported file, and **reuses one engine (and one
+`--serve` container) for the whole batch** — a single file failure is logged and
+skipped, never aborting the rest. A Ctrl-C writes the current file's partial
+output and stops the batch.
+
+```bash
+# each book.epub -> book.bilingual.epub (sibling); unsupported files skipped
+./target/release/ferryman -i ~/data/books --preset 30b-fp8
+
+# overwrite every file in place (atomic temp + rename; originals not truncated)
+./target/release/ferryman -i ~/data/books --in-place --preset 30b-fp8
+```
+
+Re-running a directory is safe: `*.bilingual.*` outputs are skipped, and the
+on-disk cache means already-translated blocks are instant.
+
 ### Options
 
 | flag | default | description |
 |---|---|---|
-| `--input` / `--output` | — | input EPUB / output bilingual EPUB |
+| `--input` | — | input file **or directory**. A directory is walked recursively and every supported file (`.epub .srt .vtt .ass .ssa .lrc .txt .md`) is translated; unsupported files and ferryman's own `*.bilingual.*` outputs are skipped. |
+| `--output` | — | output path (single file only; rejected with a directory input). If neither `--output` nor `--in-place` is set, each file is written next to its source as `<name>.bilingual.<ext>`. |
+| `--in-place` | off | overwrite each input file in place (writes a sibling temp, then atomically renames over the original). Works for a single file or a directory. Mutually exclusive with `--output`. |
 | `--preset` | `7b-fp8` | model + optimal serve config bundle: `7b-fp8` (Hy-MT2-7B-FP8) or `30b-fp8` (Hy-MT2-30B-A3B-FP8). Every flag below overrides the preset. |
 | `--serve` | off | launch & manage the vLLM container (removed on exit) |
 | `--endpoint` | `http://localhost:8001` | base URL (used when not `--serve`) |

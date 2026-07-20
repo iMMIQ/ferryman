@@ -19,7 +19,7 @@ use crate::engine::Engine;
 use crate::format::{OutputMode, Strategy};
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -28,13 +28,25 @@ use std::time::Duration;
     about = "Translate a document into a bilingual side-by-side output via vLLM (EPUB, SRT, VTT, ASS, LRC, TXT, MD)"
 )]
 struct Cli {
-    /// Input path (format auto-detected from extension: epub, srt, vtt, ass, lrc, txt, md).
+    /// Input file or directory. A file is translated directly (format
+    /// auto-detected from the extension). A directory is walked recursively and
+    /// every supported file (epub, srt, vtt, ass, lrc, txt, md) is translated;
+    /// unsupported files and ferryman's own suffixed outputs are skipped.
     #[arg(long, short = 'i')]
     input: PathBuf,
 
-    /// Output path (bilingual output, same format as the input).
-    #[arg(long, short = 'o')]
-    output: PathBuf,
+    /// Output path (single-file mode only; rejected with a directory input).
+    /// If neither --output nor --in-place is given, each file is written to a
+    /// sibling named `<name>.bilingual.<ext>` next to the original.
+    #[arg(long, short = 'o', conflicts_with = "in_place")]
+    output: Option<PathBuf>,
+
+    /// Overwrite each input file in place (single file or directory). Mutually
+    /// exclusive with --output. Each file is written to a sibling temp file
+    /// first, then atomically renamed over the original, so a crash mid-write
+    /// can't truncate the source.
+    #[arg(long)]
+    in_place: bool,
 
     /// Output mode: `bilingual` (default) keeps the original and appends the
     /// translation; `replace` writes only the translation.
@@ -261,6 +273,159 @@ fn model_root() -> String {
         .unwrap_or_else(|_| "model".to_string())
 }
 
+/// Suffix inserted before the extension when neither `--output` nor `--in-place`
+/// is given: `book.epub` → `book.bilingual.epub`. Also doubles as the marker
+/// the directory walk skips, so re-running a dir doesn't retranslate its output.
+const OUTPUT_SUFFIX: &str = "bilingual";
+
+/// Recursively collect every supported, non-output file under `root`, sorted
+/// for deterministic ordering. Symlinks are skipped (avoids cycles).
+fn collect_inputs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    visit(root, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+fn visit(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?;
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)
+            .with_context(|| format!("read dir {}", path.display()))?
+        {
+            visit(&entry?.path(), out)?;
+        }
+    } else if meta.is_file() {
+        // Keep the filter in sync with supported formats via from_path, and
+        // skip our own suffixed outputs so re-running a dir doesn't retranslate
+        // them. (book.bilingual.epub → stem's last dot-segment == "bilingual".)
+        if format::Format::from_path(path).is_ok() && !is_suffix_output(path) {
+            out.push(path.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+/// Is `path` one of our suffixed outputs? The last dot-segment of the file stem
+/// equals [`OUTPUT_SUFFIX`] (`book.bilingual` → `bilingual`).
+fn is_suffix_output(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|stem| stem.rsplit('.').next())
+        .is_some_and(|last| last == OUTPUT_SUFFIX)
+}
+
+/// `book.epub` → `book.bilingual.epub` (same directory). Used when neither
+/// `--output` nor `--in-place` is given.
+fn suffix_path(path: &Path) -> PathBuf {
+    let mut name = path.file_stem().map(|s| s.to_os_string()).unwrap_or_default();
+    name.push(".");
+    name.push(OUTPUT_SUFFIX);
+    if let Some(ext) = path.extension() {
+        name.push(".");
+        name.push(ext);
+    }
+    path.with_file_name(name)
+}
+
+/// Hidden sibling temp file used for atomic in-place writes.
+fn inplace_temp(target: &Path) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(".ferryman-tmp");
+    target.with_file_name(name)
+}
+
+/// Resolve a file's output path: explicit `--output`, in-place, or a suffixed
+/// sibling next to the source.
+fn resolve_output(input: &Path, in_place: bool, explicit: Option<&Path>) -> PathBuf {
+    if in_place {
+        input.to_path_buf()
+    } else if let Some(o) = explicit {
+        o.to_path_buf()
+    } else {
+        suffix_path(input)
+    }
+}
+
+/// Per-file translation knobs, resolved once from the CLI and reused across the
+/// batch (keeps [`translate_file`] under clippy's argument-count threshold).
+struct TranslateOpts {
+    batch_size: usize,
+    context: usize,
+    mode: OutputMode,
+    limit: Option<usize>,
+}
+
+/// Outcome of translating one file (for the batch summary).
+struct FileOutcome {
+    cancelled: bool,
+}
+
+/// Open, translate, and write a single file. A file-level failure (can't open /
+/// write) returns `Err` so the caller can skip it without aborting the batch;
+/// block-level translation failures stay inside ([`Engine`] counts them, never
+/// errors). On Ctrl-C it writes the partial output and returns `cancelled`.
+async fn translate_file(
+    engine: &Engine,
+    input: &Path,
+    out_path: &Path,
+    in_place: bool,
+    opts: &TranslateOpts,
+) -> Result<FileOutcome> {
+    let mut doc = format::open(input, None)
+        .with_context(|| format!("open {}", input.display()))?;
+    let segments = doc.segments();
+    eprintln!(
+        "\n{}: {} block(s) -> {} [{}]",
+        input.display(),
+        segments.len(),
+        out_path.display(),
+        doc.format_name()
+    );
+
+    // The format picks Independent vs Batched via its strategy(); the CLI
+    // supplies the batch parameters when batching is requested.
+    let strategy = match doc.strategy() {
+        Strategy::Independent => Strategy::Independent,
+        Strategy::Batched { .. } => Strategy::Batched {
+            batch_size: opts.batch_size,
+            context: opts.context,
+        },
+    };
+    let out = engine.translate(&segments, strategy, opts.limit).await;
+    if out.cancelled {
+        eprintln!("interrupted (Ctrl-C): writing the partial output gathered so far");
+    }
+
+    // In-place writes a sibling temp first, then atomically renames over the
+    // original — a crash mid-write can't truncate the source.
+    let write_target = if in_place {
+        inplace_temp(out_path)
+    } else {
+        out_path.to_path_buf()
+    };
+    doc.write(&out.translations, &write_target, opts.mode)
+        .with_context(|| format!("write {}", write_target.display()))?;
+    if in_place {
+        std::fs::rename(&write_target, out_path)
+            .with_context(|| format!("rename into place {}", out_path.display()))?;
+    }
+
+    eprintln!(
+        "done: {} translated, {} failed -> {}",
+        out.translated,
+        out.failed,
+        out_path.display()
+    );
+    Ok(FileOutcome {
+        cancelled: out.cancelled,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -352,40 +517,67 @@ async fn main() -> Result<()> {
     };
     let engine = Engine::new(client, endpoint, model, cli.target.clone(), concurrency, cache);
 
-    let mut doc = format::open(&cli.input, None)
-        .with_context(|| format!("open input {}", cli.input.display()))?;
-    let segments = doc.segments();
-    eprintln!(
-        "{}: {} block(s) -> translating into {:?}",
-        doc.format_name(),
-        segments.len(),
-        cli.target
-    );
-
-    // The format picks Independent vs Batched via its strategy(); the CLI
-    // supplies the batch parameters (size / context window) when batching is
-    // requested. Formats that stay Independent ignore them.
-    let strategy = match doc.strategy() {
-        Strategy::Independent => Strategy::Independent,
-        Strategy::Batched { .. } => Strategy::Batched {
-            batch_size: cli.subtitle_batch_size,
-            context: cli.subtitle_context,
-        },
+    // --- input enumeration ---
+    // A directory is walked recursively for supported files; a single file is
+    // processed as-is. --output (one path) can't be paired with a directory.
+    if cli.input.is_dir() && cli.output.is_some() {
+        anyhow::bail!(
+            "--output cannot be combined with a directory input; use --in-place, \
+             or drop both to write a '{OUTPUT_SUFFIX}' sibling next to each file"
+        );
+    }
+    let inputs = if cli.input.is_dir() {
+        let files = collect_inputs(&cli.input)?;
+        eprintln!(
+            "input dir {}: {} supported file(s) (recursed)",
+            cli.input.display(),
+            files.len()
+        );
+        files
+    } else {
+        vec![cli.input.clone()]
     };
-    let out = engine.translate(&segments, strategy, cli.limit).await;
-    if out.cancelled {
-        eprintln!("interrupted (Ctrl-C): writing the partial output gathered so far");
+
+    // --- per-file loop: one file's failure never aborts the batch ---
+    // The engine (and any --serve container) are set up once above and reused
+    // across the whole batch. A Ctrl-C writes the current file's partial output
+    // and stops the batch.
+    let opts = TranslateOpts {
+        batch_size: cli.subtitle_batch_size,
+        context: cli.subtitle_context,
+        mode: cli.mode,
+        limit: cli.limit,
+    };
+    let mut ok = 0usize;
+    let mut failed_files: Vec<(PathBuf, String)> = Vec::new();
+    let mut cancelled = false;
+    for input in &inputs {
+        let out_path = resolve_output(input, cli.in_place, cli.output.as_deref());
+        match translate_file(&engine, input, &out_path, cli.in_place, &opts).await {
+            Ok(fo) => {
+                ok += 1;
+                if fo.cancelled {
+                    cancelled = true;
+                    break;
+                }
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                eprintln!("error: {} — skipping", msg);
+                failed_files.push((input.clone(), msg));
+            }
+        }
     }
 
-    doc.write(&out.translations, &cli.output, cli.mode)
-        .with_context(|| format!("write output {}", cli.output.display()))?;
-
+    // --- batch summary ---
     eprintln!(
-        "\ndone: {} block(s) translated, {} failed{} -> {}",
-        out.translated,
-        out.failed,
-        if out.cancelled { " (partial)" } else { "" },
-        cli.output.display()
+        "\nbatch: {} file(s) ok, {} failed{}",
+        ok,
+        failed_files.len(),
+        if cancelled { " (interrupted)" } else { "" }
     );
+    for (p, m) in &failed_files {
+        eprintln!("  failed: {} ({})", p.display(), m);
+    }
     Ok(())
 }

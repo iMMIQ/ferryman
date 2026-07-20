@@ -1,16 +1,21 @@
 //! Format-agnostic document abstraction.
 //!
-//! Each input format (EPUB today; txt / srt / docx later) implements
+//! Each input format (EPUB, SRT, VTT today; txt / docx later) implements
 //! [`Document`]: it parses the file into translatable [`Segment`]s (plain
 //! text) and knows how to write translations back. The translation engine
-//! ([`crate::engine`]) is fully format-agnostic, so adding a format touches
-//! only this module + a new backend file — never `main.rs` or `engine.rs`.
+//! ([`crate::engine`]) is format-agnostic — with one caveat: subtitle formats
+//! set [`Document::batched`] so the engine translates their cues in contextual
+//! batches rather than independently (see [`crate::engine`]).
 
 use crate::format::epub::EpubDoc;
+use crate::format::subtitle::srt::Srt;
+use crate::format::subtitle::vtt::Vtt;
+use crate::format::subtitle::SubtitleDoc;
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
 pub mod epub;
+pub mod subtitle;
 
 /// Identifier of a segment within a document. Dense `0..N`, assigned by the
 /// backend in document order.
@@ -56,6 +61,17 @@ pub trait Document {
         out: &Path,
         mode: OutputMode,
     ) -> Result<()>;
+
+    /// Whether this document's segments must be translated in contiguous,
+    /// context-carrying batches rather than independently. `false` (the
+    /// default) suits formats whose segments are self-contained blocks (EPUB).
+    /// Subtitle formats override to `true`: their cues are short and only make
+    /// sense in the surrounding flow, so the engine batches them behind one
+    /// prompt and aligns the result strictly one-to-one (no merge/split). See
+    /// [`crate::engine::Engine::translate_subtitles`].
+    fn batched(&self) -> bool {
+        false
+    }
 }
 
 /// Supported input formats. Add a variant here when a backend lands, plus a
@@ -63,7 +79,9 @@ pub trait Document {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Epub,
-    // TODO: Txt, Srt, Docx, …
+    Srt,
+    Vtt,
+    // TODO: Txt, Docx, …
 }
 
 impl Format {
@@ -76,9 +94,11 @@ impl Format {
             .map(str::to_ascii_lowercase);
         match ext.as_deref() {
             Some("epub") => Ok(Format::Epub),
-            // TODO: "txt" | "md" => Ok(Format::Txt), "srt" | "vtt" => Ok(Format::Srt), …
+            Some("srt") => Ok(Format::Srt),
+            Some("vtt") => Ok(Format::Vtt),
+            // TODO: "txt" | "md" => Ok(Format::Txt), …
             other => Err(anyhow!(
-                "unsupported input format {:?} ({}); supported: epub",
+                "unsupported input format {:?} ({}); supported: epub, srt, vtt",
                 other.unwrap_or("(none)"),
                 path.display()
             )),
@@ -96,7 +116,8 @@ pub fn open(path: &Path, hint: Option<Format>) -> Result<Box<dyn Document>> {
     };
     match fmt {
         Format::Epub => Ok(Box::new(EpubDoc::open(path)?)),
-        // TODO: Format::Txt => Ok(Box::new(TxtDoc::open(path)?)), …
+        Format::Srt => Ok(Box::new(SubtitleDoc::<Srt>::open(path)?)),
+        Format::Vtt => Ok(Box::new(SubtitleDoc::<Vtt>::open(path)?)),
     }
 }
 
@@ -116,5 +137,13 @@ mod tests {
     fn from_path_rejects_unknown_and_missing_extension() {
         assert!(Format::from_path(Path::new("book.txt")).is_err());
         assert!(Format::from_path(Path::new("noext")).is_err());
+    }
+
+    #[test]
+    fn from_path_detects_subtitles_case_insensitively() {
+        assert_eq!(Format::from_path(Path::new("a.srt")).unwrap(), Format::Srt);
+        assert_eq!(Format::from_path(Path::new("A.SRT")).unwrap(), Format::Srt);
+        assert_eq!(Format::from_path(Path::new("a.vtt")).unwrap(), Format::Vtt);
+        assert_eq!(Format::from_path(Path::new("/x/y.Z.VtT")).unwrap(), Format::Vtt);
     }
 }

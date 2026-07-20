@@ -1,10 +1,10 @@
 //! ferryman — translate a document into bilingual (original + translation)
-//! output via a vLLM-served model. EPUB ships today; txt / subtitles / docx
-//! are planned — plug a new format into `src/format/` and it just works.
+//! output via a vLLM-served model. EPUB, SRT and VTT ship today; txt / docx are
+//! planned — plug a new format into `src/format/` and it just works.
 //!
-//! The original formatting is preserved byte-for-byte (via lol_html for EPUB);
-//! after each translated block a styled sibling carrying the translation is
-//! inserted.
+//! The original formatting is preserved byte-for-byte (via lol_html for EPUB;
+//! cue timing/structure is preserved verbatim for subtitles); after each
+//! translated block a styled sibling carrying the translation is inserted.
 
 mod archive;
 mod cache;
@@ -25,10 +25,10 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(
     name = "ferryman",
-    about = "Translate a document into a bilingual side-by-side output via vLLM (EPUB today; more formats coming)"
+    about = "Translate a document into a bilingual side-by-side output via vLLM (EPUB, SRT, VTT)"
 )]
 struct Cli {
-    /// Input path (format auto-detected from extension; epub supported today).
+    /// Input path (format auto-detected from extension: epub, srt, vtt).
     #[arg(long, short = 'i')]
     input: PathBuf,
 
@@ -52,6 +52,18 @@ struct Cli {
     /// Optional cap on total translated blocks (for quick testing).
     #[arg(long)]
     limit: Option<usize>,
+
+    /// Subtitle cues per translation request (subtitle inputs only). Batching
+    /// keeps cross-cue context and orders the result strictly one-to-one; the
+    /// model returns one translation per cue, no merge/split. (default: 25)
+    #[arg(long, default_value_t = 25)]
+    subtitle_batch_size: usize,
+
+    /// Number of preceding cues sent as read-only context with each subtitle
+    /// batch (not translated, not emitted) — keeps the translation fluent
+    /// across cue boundaries. (default: 5)
+    #[arg(long, default_value_t = 5)]
+    subtitle_context: usize,
 
     /// Disable the on-disk translation cache (retranslate everything). By
     /// default completed translations are cached so re-runs skip them and a
@@ -350,7 +362,13 @@ async fn main() -> Result<()> {
         cli.target
     );
 
-    let out = engine.translate(&segments, cli.limit).await;
+    let out = if doc.batched() {
+        engine
+            .translate_subtitles(&segments, cli.subtitle_batch_size, cli.subtitle_context, cli.limit)
+            .await
+    } else {
+        engine.translate(&segments, cli.limit).await
+    };
     if out.cancelled {
         eprintln!("interrupted (Ctrl-C): writing the partial output gathered so far");
     }

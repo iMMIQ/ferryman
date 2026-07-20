@@ -9,6 +9,7 @@
 //! contextual batches aligned strictly one-to-one (see [`crate::engine`]).
 
 use crate::format::epub::EpubDoc;
+use crate::format::md::MdDoc;
 use crate::format::subtitle::ass::Ass;
 use crate::format::subtitle::lrc::Lrc;
 use crate::format::subtitle::srt::Srt;
@@ -19,6 +20,7 @@ use anyhow::{anyhow, Result};
 use std::path::Path;
 
 pub mod epub;
+pub mod md;
 pub mod subtitle;
 pub mod txt;
 
@@ -113,7 +115,8 @@ pub enum Format {
     Ass,
     Lrc,
     Txt,
-    // TODO: Docx, Md, …
+    Md,
+    // TODO: Docx, …
 }
 
 impl Format {
@@ -131,9 +134,10 @@ impl Format {
             Some("ass") | Some("ssa") => Ok(Format::Ass),
             Some("lrc") => Ok(Format::Lrc),
             Some("txt") => Ok(Format::Txt),
-            // TODO: "md" | "docx" => …
+            Some("md") | Some("markdown") => Ok(Format::Md),
+            // TODO: "docx" => …
             other => Err(anyhow!(
-                "unsupported input format {:?} ({}); supported: epub, srt, vtt, ass, lrc, txt",
+                "unsupported input format {:?} ({}); supported: epub, srt, vtt, ass, lrc, txt, md",
                 other.unwrap_or("(none)"),
                 path.display()
             )),
@@ -156,6 +160,7 @@ pub fn open(path: &Path, hint: Option<Format>) -> Result<Box<dyn Document>> {
         Format::Ass => Ok(Box::new(SubtitleDoc::<Ass>::open(path)?)),
         Format::Lrc => Ok(Box::new(SubtitleDoc::<Lrc>::open(path)?)),
         Format::Txt => Ok(Box::new(TxtDoc::open(path)?)),
+        Format::Md => Ok(Box::new(MdDoc::open(path)?)),
     }
 }
 
@@ -189,5 +194,7 @@ mod tests {
         assert_eq!(Format::from_path(Path::new("lyrics.LRC")).unwrap(), Format::Lrc);
         assert_eq!(Format::from_path(Path::new("novel.txt")).unwrap(), Format::Txt);
         assert_eq!(Format::from_path(Path::new("BOOK.TXT")).unwrap(), Format::Txt);
+        assert_eq!(Format::from_path(Path::new("doc.md")).unwrap(), Format::Md);
+        assert_eq!(Format::from_path(Path::new("NOTES.MARKDOWN")).unwrap(), Format::Md);
     }
 }

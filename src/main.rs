@@ -1,6 +1,6 @@
 //! ferryman — translate a document into bilingual (original + translation)
-//! output via a vLLM-served model. EPUB, SRT, VTT, ASS, LRC and TXT ship today;
-//! docx / md are planned — plug a new format into `src/format/` and it just works.
+//! output via a vLLM-served model. EPUB, SRT, VTT, ASS, LRC, TXT and MD ship
+//! today; docx is planned — plug a new format into `src/format/` and it just works.
 //!
 //! The original formatting is preserved byte-for-byte (via lol_html for EPUB;
 //! cue timing/structure is preserved verbatim for subtitles); after each
@@ -25,10 +25,10 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(
     name = "ferryman",
-    about = "Translate a document into a bilingual side-by-side output via vLLM (EPUB, SRT, VTT, ASS, LRC, TXT)"
+    about = "Translate a document into a bilingual side-by-side output via vLLM (EPUB, SRT, VTT, ASS, LRC, TXT, MD)"
 )]
 struct Cli {
-    /// Input path (format auto-detected from extension: epub, srt, vtt, ass, lrc, txt).
+    /// Input path (format auto-detected from extension: epub, srt, vtt, ass, lrc, txt, md).
     #[arg(long, short = 'i')]
     input: PathBuf,
 

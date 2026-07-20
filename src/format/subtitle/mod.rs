@@ -27,6 +27,7 @@ use std::fs;
 use std::marker::PhantomData;
 use std::path::Path;
 
+pub mod ass;
 pub mod srt;
 pub mod vtt;
 

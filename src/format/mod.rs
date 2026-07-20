@@ -8,6 +8,7 @@
 //! batches rather than independently (see [`crate::engine`]).
 
 use crate::format::epub::EpubDoc;
+use crate::format::subtitle::ass::Ass;
 use crate::format::subtitle::srt::Srt;
 use crate::format::subtitle::vtt::Vtt;
 use crate::format::subtitle::SubtitleDoc;
@@ -81,6 +82,7 @@ pub enum Format {
     Epub,
     Srt,
     Vtt,
+    Ass,
     // TODO: Txt, Docx, …
 }
 
@@ -96,9 +98,10 @@ impl Format {
             Some("epub") => Ok(Format::Epub),
             Some("srt") => Ok(Format::Srt),
             Some("vtt") => Ok(Format::Vtt),
+            Some("ass") | Some("ssa") => Ok(Format::Ass),
             // TODO: "txt" | "md" => Ok(Format::Txt), …
             other => Err(anyhow!(
-                "unsupported input format {:?} ({}); supported: epub, srt, vtt",
+                "unsupported input format {:?} ({}); supported: epub, srt, vtt, ass",
                 other.unwrap_or("(none)"),
                 path.display()
             )),
@@ -118,6 +121,7 @@ pub fn open(path: &Path, hint: Option<Format>) -> Result<Box<dyn Document>> {
         Format::Epub => Ok(Box::new(EpubDoc::open(path)?)),
         Format::Srt => Ok(Box::new(SubtitleDoc::<Srt>::open(path)?)),
         Format::Vtt => Ok(Box::new(SubtitleDoc::<Vtt>::open(path)?)),
+        Format::Ass => Ok(Box::new(SubtitleDoc::<Ass>::open(path)?)),
     }
 }
 
@@ -145,5 +149,7 @@ mod tests {
         assert_eq!(Format::from_path(Path::new("A.SRT")).unwrap(), Format::Srt);
         assert_eq!(Format::from_path(Path::new("a.vtt")).unwrap(), Format::Vtt);
         assert_eq!(Format::from_path(Path::new("/x/y.Z.VtT")).unwrap(), Format::Vtt);
+        assert_eq!(Format::from_path(Path::new("a.ass")).unwrap(), Format::Ass);
+        assert_eq!(Format::from_path(Path::new("a.SSA")).unwrap(), Format::Ass);
     }
 }

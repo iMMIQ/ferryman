@@ -274,32 +274,29 @@ impl Engine {
                             .into_iter()
                             .zip(cached.into_iter().map(|v| v.unwrap()))
                             .collect();
-                        return (n, Ok(pairs));
+                        return (n, pairs);
                     }
 
-                    // Send the full batch. Cached cues inside a partially-cached
-                    // batch are re-translated and re-cached — bounded waste (only
-                    // the batch straddling a resume boundary), and it keeps the
-                    // alignment simple (a contiguous #1..#N run).
-                    match translate::translate_batch(
+                    // translate_batch returns one Option per cue: Some = done,
+                    // None = the model skipped/failed that cue (kept original by
+                    // the writer). Cache the wins; a partial batch still yields
+                    // every cue it could — one degenerate cue costs only itself.
+                    let trs = translate::translate_batch(
                         client, endpoint, model, &cue_refs, &ctx_refs, target,
                     )
-                    .await
-                    {
-                        Ok(trs) => {
-                            let mut pairs = Vec::with_capacity(n);
-                            for idx in 0..n {
-                                if let (Some(c), Some(k)) =
-                                    (cache.as_ref(), keys[idx].as_deref())
-                                {
-                                    c.put(k, &trs[idx]);
-                                }
-                                pairs.push((b.ids[idx], trs[idx].clone()));
+                    .await;
+                    let mut pairs = Vec::with_capacity(n);
+                    for idx in 0..n {
+                        if let Some(tr) = &trs[idx] {
+                            if let (Some(c), Some(k)) =
+                                (cache.as_ref(), keys[idx].as_deref())
+                            {
+                                c.put(k, tr);
                             }
-                            (n, Ok(pairs))
+                            pairs.push((b.ids[idx], tr.clone()));
                         }
-                        Err(e) => (n, Err(e)),
                     }
+                    (n, pairs)
                 }
             })
             .buffer_unordered(self.concurrency);
@@ -324,15 +321,14 @@ impl Engine {
                 }
                 item = stream.next() => match item {
                     None => break,
-                    Some((n, Ok(pairs))) => {
+                    // `n` = cues in the batch; `pairs` = the ones the model
+                    // actually translated. The rest (n - pairs.len()) were
+                    // skipped/failed and keep their original text on write.
+                    Some((n, pairs)) => {
+                        translated += pairs.len();
+                        failed += n - pairs.len();
                         translations.extend(pairs);
-                        translated += n;
                         pb.inc(n as u64);
-                    }
-                    Some((n, Err(e))) => {
-                        failed += n;
-                        pb.inc(n as u64);
-                        eprintln!("warn: subtitle batch ({} cues) failed: {}", n, e);
                     }
                 }
             }

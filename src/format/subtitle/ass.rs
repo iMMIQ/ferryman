@@ -148,17 +148,6 @@ fn split_leading_tags(text: &str) -> (&str, &str) {
     (&text[..end], &text[end..])
 }
 
-impl Cue {
-    /// A verbatim line emitted unchanged (headers, Format:, Comment:, blanks).
-    fn passthrough(line: &str) -> Cue {
-        Cue {
-            text: String::new(),
-            framing: line.to_string(),
-            timed: false,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

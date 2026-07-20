@@ -28,6 +28,7 @@ use std::marker::PhantomData;
 use std::path::Path;
 
 pub mod ass;
+pub mod lrc;
 pub mod srt;
 pub mod vtt;
 
@@ -52,6 +53,19 @@ pub struct Cue {
     /// `true` if the block has a timing line (a real, translatable cue); `false`
     /// for headers / NOTEs / STYLEs / anything without `-->`.
     pub timed: bool,
+}
+
+impl Cue {
+    /// A verbatim line emitted unchanged — headers, `Format:`/`Comment:` lines,
+    /// metadata tags, blanks. Shared by the line-oriented grammars (ASS, LRC).
+    /// Private to this module, but visible to the grammar submodules (ass, lrc).
+    fn passthrough(line: &str) -> Cue {
+        Cue {
+            text: String::new(),
+            framing: line.to_string(),
+            timed: false,
+        }
+    }
 }
 
 /// A subtitle grammar: how to split a file into [`Cue`]s and how to stitch them

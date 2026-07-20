@@ -10,14 +10,17 @@
 
 use crate::format::epub::EpubDoc;
 use crate::format::subtitle::ass::Ass;
+use crate::format::subtitle::lrc::Lrc;
 use crate::format::subtitle::srt::Srt;
 use crate::format::subtitle::vtt::Vtt;
 use crate::format::subtitle::SubtitleDoc;
+use crate::format::txt::TxtDoc;
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
 pub mod epub;
 pub mod subtitle;
+pub mod txt;
 
 /// Identifier of a segment within a document. Dense `0..N`, assigned by the
 /// backend in document order.
@@ -108,7 +111,9 @@ pub enum Format {
     Srt,
     Vtt,
     Ass,
-    // TODO: Txt, Docx, …
+    Lrc,
+    Txt,
+    // TODO: Docx, Md, …
 }
 
 impl Format {
@@ -124,9 +129,11 @@ impl Format {
             Some("srt") => Ok(Format::Srt),
             Some("vtt") => Ok(Format::Vtt),
             Some("ass") | Some("ssa") => Ok(Format::Ass),
-            // TODO: "txt" | "md" => Ok(Format::Txt), …
+            Some("lrc") => Ok(Format::Lrc),
+            Some("txt") => Ok(Format::Txt),
+            // TODO: "md" | "docx" => …
             other => Err(anyhow!(
-                "unsupported input format {:?} ({}); supported: epub, srt, vtt, ass",
+                "unsupported input format {:?} ({}); supported: epub, srt, vtt, ass, lrc, txt",
                 other.unwrap_or("(none)"),
                 path.display()
             )),
@@ -147,6 +154,8 @@ pub fn open(path: &Path, hint: Option<Format>) -> Result<Box<dyn Document>> {
         Format::Srt => Ok(Box::new(SubtitleDoc::<Srt>::open(path)?)),
         Format::Vtt => Ok(Box::new(SubtitleDoc::<Vtt>::open(path)?)),
         Format::Ass => Ok(Box::new(SubtitleDoc::<Ass>::open(path)?)),
+        Format::Lrc => Ok(Box::new(SubtitleDoc::<Lrc>::open(path)?)),
+        Format::Txt => Ok(Box::new(TxtDoc::open(path)?)),
     }
 }
 
@@ -164,7 +173,7 @@ mod tests {
 
     #[test]
     fn from_path_rejects_unknown_and_missing_extension() {
-        assert!(Format::from_path(Path::new("book.txt")).is_err());
+        assert!(Format::from_path(Path::new("book.docx")).is_err());
         assert!(Format::from_path(Path::new("noext")).is_err());
     }
 
@@ -176,5 +185,9 @@ mod tests {
         assert_eq!(Format::from_path(Path::new("/x/y.Z.VtT")).unwrap(), Format::Vtt);
         assert_eq!(Format::from_path(Path::new("a.ass")).unwrap(), Format::Ass);
         assert_eq!(Format::from_path(Path::new("a.SSA")).unwrap(), Format::Ass);
+        assert_eq!(Format::from_path(Path::new("a.lrc")).unwrap(), Format::Lrc);
+        assert_eq!(Format::from_path(Path::new("lyrics.LRC")).unwrap(), Format::Lrc);
+        assert_eq!(Format::from_path(Path::new("novel.txt")).unwrap(), Format::Txt);
+        assert_eq!(Format::from_path(Path::new("BOOK.TXT")).unwrap(), Format::Txt);
     }
 }

@@ -141,13 +141,14 @@ fn truncate(s: &str, n: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-/// Translate a batch of subtitle cues into `target_lang`, returning one
-/// `Option<String>` per cue (`Some` = translated, `None` = the model skipped it
-/// or it otherwise didn't parse — the engine leaves such cues untranslated).
+/// Translate a batch of segments (subtitle cues, prose lines) into
+/// `target_lang`, returning one `Option<String>` per segment (`Some` =
+/// translated, `None` = the model skipped it or it otherwise didn't parse — the
+/// engine leaves such segments untranslated).
 ///
 /// The batched counterpart to [`translate`]: instead of one text per request
-/// (which starves the model of cross-cue context for short subtitle lines), all
-/// cues go out behind a single prompt and the response is aligned by `<cN>`
+/// (which starves the model of cross-segment context for short lines), all
+/// segments go out behind a single prompt and the response is aligned by `<cN>`
 /// delimiters. `context` carries a few preceding cues as read-only narrative
 /// context (not translated, not counted).
 ///

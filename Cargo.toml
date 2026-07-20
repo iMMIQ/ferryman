@@ -3,6 +3,8 @@ name = "ferryman"
 version = "0.1.0"
 edition = "2021"
 description = "Ferryman — translate documents via a vLLM-served model into bilingual output (EPUB now; txt/subtitles planned)"
+license = "LGPL-3.0-or-later"
+repository = "https://github.com/iMMIQ/ferryman"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

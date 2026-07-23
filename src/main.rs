@@ -121,7 +121,10 @@ struct Cli {
     serve: bool,
 
     /// Docker image to run when --serve.
-    #[arg(long, default_value = "docker.io/catdogai/lzc-aipod-vllm:agxorin-cu126-src-18f658bb3185-20260703")]
+    #[arg(
+        long,
+        default_value = "docker.io/catdogai/lzc-aipod-vllm:agxorin-cu126-src-18f658bb3185-20260703"
+    )]
     image: String,
 
     /// Host directory holding the model files (mounted into the container).
@@ -302,12 +305,17 @@ async fn main() -> Result<()> {
         .serve_model
         .clone()
         .unwrap_or_else(|| p.serve_model.to_string());
-    let dtype = cli.vllm_dtype.clone().unwrap_or_else(|| p.dtype.to_string());
+    let dtype = cli
+        .vllm_dtype
+        .clone()
+        .unwrap_or_else(|| p.dtype.to_string());
     let kv_cache_dtype = cli
         .kv_cache_dtype
         .clone()
         .unwrap_or_else(|| p.kv_cache_dtype.to_string());
-    let gpu_memory_utilization = cli.gpu_memory_utilization.unwrap_or(p.gpu_memory_utilization);
+    let gpu_memory_utilization = cli
+        .gpu_memory_utilization
+        .unwrap_or(p.gpu_memory_utilization);
     let max_model_len = cli.max_model_len.unwrap_or(p.max_model_len);
     let max_num_seqs = cli.max_num_seqs.or(p.max_num_seqs);
     let enforce_eager = cli.enforce_eager || p.enforce_eager;
@@ -355,9 +363,7 @@ async fn main() -> Result<()> {
     let model = if cli.serve {
         serve_model.clone()
     } else {
-        cli.model
-            .clone()
-            .unwrap_or_else(|| serve_model.clone())
+        cli.model.clone().unwrap_or_else(|| serve_model.clone())
     };
 
     let client = reqwest::Client::builder()
@@ -369,7 +375,14 @@ async fn main() -> Result<()> {
         let dir = cli.cache_dir.clone().unwrap_or_else(default_cache_dir);
         Cache::open(Some(dir))
     };
-    let engine = Engine::new(client, endpoint, model, cli.target.clone(), concurrency, cache);
+    let engine = Engine::new(
+        client,
+        endpoint,
+        model,
+        cli.target.clone(),
+        concurrency,
+        cache,
+    );
 
     // --- input enumeration ---
     // A directory is walked recursively for supported files; a single file is
@@ -412,7 +425,11 @@ async fn main() -> Result<()> {
         summary.failed_files.len(),
         summary.translated,
         summary.failed,
-        if summary.cancelled { " (interrupted)" } else { "" }
+        if summary.cancelled {
+            " (interrupted)"
+        } else {
+            ""
+        }
     );
     for (p, m) in &summary.failed_files {
         eprintln!("  failed: {} ({})", p.display(), m);

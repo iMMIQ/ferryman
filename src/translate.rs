@@ -93,13 +93,9 @@ pub async fn translate(
                     // id, malformed request, or a block over the context window.
                     // Retrying just burns a concurrency slot for several seconds
                     // and can never succeed, so fail this block immediately.
-                    if status.is_client_error()
-                        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                    if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                     {
-                        return Err(anyhow!(
-                            "translation failed (fatal HTTP): {}",
-                            last_err
-                        ));
+                        return Err(anyhow!("translation failed (fatal HTTP): {}", last_err));
                     }
                     continue;
                 }
@@ -184,8 +180,10 @@ async fn translate_split(
     context: &[&str],
     target_lang: &str,
 ) -> Vec<Option<String>> {
-    let SliceOutcome { translations, overflow } =
-        translate_one_batch(client, endpoint, model, cues, context, target_lang).await;
+    let SliceOutcome {
+        translations,
+        overflow,
+    } = translate_one_batch(client, endpoint, model, cues, context, target_lang).await;
     let missing = cues.len() - translations.iter().filter(|t| t.is_some()).count();
     if missing >= 2 && cues.len() > 1 {
         // The batch came back missing ≥2 cues. Two causes, both fixed by halving
@@ -313,8 +311,7 @@ async fn translate_one_batch(
                     // 4xx (except 429) is permanent — retries can't fix it. A
                     // context-length overflow is recoverable by the caller
                     // splitting the batch, so flag it rather than giving up.
-                    if status.is_client_error()
-                        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                    if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                     {
                         if is_context_overflow(&last_err) {
                             overflow = true;
@@ -492,14 +489,24 @@ mod tests {
     fn parse_tagged_perfect_alignment() {
         let resp = "<c1>你好</c1>\n<c2>世界</c2>\n<c3>再见</c3>";
         let trs = parse_tagged(resp, 3);
-        assert_eq!(trs, vec![Some("你好".into()), Some("世界".into()), Some("再见".into())]);
+        assert_eq!(
+            trs,
+            vec![
+                Some("你好".into()),
+                Some("世界".into()),
+                Some("再见".into())
+            ]
+        );
     }
 
     #[test]
     fn parse_tagged_preserves_multiline_cues() {
         let resp = "<c1>第一行\n第二行</c1>\n<c2>世界</c2>";
         let trs = parse_tagged(resp, 2);
-        assert_eq!(trs, vec![Some("第一行\n第二行".into()), Some("世界".into())]);
+        assert_eq!(
+            trs,
+            vec![Some("第一行\n第二行".into()), Some("世界".into())]
+        );
     }
 
     #[test]
@@ -524,7 +531,14 @@ mod tests {
         // A spurious c4 (outside 1..=count) is ignored, not a hard failure.
         let resp = "<c1>你好</c1>\n<c2>世界</c2>\n<c3>再见</c3>\n<c4>多余</c4>";
         let trs = parse_tagged(resp, 3);
-        assert_eq!(trs, vec![Some("你好".into()), Some("世界".into()), Some("再见".into())]);
+        assert_eq!(
+            trs,
+            vec![
+                Some("你好".into()),
+                Some("世界".into()),
+                Some("再见".into())
+            ]
+        );
     }
 
     #[test]
@@ -547,7 +561,9 @@ mod tests {
     fn parse_tagged_handles_double_digit_tags() {
         // `</c1>` is not a substring of `</c10>`, so a 10-cue response parses
         // without cue 1 bleeding into cue 10's region.
-        let items: Vec<String> = (1..=10).map(|i| format!("<c{i}>t{i}</c{i}>", i = i)).collect();
+        let items: Vec<String> = (1..=10)
+            .map(|i| format!("<c{i}>t{i}</c{i}>", i = i))
+            .collect();
         let resp = items.join("\n");
         let trs = parse_tagged(&resp, 10);
         assert_eq!(trs.len(), 10);

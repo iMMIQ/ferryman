@@ -175,7 +175,10 @@ Comment: 0,0:00:20.00,0:00:21.00,Default,,0,0,0,,a hidden note
         let timed: Vec<&Cue> = cues.iter().filter(|c| c.timed).collect();
         assert_eq!(timed.len(), 2);
         assert_eq!(timed[0].text, "还差一点点");
-        assert_eq!(timed[0].framing, "Dialogue: 0,0:00:12.36,0:00:13.88,Default,,0,0,0,,");
+        assert_eq!(
+            timed[0].framing,
+            "Dialogue: 0,0:00:12.36,0:00:13.88,Default,,0,0,0,,"
+        );
         // Leading override tags peeled into framing; visible text only.
         assert_eq!(timed[1].text, "魔穗字幕组");
         assert_eq!(
@@ -190,11 +193,11 @@ Comment: 0,0:00:20.00,0:00:21.00,Default,,0,0,0,,a hidden note
         // Styles Format: line must NOT be read as the Events field list — the
         // Events text_commas stays 9 even though the Styles Format lists 3 fields.
         let framing_set: Vec<&str> = cues.iter().map(|c| c.framing.as_str()).collect();
-        assert!(framing_set.iter().any(|&f| f == "[Script Info]"));
+        assert!(framing_set.contains(&"[Script Info]"));
         assert!(framing_set.iter().any(|&f| f.starts_with("Format: Layer")));
         assert!(framing_set.iter().any(|&f| f.starts_with("Comment:")));
         // The Styles Format line is preserved verbatim too.
-        assert!(framing_set.iter().any(|&f| f == "Format: Name, Fontname, Fontsize"));
+        assert!(framing_set.contains(&"Format: Name, Fontname, Fontsize"));
     }
 
     #[test]
@@ -233,7 +236,12 @@ Comment: 0,0:00:20.00,0:00:21.00,Default,,0,0,0,,a hidden note
 
     #[test]
     fn fields_before_text_handles_custom_format() {
-        assert_eq!(fields_before_text("Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"), 9);
+        assert_eq!(
+            fields_before_text(
+                "Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+            ),
+            9
+        );
         // A format without Text falls back to the last field.
         assert_eq!(fields_before_text("A, B, C"), 2);
     }

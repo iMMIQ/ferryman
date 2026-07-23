@@ -111,10 +111,7 @@ pub fn extract(html: &str) -> Result<(String, Vec<Block>)> {
                         let has_text = !s2.borrow().blocks[id].text.trim().is_empty();
                         if is_leaf && has_text {
                             s2.borrow_mut().blocks[id].leaf = true;
-                            let _ = end.after(
-                                &format!("<!--HYZH:{}-->", id),
-                                ContentType::Html,
-                            );
+                            end.after(&format!("<!--HYZH:{}-->", id), ContentType::Html);
                         }
                         Ok(())
                     });
@@ -122,7 +119,7 @@ pub fn extract(html: &str) -> Result<(String, Vec<Block>)> {
                 }),
                 // Inject the translation style into <head>.
                 element!("head", |el| {
-                    let _ = el.append(STYLE_HTML, ContentType::Html);
+                    el.append(STYLE_HTML, ContentType::Html);
                     Ok(())
                 }),
                 // Accumulate text content of blocks (scoped to <body>, so <head>
@@ -151,7 +148,11 @@ pub fn extract(html: &str) -> Result<(String, Vec<Block>)> {
 /// `translations` maps block id -> translated text. Any placeholder not
 /// covered (e.g. due to `--limit` or a failed request) is removed so no
 /// marker comments leak into the output.
-pub fn apply_translations(html: &str, blocks: &[Block], translations: &[(usize, String)]) -> String {
+pub fn apply_translations(
+    html: &str,
+    blocks: &[Block],
+    translations: &[(usize, String)],
+) -> String {
     let mut out = html.to_string();
     for (id, tr) in translations {
         let tag = blocks.get(*id).map(|b| b.tag.as_str()).unwrap_or("p");
@@ -160,7 +161,11 @@ pub fn apply_translations(html: &str, blocks: &[Block], translations: &[(usize, 
             _ => "p",
         };
         let esc = html_escape(tr);
-        let replacement = format!("<{wt} class=\"hy-zh\">{esc}</{wt}>", wt = wrapper_tag, esc = esc);
+        let replacement = format!(
+            "<{wt} class=\"hy-zh\">{esc}</{wt}>",
+            wt = wrapper_tag,
+            esc = esc
+        );
         out = out.replace(&format!("<!--HYZH:{}-->", id), &replacement);
     }
     strip_leftover_placeholders(&out)
@@ -223,20 +228,29 @@ mod tests {
     #[test]
     fn strip_removes_markers() {
         assert_eq!(strip_leftover_placeholders("a<!--HYZH:5-->b"), "ab");
-        assert_eq!(strip_leftover_placeholders("<!--HYZH:0--><!--HYZH:1-->"), "");
+        assert_eq!(
+            strip_leftover_placeholders("<!--HYZH:0--><!--HYZH:1-->"),
+            ""
+        );
     }
 
     #[test]
     fn strip_preserves_unrelated_content() {
         // A bare `-->` that isn't part of a HYZH marker must survive.
         assert_eq!(strip_leftover_placeholders("x-->y"), "x-->y");
-        assert_eq!(strip_leftover_placeholders("no markers here"), "no markers here");
+        assert_eq!(
+            strip_leftover_placeholders("no markers here"),
+            "no markers here"
+        );
     }
 
     #[test]
     fn apply_inserts_translation() {
         let html = "<p>orig</p><!--HYZH:0-->";
-        let blocks = vec![Block { tag: "p".into(), ..Default::default() }];
+        let blocks = vec![Block {
+            tag: "p".into(),
+            ..Default::default()
+        }];
         let out = apply_translations(html, &blocks, &[(0, "你好".into())]);
         assert_eq!(out, "<p>orig</p><p class=\"hy-zh\">你好</p>");
     }
@@ -244,7 +258,10 @@ mod tests {
     #[test]
     fn apply_picks_list_wrapper_tags() {
         for tag in ["li", "dt", "dd"] {
-            let blocks = vec![Block { tag: tag.into(), ..Default::default() }];
+            let blocks = vec![Block {
+                tag: tag.into(),
+                ..Default::default()
+            }];
             let out = apply_translations("<!--HYZH:0-->", &blocks, &[(0, "x".into())]);
             assert!(
                 out.starts_with(&format!("<{} class=\"hy-zh\">", tag)),

@@ -85,11 +85,7 @@ pub trait SubFormat: Sized {
     /// translatable cue's text per `mode` and emitting passthrough cues
     /// verbatim. `translations` is keyed by cue index (`SegmentId` == position
     /// in the parsed `Vec<Cue>`). Default: [`render_timed`].
-    fn render(
-        cues: &[Cue],
-        translations: &HashMap<usize, String>,
-        mode: OutputMode,
-    ) -> String {
+    fn render(cues: &[Cue], translations: &HashMap<usize, String>, mode: OutputMode) -> String {
         render_timed(cues, translations, mode)
     }
 }

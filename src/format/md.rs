@@ -46,14 +46,18 @@ enum MdBlock {
 
 impl MdDoc {
     pub fn open(path: &Path) -> Result<Self> {
-        let src = fs::read_to_string(path)
-            .with_context(|| format!("read md {}", path.display()))?;
+        let src =
+            fs::read_to_string(path).with_context(|| format!("read md {}", path.display()))?;
         let blocks = parse_md(&src);
         let translatable = blocks
             .iter()
             .filter(|b| matches!(b, MdBlock::Text(_)))
             .count();
-        eprintln!("md: {} block(s), {} translatable", blocks.len(), translatable);
+        eprintln!(
+            "md: {} block(s), {} translatable",
+            blocks.len(),
+            translatable
+        );
         Ok(MdDoc { blocks })
     }
 }
@@ -241,7 +245,9 @@ fn is_hr(s: &str) -> bool {
     let dash = s.chars().filter(|&c| c == '-').count();
     let star = s.chars().filter(|&c| c == '*').count();
     let und = s.chars().filter(|&c| c == '_').count();
-    let only_marks = s.chars().all(|c| c == ' ' || c == '-' || c == '*' || c == '_');
+    let only_marks = s
+        .chars()
+        .all(|c| c == ' ' || c == '-' || c == '*' || c == '_');
     only_marks
         && ((dash >= 3 && star == 0 && und == 0)
             || (star >= 3 && dash == 0 && und == 0)
@@ -314,9 +320,13 @@ A final paragraph.
             })
             .collect();
         // frontmatter intact
-        assert!(pass.iter().any(|s| s.contains("title: My Doc") && s.starts_with("---")));
+        assert!(pass
+            .iter()
+            .any(|s| s.contains("title: My Doc") && s.starts_with("---")));
         // code fence intact, body not split out
-        assert!(pass.iter().any(|s| s.contains("```rust") && s.contains("let x = 1;")));
+        assert!(pass
+            .iter()
+            .any(|s| s.contains("```rust") && s.contains("let x = 1;")));
     }
 
     #[test]
@@ -369,7 +379,7 @@ A final paragraph.
         }
         let out = render_md(&blocks, &tr, OutputMode::Replace);
         assert!(out.contains("[TR")); // translations present
-        // frontmatter + code still verbatim.
+                                      // frontmatter + code still verbatim.
         assert!(out.contains("title: My Doc"));
         assert!(out.contains("let x = 1;"));
     }

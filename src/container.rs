@@ -67,27 +67,47 @@ impl ContainerGuard {
         let cache_mount = format!("{}:/root/.cache", spec.host_cache_dir);
 
         let mut args: Vec<String> = vec![
-            "run".into(), "-d".into(), "--runtime=nvidia".into(),
-            "--name".into(), spec.container_name.clone(),
-            "-v".into(), mount,
-            "-v".into(), cache_mount,
-            "-p".into(), format!("{}:8000", spec.host_port),
-            "--shm-size".into(), "512m".into(),
-            "-e".into(), "VLLM_CONFIGURE_LOGGING=0".into(),
-            "-e".into(), "VLLM_DO_NOT_TRACK=1".into(),
-            "-e".into(), "VLLM_NO_USAGE_STATS=1".into(),
+            "run".into(),
+            "-d".into(),
+            "--runtime=nvidia".into(),
+            "--name".into(),
+            spec.container_name.clone(),
+            "-v".into(),
+            mount,
+            "-v".into(),
+            cache_mount,
+            "-p".into(),
+            format!("{}:8000", spec.host_port),
+            "--shm-size".into(),
+            "512m".into(),
+            "-e".into(),
+            "VLLM_CONFIGURE_LOGGING=0".into(),
+            "-e".into(),
+            "VLLM_DO_NOT_TRACK=1".into(),
+            "-e".into(),
+            "VLLM_NO_USAGE_STATS=1".into(),
             // Route Triton + Inductor caches under the persisted /root/.cache too.
-            "-e".into(), "TRITON_CACHE_DIR=/root/.cache/triton".into(),
-            "-e".into(), "TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor".into(),
-            "--entrypoint".into(), "vllm".into(),
+            "-e".into(),
+            "TRITON_CACHE_DIR=/root/.cache/triton".into(),
+            "-e".into(),
+            "TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor".into(),
+            "--entrypoint".into(),
+            "vllm".into(),
             spec.image.clone(),
-            "serve".into(), spec.container_model.clone(),
-            "--host".into(), "0.0.0.0".into(),
-            "--port".into(), "8000".into(),
-            "--dtype".into(), spec.dtype.clone(),
-            "--max-model-len".into(), spec.max_model_len.to_string(),
-            "--gpu-memory-utilization".into(), spec.gpu_memory_utilization.to_string(),
-            "--kv-cache-dtype".into(), spec.kv_cache_dtype.clone(),
+            "serve".into(),
+            spec.container_model.clone(),
+            "--host".into(),
+            "0.0.0.0".into(),
+            "--port".into(),
+            "8000".into(),
+            "--dtype".into(),
+            spec.dtype.clone(),
+            "--max-model-len".into(),
+            spec.max_model_len.to_string(),
+            "--gpu-memory-utilization".into(),
+            spec.gpu_memory_utilization.to_string(),
+            "--kv-cache-dtype".into(),
+            spec.kv_cache_dtype.clone(),
             "--enable-prefix-caching".into(),
         ];
         // CUDA graphs are FASTER for the 30B-FP8 on this Jetson (measured 2.9x
@@ -131,7 +151,8 @@ impl ContainerGuard {
                 .await;
             bail!(
                 "vLLM container '{}' did not become healthy within {}s",
-                spec.container_name, spec.health_timeout
+                spec.container_name,
+                spec.health_timeout
             );
         }
         eprintln!("vLLM healthy at {}", endpoint);

@@ -31,11 +31,18 @@ enum TxtLine {
 
 impl TxtDoc {
     pub fn open(path: &Path) -> Result<Self> {
-        let src = fs::read_to_string(path)
-            .with_context(|| format!("read txt {}", path.display()))?;
+        let src =
+            fs::read_to_string(path).with_context(|| format!("read txt {}", path.display()))?;
         let lines = parse_txt(&src);
-        let translatable = lines.iter().filter(|l| matches!(l, TxtLine::Text(_))).count();
-        eprintln!("txt: {} line(s), {} translatable", lines.len(), translatable);
+        let translatable = lines
+            .iter()
+            .filter(|l| matches!(l, TxtLine::Text(_)))
+            .count();
+        eprintln!(
+            "txt: {} line(s), {} translatable",
+            lines.len(),
+            translatable
+        );
         Ok(TxtDoc { lines })
     }
 }
@@ -90,7 +97,10 @@ impl Document for TxtDoc {
             .iter()
             .enumerate()
             .filter_map(|(i, l)| match l {
-                TxtLine::Text(t) => Some(Segment { id: i, text: t.clone() }),
+                TxtLine::Text(t) => Some(Segment {
+                    id: i,
+                    text: t.clone(),
+                }),
                 TxtLine::Passthrough(_) => None,
             })
             .collect()

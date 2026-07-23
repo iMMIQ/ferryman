@@ -23,7 +23,7 @@ impl Epub {
     pub fn load(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mut za = ZipArchive::new(file).context("read zip")?;
-        let mut entries = Vec::with_capacity(za.len() as usize);
+        let mut entries = Vec::with_capacity(za.len());
         for i in 0..za.len() {
             let mut zf = za.by_index(i)?;
             let name = zf.name().to_string();

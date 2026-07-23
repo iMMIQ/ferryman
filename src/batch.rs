@@ -362,7 +362,10 @@ fn build_units(
                 });
             }
         }
-        Strategy::Batched { batch_size, context } => {
+        Strategy::Batched {
+            batch_size,
+            context,
+        } => {
             let batch_size = batch_size.max(1); // guard against a nonsensical 0.
             let mut i = 0;
             while i < segments.len() {
@@ -401,11 +404,11 @@ pub fn collect_inputs(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn visit(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let meta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?;
+    let meta =
+        std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
     if meta.is_dir() {
-        for entry in std::fs::read_dir(path)
-            .with_context(|| format!("read dir {}", path.display()))?
+        for entry in
+            std::fs::read_dir(path).with_context(|| format!("read dir {}", path.display()))?
         {
             visit(&entry?.path(), out)?;
         }
@@ -433,7 +436,10 @@ pub(crate) fn is_suffix_output(path: &Path) -> bool {
 /// `book.epub` → `book.bilingual.epub` (same directory). Used when neither
 /// `--output` nor `--in-place` is given.
 fn suffix_path(path: &Path) -> PathBuf {
-    let mut name = path.file_stem().map(|s| s.to_os_string()).unwrap_or_default();
+    let mut name = path
+        .file_stem()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
     name.push(".");
     name.push(OUTPUT_SUFFIX);
     if let Some(ext) = path.extension() {
@@ -508,7 +514,9 @@ mod tests {
         assert_eq!(units.len(), 3);
         // batch 0 (starts at i=0): cues a,b; context = segs[0..0] = none.
         match &units[0] {
-            Unit::Batch { ids, cues, context, .. } => {
+            Unit::Batch {
+                ids, cues, context, ..
+            } => {
                 assert_eq!(*ids, vec![0, 1]);
                 assert_eq!(*cues, vec!["a".to_string(), "b".to_string()]);
                 assert!(context.is_empty());

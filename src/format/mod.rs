@@ -174,9 +174,18 @@ mod tests {
 
     #[test]
     fn from_path_detects_epub_case_insensitively() {
-        assert_eq!(Format::from_path(Path::new("book.epub")).unwrap(), Format::Epub);
-        assert_eq!(Format::from_path(Path::new("BOOK.EPUB")).unwrap(), Format::Epub);
-        assert_eq!(Format::from_path(Path::new("/a/b/c.EpUb")).unwrap(), Format::Epub);
+        assert_eq!(
+            Format::from_path(Path::new("book.epub")).unwrap(),
+            Format::Epub
+        );
+        assert_eq!(
+            Format::from_path(Path::new("BOOK.EPUB")).unwrap(),
+            Format::Epub
+        );
+        assert_eq!(
+            Format::from_path(Path::new("/a/b/c.EpUb")).unwrap(),
+            Format::Epub
+        );
     }
 
     #[test]
@@ -190,16 +199,37 @@ mod tests {
         assert_eq!(Format::from_path(Path::new("a.srt")).unwrap(), Format::Srt);
         assert_eq!(Format::from_path(Path::new("A.SRT")).unwrap(), Format::Srt);
         assert_eq!(Format::from_path(Path::new("a.vtt")).unwrap(), Format::Vtt);
-        assert_eq!(Format::from_path(Path::new("/x/y.Z.VtT")).unwrap(), Format::Vtt);
+        assert_eq!(
+            Format::from_path(Path::new("/x/y.Z.VtT")).unwrap(),
+            Format::Vtt
+        );
         assert_eq!(Format::from_path(Path::new("a.ass")).unwrap(), Format::Ass);
         assert_eq!(Format::from_path(Path::new("a.SSA")).unwrap(), Format::Ass);
         assert_eq!(Format::from_path(Path::new("a.lrc")).unwrap(), Format::Lrc);
-        assert_eq!(Format::from_path(Path::new("lyrics.LRC")).unwrap(), Format::Lrc);
-        assert_eq!(Format::from_path(Path::new("novel.txt")).unwrap(), Format::Txt);
-        assert_eq!(Format::from_path(Path::new("BOOK.TXT")).unwrap(), Format::Txt);
+        assert_eq!(
+            Format::from_path(Path::new("lyrics.LRC")).unwrap(),
+            Format::Lrc
+        );
+        assert_eq!(
+            Format::from_path(Path::new("novel.txt")).unwrap(),
+            Format::Txt
+        );
+        assert_eq!(
+            Format::from_path(Path::new("BOOK.TXT")).unwrap(),
+            Format::Txt
+        );
         assert_eq!(Format::from_path(Path::new("doc.md")).unwrap(), Format::Md);
-        assert_eq!(Format::from_path(Path::new("NOTES.MARKDOWN")).unwrap(), Format::Md);
-        assert_eq!(Format::from_path(Path::new("report.docx")).unwrap(), Format::Docx);
-        assert_eq!(Format::from_path(Path::new("REPORT.DOCX")).unwrap(), Format::Docx);
+        assert_eq!(
+            Format::from_path(Path::new("NOTES.MARKDOWN")).unwrap(),
+            Format::Md
+        );
+        assert_eq!(
+            Format::from_path(Path::new("report.docx")).unwrap(),
+            Format::Docx
+        );
+        assert_eq!(
+            Format::from_path(Path::new("REPORT.DOCX")).unwrap(),
+            Format::Docx
+        );
     }
 }

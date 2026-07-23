@@ -175,7 +175,10 @@ impl Engine {
                 // All-cached fast path: skip the HTTP round-trip entirely.
                 let cached: Vec<Option<String>> = keys
                     .iter()
-                    .map(|k| k.as_deref().and_then(|kk| cache.as_ref().and_then(|c| c.get(kk))))
+                    .map(|k| {
+                        k.as_deref()
+                            .and_then(|kk| cache.as_ref().and_then(|c| c.get(kk)))
+                    })
                     .collect();
                 if cached.iter().all(|v| v.is_some()) {
                     let pairs = ids
@@ -189,9 +192,10 @@ impl Engine {
                     };
                 }
 
-                let trs =
-                    translate::translate_batch(client, endpoint, model, &cue_refs, &ctx_refs, target)
-                        .await;
+                let trs = translate::translate_batch(
+                    client, endpoint, model, &cue_refs, &ctx_refs, target,
+                )
+                .await;
                 let mut pairs = Vec::with_capacity(n);
                 for idx in 0..n {
                     if let Some(tr) = &trs[idx] {

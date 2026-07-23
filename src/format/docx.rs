@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(paragraphs[1].text, ""); // empty paragraph
         assert_eq!(paragraphs[2].text, "cell text"); // inside a table cell
         assert_eq!(paragraphs[3].text, "Final & line"); // entity resolved
-        // only the 3 non-empty paragraphs are translatable (empty one excluded).
+                                                        // only the 3 non-empty paragraphs are translatable (empty one excluded).
         assert_eq!(seg_index, vec![0, 2, 3]);
     }
 
@@ -350,10 +350,8 @@ mod tests {
 
     #[test]
     fn roundtrip_inserts_translation_and_preserves_originals() {
-        let tmp = std::env::temp_dir().join(format!(
-            "ferryman_docx_test_{}.docx",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("ferryman_docx_test_{}.docx", std::process::id()));
         make_docx(&tmp, SAMPLE_XML);
 
         let mut doc = DocxDoc::open(&tmp).unwrap();

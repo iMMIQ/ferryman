@@ -142,21 +142,16 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 /// Translate a batch of segments (subtitle cues, prose lines) into
-/// `target_lang`, returning one `Option<String>` per segment (`Some` =
-/// translated, `None` = the model skipped it or it otherwise didn't parse — the
-/// engine leaves such segments untranslated).
+/// `target_lang`, returning one `Option<String>` per segment, aligned by
+/// position (`Some` = translated; `None` = the model skipped/failed it and the
+/// engine keeps the original). `context` carries a few preceding cues as
+/// read-only narrative context (not translated, not counted).
 ///
-/// The batched counterpart to [`translate`]: instead of one text per request
-/// (which starves the model of cross-segment context for short lines), all
-/// segments go out behind a single prompt and the response is aligned by `<cN>`
-/// delimiters. `context` carries a few preceding cues as read-only narrative
-/// context (not translated, not counted).
-///
-/// Retries transient failures a few times, keeping the attempt that translated
-/// the most cues (so a flaky batch still yields what it could). Never aborts on
-/// a partial result — a degenerate cue the model refuses only costs itself, not
-/// its batch-mates. A fatal 4xx (except 429) stops early since retries can't
-/// help. [`batch_max_tokens`] bounds any runaway generation.
+/// If the whole batch's prompt is too long for the model's context window (a
+/// 25-line prose batch can run to several thousand tokens — see the `max_tokens`
+/// note on `ChatReq`), the batch is split in half and each side translated
+/// separately; see [`translate_split`]. Retries, partial results, and the
+/// fatal-4xx rule live in [`translate_one_batch`].
 pub async fn translate_batch(
     client: &reqwest::Client,
     endpoint: &str,
@@ -165,6 +160,115 @@ pub async fn translate_batch(
     context: &[&str],
     target_lang: &str,
 ) -> Vec<Option<String>> {
+    translate_split(client, endpoint, model, cues, context, target_lang).await
+}
+
+/// Translate a slice of cues, halving it whenever the batch comes back missing
+/// ≥2 cues. Two failure modes trigger a split, both cured by smaller batches:
+/// the prompt overflowing the context window (input too long — every cue lost),
+/// or the model's output being truncated before every `<cN>` tag closes (it then
+/// drops the trailing cues). A single missing cue is left as-is — that's the
+/// by-design "one bad cue costs only itself" case, not worth a split. Each half
+/// is a fresh tagged batch with its own `<c1>…` numbering; the results are
+/// concatenated in order, so the caller's positional alignment (`trs[idx]` ↔
+/// cue `idx`) is preserved.
+///
+/// A lone cue that still overflows the whole window — one line longer than
+/// `max_model_len` — can't be split further and is left untranslated, costing
+/// only itself (mirrors the "one bad cue" guarantee).
+async fn translate_split(
+    client: &reqwest::Client,
+    endpoint: &str,
+    model: &str,
+    cues: &[&str],
+    context: &[&str],
+    target_lang: &str,
+) -> Vec<Option<String>> {
+    let SliceOutcome { translations, overflow } =
+        translate_one_batch(client, endpoint, model, cues, context, target_lang).await;
+    let missing = cues.len() - translations.iter().filter(|t| t.is_some()).count();
+    if missing >= 2 && cues.len() > 1 {
+        // The batch came back missing ≥2 cues. Two causes, both fixed by halving
+        // the slice so each side has more room: either the prompt overflowed the
+        // context window (`overflow` — input too long, every cue lost), or the
+        // model's output was truncated before every `<cN>` tag closed and it
+        // dropped the trailing cues. (A single missing cue is left as-is — that's
+        // the by-design "one bad cue costs only itself" case, not worth a split.)
+        // Each half is a fresh tagged batch with its own `<c1>…` numbering and
+        // reuses the same read-only `context` (the right half sees slightly older
+        // narrative, fine for fluency).
+        let mid = cues.len() / 2;
+        let (left, right) = cues.split_at(mid);
+        // `Box::pin` the recursive calls: a recursive `async fn`'s future would
+        // otherwise be infinitely sized (its size nests its own recursive
+        // future). Boxing makes it an opaque heap pointer.
+        let mut out = Box::pin(translate_split(
+            client,
+            endpoint,
+            model,
+            left,
+            context,
+            target_lang,
+        ))
+        .await;
+        out.extend(
+            Box::pin(translate_split(
+                client,
+                endpoint,
+                model,
+                right,
+                context,
+                target_lang,
+            ))
+            .await,
+        );
+        out
+    } else if overflow && cues.len() == 1 {
+        // A lone cue longer than the whole context window: can't split further.
+        // (`translate_one_batch` suppresses its own warn on overflow expecting
+        // the caller to split, so name the cause here.)
+        eprintln!("warn: 1 cue is longer than the model's context window — left untranslated");
+        translations
+    } else {
+        // Complete, or ≤1 cue missing (a degenerate cue the model refused — kept
+        // original; already warned by `translate_one_batch` if it dropped all).
+        translations
+    }
+}
+
+/// One attempt's worth of translations for a fixed cue slice, plus whether the
+/// prompt was too long for the model's context window (recoverable by
+/// [`translate_split`] halving the slice).
+struct SliceOutcome {
+    translations: Vec<Option<String>>,
+    /// Every attempt failed with a context-length-overflow 4xx — the prompt
+    /// itself doesn't fit the window. `false` for any other outcome.
+    overflow: bool,
+}
+
+/// Did a fatal 4xx come from the prompt not fitting the model's context window?
+/// vLLM's body reads "This model's maximum context length is N tokens … reduce
+/// the length of the input prompt". Such a batch is recoverable by splitting;
+/// other 4xx (bad model id, malformed request) are not.
+fn is_context_overflow(err: &str) -> bool {
+    err.contains("context length") || err.contains("input prompt")
+}
+
+/// Send one cue slice as a tagged batch, retrying transient failures and
+/// keeping the attempt that translated the most cues (so a flaky batch still
+/// yields what it could). Never aborts on a partial result — a degenerate cue
+/// the model refuses costs only itself, not its batch-mates. A fatal 4xx (except
+/// 429) stops early. Sets `overflow` on a context-length-overflow 4xx so
+/// [`translate_split`] can react by splitting; never warns on overflow (the
+/// caller handles it).
+async fn translate_one_batch(
+    client: &reqwest::Client,
+    endpoint: &str,
+    model: &str,
+    cues: &[&str],
+    context: &[&str],
+    target_lang: &str,
+) -> SliceOutcome {
     let prompt = build_batch_prompt(cues, context, target_lang);
     let body = ChatReq {
         model,
@@ -176,7 +280,17 @@ pub async fn translate_batch(
         top_p: 0.6,
         top_k: 20,
         repetition_penalty: 1.05,
-        max_tokens: Some(batch_max_tokens(cues)),
+        // Omitted on purpose — same rationale as the Single `translate()` path
+        // (see the `ChatReq.max_tokens` note above). A fixed cap is unsafe here:
+        // TXT novels batch 25 long paragraphs whose prompt alone can exceed 2048
+        // tokens, so a `max_tokens` of 2048 overflows the 30B preset's 4096
+        // context and vLLM 400s the whole request, dropping all 25 cues. Letting
+        // vLLM derive `max_model_len - prompt_len` fits any input that fits the
+        // window at all; a prompt that still overflows the whole window is
+        // recovered by `translate_split` halving the batch. The runaway risk a
+        // cap once guarded is already handled by `sanitize_for_model` (collapsing
+        // repetitive char runs) plus the server-side context limit.
+        max_tokens: None,
     };
 
     let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
@@ -184,6 +298,7 @@ pub async fn translate_batch(
     let mut best: Vec<Option<String>> = (0..cues.len()).map(|_| None).collect();
     let mut best_count = 0;
     let mut last_err = String::new();
+    let mut overflow = false;
 
     for attempt in 0..4u32 {
         if attempt > 0 {
@@ -195,10 +310,15 @@ pub async fn translate_batch(
                 let txt = resp.text().await.unwrap_or_default();
                 if !status.is_success() {
                     last_err = format!("HTTP {}: {}", status, truncate(&txt, 300));
-                    // 4xx (except 429) is permanent — retries can't fix it.
+                    // 4xx (except 429) is permanent — retries can't fix it. A
+                    // context-length overflow is recoverable by the caller
+                    // splitting the batch, so flag it rather than giving up.
                     if status.is_client_error()
                         && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                     {
+                        if is_context_overflow(&last_err) {
+                            overflow = true;
+                        }
                         break;
                     }
                     continue;
@@ -232,14 +352,20 @@ pub async fn translate_batch(
             }
         }
     }
-    if best_count == 0 {
+    // Warn only for a genuinely dead slice (non-overflow fatal 4xx, or transient
+    // failures that never parsed). Overflow is handled by `translate_split`, so
+    // stay quiet here and let it split.
+    if best_count == 0 && !overflow {
         eprintln!(
             "warn: batch of {} cues produced no translations: {}",
             cues.len(),
             last_err
         );
     }
-    best
+    SliceOutcome {
+        translations: best,
+        overflow,
+    }
 }
 
 /// Build a delimiter-tagged prompt for a subtitle batch.
@@ -307,27 +433,6 @@ fn sanitize_for_model(s: &str) -> String {
         }
     }
     out
-}
-
-/// A safe `max_tokens` cap for a subtitle batch.
-///
-/// Without a cap, vLLM generates up to `max_model_len - prompt_len` (~7800
-/// tokens on the 7B preset), so a single degenerate cue can hang the whole
-/// run: an ASR artifact like 177× `あ` makes the model loop on `啊啊…` without
-/// emitting EOS, burning ~150s and hitting the request timeout while every
-/// other batch waits on `buffer_unordered`. Capping bounds the runaway — a
-/// truncated batch simply fails alignment and its cues keep their original
-/// text (graceful, never a hang).
-///
-/// Scales with cue count (a subtitle line is short; ~96 tokens/cue is ~3-4×
-/// the real output of line + `<cN>` wrapper, leaving headroom for a long cue
-/// or two), floored so a tiny batch still has room. The **2048 ceiling is
-/// deliberate**: the 30B preset's `max_model_len` is only 4096, and a subtitle
-/// batch prompt stays well under ~2048 tokens, so 2048 always fits the
-/// remaining context (a higher ceiling would 400 on the 30B — see the
-/// `ChatReq.max_tokens` note).
-fn batch_max_tokens(cues: &[&str]) -> u32 {
-    (cues.len() as u32 * 96 + 256).clamp(512, 2048)
 }
 
 /// Parse a `<cN>…</cN>`-tagged response into up to `count` aligned
@@ -488,16 +593,23 @@ mod tests {
     }
 
     #[test]
-    fn batch_max_tokens_scales_and_stays_under_30b_context() {
-        // Tiny batch gets the floor.
-        assert_eq!(batch_max_tokens(&["a"]), 512);
-        // Scales with cue count.
-        assert_eq!(batch_max_tokens(&["a"; 10]), 10 * 96 + 256);
-        // Default 25-cue batch would be 2656 but is ceiled at 2048 (the 30B's
-        // max_model_len is 4096; a batch prompt stays well under ~2048 tokens,
-        // so 2048 always fits the remaining context).
-        assert_eq!(batch_max_tokens(&["a"; 25]), 2048);
-        assert_eq!(batch_max_tokens(&["a"; 100]), 2048);
+    fn is_context_overflow_matches_vllm_context_error() {
+        // The exact body vLLM returns when the prompt exceeds the context window.
+        let vllm = "HTTP 400 Bad Request: {\"error\":{\"message\":\"This model's \
+            maximum context length is 4096 tokens. However, you requested 0 output \
+            tokens and your prompt contains at least 4097 input tokens, for a total \
+            of at least 4097 tokens. Please reduce the length of the input prompt or \
+            the number of requested output tokens.\"}}";
+        assert!(is_context_overflow(vllm));
+        // The shorter "input prompt" phrasing alone also matches.
+        assert!(is_context_overflow(
+            "HTTP 400: Please reduce the length of the input prompt"
+        ));
+        // Other 4xx must NOT match — those aren't recoverable by splitting.
+        assert!(!is_context_overflow("HTTP 404 Not Found: model not found"));
+        assert!(!is_context_overflow(
+            "HTTP 400: invalid sampling temperature"
+        ));
     }
 
     #[test]

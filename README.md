@@ -3,9 +3,8 @@
 > **Ferryman** — a multi-format translation tool (epub / txt / subtitles / …).
 > *"渡船工": ferries content across the river between languages and formats.*
 >
-> **Status:** ships the bilingual-EPUB translator today (ported from the old
-> `epub-translator`); plain-text and subtitle pipelines are planned. The
-> package/binary are now `ferryman`; the epub code itself is unchanged.
+> **Status:** EPUB, DOCX, plain text, Markdown, SRT, VTT, ASS/SSA and LRC ship
+> today. Ferryman can run as a CLI or as a Lazycat MicroServer + AI Pod Web app.
 
 Produce a **bilingual (original + Chinese) EPUB** from any EPUB book by translating
 its content through a vLLM-served model. The original formatting is preserved
@@ -44,6 +43,103 @@ when finished (no need to run the server separately).
 ```bash
 cargo build --release
 ```
+
+## Web app and Lazycat deployment
+
+Ferryman's Web deployment has two processes:
+
+- `ferryman-web` runs on the MicroServer. It owns uploads, per-user files, the
+  persistent job queue, progress/cancellation and result downloads. Job metadata
+  and state live in a SQLite WAL database; source/result files stay on disk, and
+  only nonterminal jobs are retained in memory. History is read with cursor
+  pagination while active jobs use a small polling endpoint. After a system or
+  application restart, queued/model-starting/translating/writing jobs are reset
+  to queued and dispatched automatically; the content cache skips segments that
+  were already translated. Temporary AI Pod outages keep waiting with backoff
+  instead of turning recovered jobs into failures. Up to eight jobs
+  using the same preset run together through one process-wide HTTP client and
+  request budget (256 requests for 7B, 128 for 30B). Preset groups stay ordered,
+  so the scheduler never tries to switch models while jobs are active.
+- `ferryman-agent` is the lightweight AI Pod controller. It starts exactly one
+  Hy-MT2 vLLM child process (`7b-fp8` or `30b-fp8`) on demand and unloads it
+  after all leases expire and the idle timeout elapses.
+
+The Web UI accepts an uploaded file or a mixed selection of files and directories
+from the user's MicroServer documents and mounted Lazycat cloud drives. The picker
+can filter the current directory by name and entry type. Selected directories are
+walked recursively, overlapping selections are deduplicated, and relative paths
+are preserved. Mounted files can be saved beside each source with a suffix,
+atomically overwrite the source when explicitly requested, or be collected under
+one chosen directory on either storage type. Advanced settings expose the shared
+batch size, context window and translation-cache controls; the target language is
+free-form with common languages offered as suggestions. Cancelling a running job
+keeps any partial document available for download without overwriting a mounted
+source.
+The LPK requests `document.read/write` and `media.read/write`, and enables the
+corresponding `/lzcapp/run/mnt/home` and `/lzcapp/media/RemoteFS` mounts. Both
+mounts contain one directory per MicroServer UID; the backend confines every
+request to the signed-in user's subtree, skips symlinks, and keeps internal
+queue data under `/lzcapp/var/ferryman`.
+
+Run both locally with a shared control token:
+
+```bash
+export FERRYMAN_AGENT_TOKEN='replace-with-at-least-16-characters'
+
+FERRYMAN_MODEL_ROOT="$HOME/model" \
+FERRYMAN_AGENT_LISTEN=127.0.0.1:8090 \
+cargo run --bin ferryman-agent
+
+mkdir -p ./ferryman-documents ./ferryman-remotefs
+FERRYMAN_AGENT_URL=http://127.0.0.1:8090 \
+FERRYMAN_USER_DOCUMENTS_DIR=./ferryman-documents \
+FERRYMAN_REMOTE_FS_DIR=./ferryman-remotefs \
+FERRYMAN_ALLOW_LOCAL_USER=true \
+cargo run --bin ferryman-web
+```
+
+The Web UI is then available at `http://127.0.0.1:8080`.
+
+For AI Pod deployment, the release build packages the native ARM64 controller
+binary directly inside `ai-pod-service` and reuses the official vLLM image:
+
+```bash
+# On an ARM64 development host, install the MicroServer Web cross compiler once:
+# sudo apt-get install gcc-x86-64-linux-gnu
+sh scripts/build-release.sh
+```
+
+Place the model directories under the app's AI Pod data directory:
+
+```text
+models/Hy-MT2-7B-FP8
+models/Hy-MT2-30B-A3B-FP8
+```
+
+The `FERRYMAN_AGENT_TOKEN` in `lzc-manifest.yml` and
+`ai-pod-service/docker-compose.yml` must always contain the same production
+value. Then lint and build the LPK V2 package:
+
+```bash
+lzc-cli project lint .
+lzc-cli project build .
+```
+
+### Shared core boundary
+
+The CLI and Web adapter intentionally stop at the same library boundary:
+
+- `format` parses and renders every supported document type.
+- `translate` owns prompts, retries and response parsing.
+- `engine` owns caching, authenticated HTTP clients and request limiting.
+- `batch` owns input discovery, output naming, concurrent dispatch, cancellation
+  and progressive writes.
+- `settings` owns defaults and Web safety bounds.
+
+`ferryman` maps CLI flags into these shared types. `ferryman-web` adds identity,
+mounted-storage validation, persistent job records and model leases, then calls
+the same engine and batch functions. `ferryman-agent` remains isolated to AI Pod
+model lifecycle and vLLM proxying.
 
 ## Usage
 
@@ -153,7 +249,10 @@ on-disk cache means already-translated blocks are instant.
 - **Translation cache.** Every translated block is written to a content-addressed
   cache keyed by `(model, target, text)`, so re-running ferryman on the same
   book with the same model + target language skips already-done blocks almost
-  instantly. `--no-cache` disables it; `--cache-dir` points it elsewhere.
+  instantly. Cache bodies remain sharded files rather than SQLite rows: cache
+  writes are frequent, best-effort optimization data and should not inflate or
+  contend on the authoritative job database. `--no-cache` disables it;
+  `--cache-dir` points it elsewhere.
 - **Ctrl-C is safe.** One Ctrl-C stops dispatching new requests, cancels the few
   in flight, writes the partial bilingual EPUB gathered so far, and (with
   `--serve`) tears the container down — nothing leaks. Re-running then resumes

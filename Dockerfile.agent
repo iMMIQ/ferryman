@@ -1,0 +1,9 @@
+FROM docker.io/catdogai/lzc-aipod-vllm:agxorin-cu126-src-18f658bb3185-20260703
+COPY build/ferryman-agent /usr/local/bin/ferryman-agent
+ENV FERRYMAN_AGENT_LISTEN=0.0.0.0:8090 \
+    FERRYMAN_MODEL_ROOT=/models \
+    FERRYMAN_IDLE_TIMEOUT_SECONDS=600 \
+    RUST_LOG=info \
+    LD_PRELOAD=
+EXPOSE 8090
+ENTRYPOINT ["ferryman-agent"]

@@ -1,0 +1,14 @@
+FROM scratch
+WORKDIR /app
+COPY build/web-libs/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
+COPY build/web-libs/ /lib/x86_64-linux-gnu/
+COPY build/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY runtime/nsswitch.conf /etc/nsswitch.conf
+COPY build/ferryman-web /usr/local/bin/ferryman-web
+COPY web ./web
+ENV FERRYMAN_WEB_LISTEN=0.0.0.0:8080 \
+    FERRYMAN_WEB_DIR=/app/web \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    RUST_LOG=info
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/ferryman-web"]

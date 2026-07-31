@@ -11,21 +11,18 @@
 //! shared concurrency pool, files opened lazily and written the moment they
 //! finish — so memory tracks the files *in flight*, not the size of the input.
 
-mod archive;
-mod batch;
-mod cache;
-mod container;
-mod engine;
-mod format;
-mod html;
-mod translate;
-
-use crate::batch::{collect_inputs, run_batch, BatchOpts, OUTPUT_SUFFIX};
-use crate::cache::Cache;
-use crate::engine::Engine;
-use crate::format::OutputMode;
 use anyhow::Result;
 use clap::Parser;
+use ferryman::batch::{collect_inputs, run_batch, BatchOpts};
+use ferryman::cache::Cache;
+use ferryman::container;
+use ferryman::engine::{build_translation_client, Engine};
+use ferryman::format::OutputMode;
+use ferryman::preset::Preset;
+use ferryman::settings::{
+    TranslationSettings, DEFAULT_BATCH_SIZE, DEFAULT_CONTEXT_SEGMENTS,
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -79,13 +76,13 @@ struct Cli {
     /// md). Batching keeps cross-segment context and orders the result strictly
     /// one-to-one; the model returns one translation per segment, no merge/split.
     /// (default: 25)
-    #[arg(long, default_value_t = 25)]
+    #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
     subtitle_batch_size: usize,
 
     /// Number of preceding segments sent as read-only context with each batch
     /// (not translated, not emitted) — keeps the translation fluent across
     /// boundaries. (default: 5)
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = DEFAULT_CONTEXT_SEGMENTS)]
     subtitle_context: usize,
 
     /// Disable the on-disk translation cache (retranslate everything). By
@@ -99,7 +96,7 @@ struct Cli {
     cache_dir: Option<PathBuf>,
 
     /// Per-request timeout in seconds.
-    #[arg(long, default_value_t = 180)]
+    #[arg(long, default_value_t = DEFAULT_REQUEST_TIMEOUT_SECONDS)]
     timeout: u64,
 
     /// Model preset: bundles the model path + the optimal vLLM serve config for
@@ -192,79 +189,6 @@ struct Cli {
     health_timeout: u64,
 }
 
-/// Bundled model + optimal serve config per preset.
-#[derive(Clone, Copy, clap::ValueEnum, PartialEq, Debug)]
-pub enum Preset {
-    /// Hy-MT2-7B-FP8 — light & fast, the original default.
-    #[value(name = "7b-fp8")]
-    SevenBFp8,
-    /// Hy-MT2-30B-A3B-FP8 — higher quality; optimal serve config measured on
-    /// this Jetson (CUDA graphs on, max-num-seqs 512 → ~1222 tok/s peak).
-    #[value(name = "30b-fp8")]
-    ThirtyBFp8,
-}
-
-struct PresetCfg {
-    host_model_dir: String,
-    serve_model: &'static str,
-    dtype: &'static str,
-    kv_cache_dtype: &'static str,
-    gpu_memory_utilization: f32,
-    max_model_len: u32,
-    max_num_seqs: Option<u32>,
-    /// false = CUDA graphs ON (omit --enforce-eager).
-    enforce_eager: bool,
-    concurrency: usize,
-}
-
-impl Preset {
-    fn cfg(self) -> PresetCfg {
-        match self {
-            Preset::SevenBFp8 => PresetCfg {
-                host_model_dir: format!("{}/Hy-MT2-7B-FP8", model_root()),
-                serve_model: "/models/Hy-MT2-7B-FP8",
-                dtype: "float16",
-                kv_cache_dtype: "fp8",
-                // 7B weights are only ~7 GiB; 0.30 already yields ~258k fp8 KV
-                // tokens, far past what compute can keep busy.
-                gpu_memory_utilization: 0.30,
-                max_model_len: 8192,
-                // 7B saturates on COMPUTE ~c256-512; 512 lets short blocks reach
-                // the ceiling (default 256 leaves throughput on the table).
-                max_num_seqs: Some(512),
-                // CUDA graphs ON: measured +8% throughput ceiling (868→938 tok/s)
-                // and +15% at low concurrency. Smaller win than the 30B (7B is
-                // dense → fewer kernels/step → less CPU launch overhead to remove)
-                // but effectively free: capture is 1.7 GiB and the 7B footprint is
-                // tiny. (The old "graphs hurt 2x" note was AWQ-specific, not FP8.)
-                enforce_eager: false,
-                // Near the compute saturation point: ~895 tok/s @ ~11s/block.
-                // (Old default 96 topped out at ~637 tok/s.)
-                concurrency: 256,
-            },
-            Preset::ThirtyBFp8 => PresetCfg {
-                host_model_dir: format!("{}/Hy-MT2-30B-A3B-FP8", model_root()),
-                serve_model: "/models/Hy-MT2-30B-A3B-FP8",
-                dtype: "auto",
-                kv_cache_dtype: "fp8",
-                // Reliable minimum: weights are 28.6G = 47% of 61G, so util must
-                // be ≥~0.52 for positive KV (0.45 went negative-KV and failed).
-                gpu_memory_utilization: 0.55,
-                max_model_len: 4096,
-                // Unlocks the throughput ceiling (default 256 caps at ~878 tok/s;
-                // 512 reaches 1222). KV (~66-108k, varies) binds real paragraphs
-                // ~c150-240, so concurrency 128 stays safely under that.
-                max_num_seqs: Some(512),
-                // CUDA graphs ON: 2.9x faster single-stream, +9% @c256, peak 1222
-                // vs 878 eager. Capture uses only ~1 GiB. (The 7B-AWQ "graphs hurt"
-                // finding does NOT apply to this 30B-FP8 + vLLM-main build.)
-                enforce_eager: false,
-                concurrency: 128,
-            },
-        }
-    }
-}
-
 /// Default on-disk cache dir: `$XDG_CACHE_HOME/ferryman`, else
 /// `$HOME/.cache/ferryman`. Avoids pulling a `dirs`-style crate for one lookup.
 fn default_cache_dir() -> PathBuf {
@@ -290,13 +214,18 @@ fn model_root() -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let settings = TranslationSettings {
+        batch_size: cli.subtitle_batch_size,
+        context_segments: cli.subtitle_context,
+        cache_enabled: !cli.no_cache,
+    };
 
     // Resolve the preset, then let any explicit --flag override it.
-    let p = cli.preset.cfg();
+    let p = cli.preset.config();
     let host_model_dir = cli
         .host_model_dir
         .clone()
-        .unwrap_or_else(|| p.host_model_dir.clone());
+        .unwrap_or_else(|| format!("{}/{}", model_root(), p.model_dir_name));
     let host_cache_dir = cli
         .host_cache_dir
         .clone()
@@ -366,14 +295,12 @@ async fn main() -> Result<()> {
         cli.model.clone().unwrap_or_else(|| serve_model.clone())
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(cli.timeout))
-        .build()?;
-    let cache = if cli.no_cache {
-        None
-    } else {
+    let client = build_translation_client(Duration::from_secs(cli.timeout), None)?;
+    let cache = if settings.cache_enabled {
         let dir = cli.cache_dir.clone().unwrap_or_else(default_cache_dir);
         Cache::open(Some(dir))
+    } else {
+        None
     };
     let engine = Engine::new(
         client,
@@ -390,7 +317,7 @@ async fn main() -> Result<()> {
     if cli.input.is_dir() && cli.output.is_some() {
         anyhow::bail!(
             "--output cannot be combined with a directory input; use --in-place, \
-             or drop both to write a '{OUTPUT_SUFFIX}' sibling next to each file"
+             or drop both to write a mode-specific suffixed sibling next to each file"
         );
     }
     let inputs = if cli.input.is_dir() {
@@ -413,8 +340,8 @@ async fn main() -> Result<()> {
         mode: cli.mode,
         in_place: cli.in_place,
         output: cli.output.clone(),
-        batch_size: cli.subtitle_batch_size,
-        context: cli.subtitle_context,
+        batch_size: settings.batch_size,
+        context: settings.context_segments,
         limit: cli.limit,
     };
     let summary = run_batch(&engine, inputs, opts).await;

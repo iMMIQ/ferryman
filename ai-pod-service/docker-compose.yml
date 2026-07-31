@@ -1,0 +1,31 @@
+services:
+  ferryman-agent:
+    image: docker.io/catdogai/lzc-aipod-vllm:agxorin-cu126-src-18f658bb3185-20260703
+    entrypoint: ["/usr/local/bin/ferryman-agent"]
+    shm_size: 512m
+    restart: unless-stopped
+    environment:
+      FERRYMAN_AGENT_LISTEN: 0.0.0.0:8090
+      FERRYMAN_AGENT_TOKEN: f060f336356356b8049e0ebae0a6c8d4f3867a7d6edc17249a853f59baf3c559
+      FERRYMAN_MODEL_ROOT: /models
+      FERRYMAN_IDLE_TIMEOUT_SECONDS: 600
+      RUST_LOG: info
+      LD_PRELOAD: ""
+      VLLM_CONFIGURE_LOGGING: "0"
+      VLLM_DO_NOT_TRACK: "1"
+      VLLM_NO_USAGE_STATS: "1"
+      TRITON_CACHE_DIR: /root/.cache/triton
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/torchinductor
+    volumes:
+      - ./ferryman-agent:/usr/local/bin/ferryman-agent:ro
+      - ${LZC_AGENT_DATA_DIR}/models:/models:ro
+      - ${LZC_AGENT_CACHE_DIR}/vllm:/root/.cache
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.${LZC_SERVICE_ID}-ferryman.rule=Host(`ferryman-agent-ai`)"
+      - "traefik.http.services.${LZC_SERVICE_ID}-ferryman.loadbalancer.server.port=8090"
+
+networks:
+  default:
+    external: true
+    name: traefik-shared-network

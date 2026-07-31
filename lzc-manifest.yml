@@ -1,0 +1,27 @@
+ext_config:
+  enable_document_access: true
+  enable_media_access: true
+
+application:
+  subdomain: ferryman
+  routes:
+    - /=http://web:8080
+  health_check:
+    test_url: http://web:8080/api/config
+    start_period: 30s
+
+services:
+  web:
+    image: embed:ferryman-web
+    environment:
+      - FERRYMAN_WEB_LISTEN=0.0.0.0:8080
+      - FERRYMAN_WEB_DIR=/app/web
+      - FERRYMAN_DATA_DIR=/lzcapp/var/ferryman
+      - FERRYMAN_USER_DOCUMENTS_DIR=/lzcapp/run/mnt/home
+      - FERRYMAN_REMOTE_FS_DIR=/lzcapp/media/RemoteFS
+      - FERRYMAN_AGENT_URL=https://ferryman-agent-ai.{{ .S.BoxDomain }}
+      # AI Pod compose files cannot currently consume deploy parameters, so this
+      # app-scoped control token must match ai-pod-service below.
+      - FERRYMAN_AGENT_TOKEN=f060f336356356b8049e0ebae0a6c8d4f3867a7d6edc17249a853f59baf3c559
+      - FERRYMAN_ALLOW_LOCAL_USER=false
+      - RUST_LOG=info

@@ -39,7 +39,10 @@ pub struct Segment {
 }
 
 /// How translations are written back.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum OutputMode {
     /// Keep the original and add the translation alongside (bilingual).
     #[value(name = "bilingual")]
@@ -47,6 +50,33 @@ pub enum OutputMode {
     /// Replace the original text with the translation.
     #[value(name = "replace")]
     Replace,
+}
+
+impl OutputMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bilingual => "bilingual",
+            Self::Replace => "replace",
+        }
+    }
+}
+
+impl std::fmt::Display for OutputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for OutputMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "bilingual" => Ok(Self::Bilingual),
+            "replace" => Ok(Self::Replace),
+            _ => Err(format!("invalid output mode: {value}")),
+        }
+    }
 }
 
 /// How the engine translates a document's segments.

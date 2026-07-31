@@ -24,12 +24,12 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
-/// Suffix inserted before the extension when no explicit output path is given
-/// (and not `--in-place`): `book.epub` -> `book.bilingual.epub`. Also the marker
-/// the directory walk skips so re-running doesn't retranslate its own output.
-pub(crate) const OUTPUT_SUFFIX: &str = "bilingual";
+pub const BILINGUAL_OUTPUT_SUFFIX: &str = "bilingual";
+pub const TRANSLATED_OUTPUT_SUFFIX: &str = "translated";
 
 /// Knobs for a batch run, resolved from the CLI.
 pub struct BatchOpts {
@@ -50,6 +50,16 @@ pub struct BatchSummary {
     pub failed: usize,
     pub cancelled: bool,
 }
+
+#[derive(Clone, Debug, Default)]
+pub struct BatchProgress {
+    pub total: usize,
+    pub completed: usize,
+    pub translated: usize,
+    pub failed: usize,
+}
+
+pub type ProgressCallback = Arc<dyn Fn(BatchProgress) + Send + Sync>;
 
 /// One opened file awaiting its progressive write. Held only while it has units
 /// pending or in flight; dropped (written) the moment its last unit completes.
@@ -77,7 +87,6 @@ struct WriteOutcome {
 /// Run a whole batch through one shared concurrency pool with lazy file opening
 /// and progressive writing. See the module docs.
 pub async fn run_batch(engine: &Engine, inputs: Vec<PathBuf>, opts: BatchOpts) -> BatchSummary {
-    let concurrency = engine.concurrency();
     let pb = ProgressBar::new(0);
     pb.set_style(
         ProgressStyle::with_template("  [{bar:20.cyan/blue}] {pos}/{len} ({elapsed}) {msg}")
@@ -85,6 +94,41 @@ pub async fn run_batch(engine: &Engine, inputs: Vec<PathBuf>, opts: BatchOpts) -
             .progress_chars("=>-"),
     );
     pb.set_message("translating");
+
+    let cancel = CancellationToken::new();
+    let signal_cancel = cancel.clone();
+    let signal_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancel.cancel();
+        }
+    });
+    let summary = run_batch_impl(engine, inputs, opts, cancel, Some(pb), None).await;
+    signal_task.abort();
+    summary
+}
+
+/// Run a batch under application-level cancellation and progress reporting.
+/// This is used by the Web job runner; unlike [`run_batch`], it has no terminal
+/// UI and never installs a process-wide Ctrl-C handler.
+pub async fn run_batch_controlled(
+    engine: &Engine,
+    inputs: Vec<PathBuf>,
+    opts: BatchOpts,
+    cancel: CancellationToken,
+    on_progress: ProgressCallback,
+) -> BatchSummary {
+    run_batch_impl(engine, inputs, opts, cancel, None, Some(on_progress)).await
+}
+
+async fn run_batch_impl(
+    engine: &Engine,
+    inputs: Vec<PathBuf>,
+    opts: BatchOpts,
+    cancel: CancellationToken,
+    pb: Option<ProgressBar>,
+    on_progress: Option<ProgressCallback>,
+) -> BatchSummary {
+    let concurrency = engine.concurrency().max(1);
 
     let mut state = BatchState {
         opts,
@@ -94,6 +138,8 @@ pub async fn run_batch(engine: &Engine, inputs: Vec<PathBuf>, opts: BatchOpts) -
         write_tasks: JoinSet::new(),
         budget: None, // set below (borrowed mutably across open_file calls)
         pb,
+        on_progress,
+        progress: BatchProgress::default(),
         translated: 0,
         failed: 0,
         ok_files: 0,
@@ -104,8 +150,6 @@ pub async fn run_batch(engine: &Engine, inputs: Vec<PathBuf>, opts: BatchOpts) -
     // &mut self (which includes budget) — initialize here.
     state.budget = state.opts.limit;
 
-    let cancel = tokio::signal::ctrl_c();
-    tokio::pin!(cancel);
     let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
 
     loop {
@@ -123,7 +167,7 @@ pub async fn run_batch(engine: &Engine, inputs: Vec<PathBuf>, opts: BatchOpts) -
         tokio::select! {
             // Poll cancel first so Ctrl-C is observed promptly.
             biased;
-            _ = &mut cancel => {
+            _ = cancel.cancelled() => {
                 state.cancelled = true;
                 break;
             }
@@ -145,7 +189,9 @@ struct BatchState {
     next_file_idx: usize,
     write_tasks: JoinSet<WriteOutcome>,
     budget: Option<usize>,
-    pb: ProgressBar,
+    pb: Option<ProgressBar>,
+    on_progress: Option<ProgressCallback>,
+    progress: BatchProgress,
     translated: usize,
     failed: usize,
     ok_files: usize,
@@ -173,8 +219,12 @@ impl BatchState {
             match self.open_file(fidx, input) {
                 Ok(mut of) => {
                     // The bar's total grows as we learn each file's segment count.
-                    self.pb
-                        .inc_length(of.pending.iter().map(Unit::attempted).sum::<usize>() as u64);
+                    let added = of.pending.iter().map(Unit::attempted).sum::<usize>();
+                    self.progress.total += added;
+                    if let Some(pb) = &self.pb {
+                        pb.inc_length(added as u64);
+                    }
+                    self.report_progress();
                     if of.pending.is_empty() {
                         // Zero translatable segments: write the passthrough now,
                         // don't track it as an open file.
@@ -218,7 +268,12 @@ impl BatchState {
         let units = build_units(fidx, &segments, strategy, &mut self.budget);
         Ok(OpenFile {
             doc,
-            out_path: resolve_output(&input, self.opts.in_place, self.opts.output.as_deref()),
+            out_path: resolve_output(
+                &input,
+                self.opts.in_place,
+                self.opts.output.as_deref(),
+                self.opts.mode,
+            ),
             in_place: self.opts.in_place,
             input,
             pending: units.into_iter().collect(),
@@ -230,9 +285,15 @@ impl BatchState {
     /// A unit finished: route its pairs, advance the bar, and write the file if
     /// it just completed.
     fn on_done(&mut self, done: UnitDone) {
-        self.pb.inc(done.attempted as u64);
+        if let Some(pb) = &self.pb {
+            pb.inc(done.attempted as u64);
+        }
         self.translated += done.pairs.len();
         self.failed += done.attempted - done.pairs.len();
+        self.progress.completed += done.attempted;
+        self.progress.translated = self.translated;
+        self.progress.failed = self.failed;
+        self.report_progress();
         let fidx = done.file;
         let Some(of) = self.open.get_mut(&fidx) else {
             return;
@@ -310,13 +371,22 @@ impl BatchState {
                 }
             }
         }
-        self.pb.finish_and_clear();
+        if let Some(pb) = &self.pb {
+            pb.finish_and_clear();
+        }
+        self.report_progress();
         BatchSummary {
             ok_files: self.ok_files,
             failed_files: self.failed_files,
             translated: self.translated,
             failed: self.failed,
             cancelled: self.cancelled,
+        }
+    }
+
+    fn report_progress(&self) {
+        if let Some(callback) = &self.on_progress {
+            callback(self.progress.clone());
         }
     }
 }
@@ -413,35 +483,35 @@ fn visit(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             visit(&entry?.path(), out)?;
         }
     } else if meta.is_file() {
-        // Keep the filter in sync with supported formats via from_path, and
-        // skip our own suffixed outputs so re-running a dir doesn't retranslate
-        // them (book.bilingual.epub → stem's last dot-segment == "bilingual").
-        if Format::from_path(path).is_ok() && !is_suffix_output(path) {
+        // Keep the filter in sync with supported formats and skip both output
+        // modes so a directory rerun does not translate generated files again.
+        if Format::from_path(path).is_ok() && !is_generated_output(path) {
             out.push(path.to_path_buf());
         }
     }
     Ok(())
 }
 
-/// Is `path` one of our suffixed outputs? The last dot-segment of the file stem
-/// equals [`OUTPUT_SUFFIX`] (`book.bilingual` → `bilingual`). A stem with no dot
-/// (e.g. `bilingual.md`) is not a match — our outputs always have a prefix.
-pub(crate) fn is_suffix_output(path: &Path) -> bool {
+/// Whether `path` is a bilingual or replace-mode output generated by Ferryman.
+pub fn is_generated_output(path: &Path) -> bool {
     path.file_stem()
         .and_then(|s| s.to_str())
         .and_then(|stem| stem.rsplit_once('.'))
-        .is_some_and(|(_, last)| last == OUTPUT_SUFFIX)
+        .is_some_and(|(_, last)| matches!(last, BILINGUAL_OUTPUT_SUFFIX | TRANSLATED_OUTPUT_SUFFIX))
 }
 
-/// `book.epub` → `book.bilingual.epub` (same directory). Used when neither
-/// `--output` nor `--in-place` is given.
-fn suffix_path(path: &Path) -> PathBuf {
+/// Add the mode-specific output suffix while preserving the extension.
+pub fn suffixed_output_path(path: &Path, mode: OutputMode) -> PathBuf {
+    let suffix = match mode {
+        OutputMode::Bilingual => BILINGUAL_OUTPUT_SUFFIX,
+        OutputMode::Replace => TRANSLATED_OUTPUT_SUFFIX,
+    };
     let mut name = path
         .file_stem()
         .map(|s| s.to_os_string())
         .unwrap_or_default();
     name.push(".");
-    name.push(OUTPUT_SUFFIX);
+    name.push(suffix);
     if let Some(ext) = path.extension() {
         name.push(".");
         name.push(ext);
@@ -461,13 +531,18 @@ fn inplace_temp(target: &Path) -> PathBuf {
 
 /// Resolve a file's output path: explicit `--output`, in-place, or a suffixed
 /// sibling next to the source.
-fn resolve_output(input: &Path, in_place: bool, explicit: Option<&Path>) -> PathBuf {
+fn resolve_output(
+    input: &Path,
+    in_place: bool,
+    explicit: Option<&Path>,
+    mode: OutputMode,
+) -> PathBuf {
     if in_place {
         input.to_path_buf()
     } else if let Some(o) = explicit {
         o.to_path_buf()
     } else {
-        suffix_path(input)
+        suffixed_output_path(input, mode)
     }
 }
 
@@ -597,10 +672,22 @@ mod tests {
     }
 
     #[test]
-    fn is_suffix_output_detects_bilingual_stem() {
-        assert!(is_suffix_output(Path::new("book.bilingual.epub")));
-        assert!(is_suffix_output(Path::new("/x/y/a.bilingual.txt")));
-        assert!(!is_suffix_output(Path::new("book.epub")));
-        assert!(!is_suffix_output(Path::new("bilingual.md"))); // stem has no dot
+    fn generated_outputs_detect_both_modes() {
+        assert!(is_generated_output(Path::new("book.bilingual.epub")));
+        assert!(is_generated_output(Path::new("/x/y/a.translated.txt")));
+        assert!(!is_generated_output(Path::new("book.epub")));
+        assert!(!is_generated_output(Path::new("bilingual.md")));
+    }
+
+    #[test]
+    fn output_suffix_tracks_mode() {
+        assert_eq!(
+            suffixed_output_path(Path::new("book.epub"), OutputMode::Bilingual),
+            PathBuf::from("book.bilingual.epub")
+        );
+        assert_eq!(
+            suffixed_output_path(Path::new("book.epub"), OutputMode::Replace),
+            PathBuf::from("book.translated.epub")
+        );
     }
 }

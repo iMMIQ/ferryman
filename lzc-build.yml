@@ -1,0 +1,9 @@
+manifest: ./lzc-manifest.yml
+buildscript: sh ./scripts/build-release.sh
+pkgout: ./dist
+icon: ./icon.png
+ai-pod-service: ./ai-pod-service
+images:
+  ferryman-web:
+    context: ./
+    dockerfile: ./Dockerfile.web

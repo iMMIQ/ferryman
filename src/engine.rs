@@ -14,6 +14,27 @@
 use crate::cache::Cache;
 use crate::format::SegmentId;
 use crate::translate;
+use anyhow::Result;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+pub fn build_translation_client(
+    timeout: Duration,
+    bearer_token: Option<&str>,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if let Some(token) = bearer_token {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+        builder = builder.default_headers(headers);
+    }
+    Ok(builder.build()?)
+}
 
 pub struct Engine {
     client: reqwest::Client,
@@ -22,6 +43,7 @@ pub struct Engine {
     target: String,
     concurrency: usize,
     cache: Option<Cache>,
+    request_limiter: Option<Arc<Semaphore>>,
 }
 
 /// One self-contained unit of translation work. The caller ([`crate::batch`])
@@ -88,12 +110,34 @@ impl Engine {
             target,
             concurrency,
             cache,
+            request_limiter: None,
         }
+    }
+
+    /// Share an aggregate request budget with other engines. The Web scheduler
+    /// uses one limiter per model preset so concurrent jobs cannot multiply the
+    /// configured vLLM concurrency.
+    pub fn with_request_limiter(mut self, limiter: Arc<Semaphore>) -> Self {
+        self.request_limiter = Some(limiter);
+        self
     }
 
     /// The shared pool's in-flight cap (the queue layer sizes itself to this).
     pub fn concurrency(&self) -> usize {
         self.concurrency
+    }
+
+    async fn acquire_request_permit(&self) -> Option<OwnedSemaphorePermit> {
+        match &self.request_limiter {
+            Some(limiter) => Some(
+                limiter
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("translation request limiter must remain open"),
+            ),
+            None => None,
+        }
     }
 
     /// Translate one [`Unit`]: cache fast-path, then `translate`/`translate_batch`,
@@ -122,6 +166,7 @@ impl Engine {
                         };
                     }
                 }
+                let _request_permit = self.acquire_request_permit().await;
                 match translate::translate(client, endpoint, model, &text, target).await {
                     Ok(tr) => {
                         // Put before returning: even if the future is dropped
@@ -192,6 +237,7 @@ impl Engine {
                     };
                 }
 
+                let _request_permit = self.acquire_request_permit().await;
                 let trs = translate::translate_batch(
                     client, endpoint, model, &cue_refs, &ctx_refs, target,
                 )
@@ -212,5 +258,44 @@ impl Engine {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn test_engine(limiter: Arc<Semaphore>) -> Engine {
+        Engine::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".to_string(),
+            "model".to_string(),
+            "target".to_string(),
+            8,
+            None,
+        )
+        .with_request_limiter(limiter)
+    }
+
+    #[tokio::test]
+    async fn engines_share_one_request_budget() {
+        let limiter = Arc::new(Semaphore::new(1));
+        let first = test_engine(limiter.clone());
+        let second = test_engine(limiter);
+
+        let first_permit = first.acquire_request_permit().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), second.acquire_request_permit())
+                .await
+                .is_err()
+        );
+
+        drop(first_permit);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), second.acquire_request_permit())
+                .await
+                .is_ok()
+        );
     }
 }

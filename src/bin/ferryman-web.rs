@@ -368,6 +368,14 @@ fn json_error(status: StatusCode, error: impl Into<String>) -> Response {
         .into_response()
 }
 
+fn agent_response(status: StatusCode, value: serde_json::Value) -> Response {
+    if status == StatusCode::NO_CONTENT {
+        status.into_response()
+    } else {
+        (status, Json(value)).into_response()
+    }
+}
+
 fn user_owner(headers: &HeaderMap, allow_local: bool) -> Result<String, StatusCode> {
     Ok(user_identity(headers, allow_local)?.owner)
 }
@@ -1457,6 +1465,114 @@ async fn runtime_status(State(state): State<AppState>) -> Response {
     }
 }
 
+async fn model_catalog(State(state): State<AppState>) -> Response {
+    match agent_json(&state.config, reqwest::Method::GET, "/models", None).await {
+        Ok((status, value)) => agent_response(status, value),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
+async fn model_storage(State(state): State<AppState>) -> Response {
+    match agent_json(&state.config, reqwest::Method::GET, "/storage", None).await {
+        Ok((status, value)) => agent_response(status, value),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
+async fn start_model_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(preset): Path<Preset>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if user_owner(&headers, state.config.allow_local_user).is_err() {
+        return json_error(StatusCode::UNAUTHORIZED, "missing SAFE_UID header");
+    }
+    let path = format!("/models/{preset}/download");
+    match agent_json(&state.config, reqwest::Method::POST, &path, Some(body)).await {
+        Ok((status, value)) => agent_response(status, value),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
+async fn pause_model_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(preset): Path<Preset>,
+) -> Response {
+    if user_owner(&headers, state.config.allow_local_user).is_err() {
+        return json_error(StatusCode::UNAUTHORIZED, "missing SAFE_UID header");
+    }
+    let path = format!("/models/{preset}/pause");
+    match agent_json(&state.config, reqwest::Method::POST, &path, None).await {
+        Ok((status, value)) => agent_response(status, value),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
+async fn delete_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(preset): Path<Preset>,
+) -> Response {
+    if user_owner(&headers, state.config.allow_local_user).is_err() {
+        return json_error(StatusCode::UNAUTHORIZED, "missing SAFE_UID header");
+    }
+    let path = format!("/models/{preset}");
+    match agent_json(&state.config, reqwest::Method::DELETE, &path, None).await {
+        Ok((status, value)) => agent_response(status, value),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
+async fn start_source_benchmark(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if user_owner(&headers, state.config.allow_local_user).is_err() {
+        return json_error(StatusCode::UNAUTHORIZED, "missing SAFE_UID header");
+    }
+    match agent_json(
+        &state.config,
+        reqwest::Method::POST,
+        "/model-sources/benchmark",
+        Some(body),
+    )
+    .await
+    {
+        Ok((status, value)) => agent_response(status, value),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
+async fn cancel_source_benchmark(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if user_owner(&headers, state.config.allow_local_user).is_err() {
+        return json_error(StatusCode::UNAUTHORIZED, "missing SAFE_UID header");
+    }
+    match agent_json(
+        &state.config,
+        reqwest::Method::DELETE,
+        "/model-sources/benchmark",
+        None,
+    )
+    .await
+    {
+        Ok((status, value)) => agent_response(status, value),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
+async fn clear_runtime_cache(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if user_owner(&headers, state.config.allow_local_user).is_err() {
+        return json_error(StatusCode::UNAUTHORIZED, "missing SAFE_UID header");
+    }
+    match agent_json(&state.config, reqwest::Method::DELETE, "/cache", None).await {
+        Ok((status, value)) => agent_response(status, value),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
 async fn runtime_start(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2149,6 +2265,19 @@ async fn main() -> Result<()> {
         .route("/api/runtime", get(runtime_status))
         .route("/api/runtime/start", post(runtime_start))
         .route("/api/runtime/stop", post(runtime_stop))
+        .route("/api/models", get(model_catalog))
+        .route("/api/models/{preset}", axum::routing::delete(delete_model))
+        .route("/api/models/{preset}/download", post(start_model_download))
+        .route("/api/models/{preset}/pause", post(pause_model_download))
+        .route(
+            "/api/model-sources/benchmark",
+            post(start_source_benchmark).delete(cancel_source_benchmark),
+        )
+        .route("/api/storage", get(model_storage))
+        .route(
+            "/api/runtime-cache",
+            axum::routing::delete(clear_runtime_cache),
+        )
         .fallback_service(ServeDir::new(web_dir).append_index_html_on_directories(true))
         .layer(TraceLayer::new_for_http())
         .with_state(state);

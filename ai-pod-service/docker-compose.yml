@@ -8,6 +8,7 @@ services:
       FERRYMAN_AGENT_LISTEN: 0.0.0.0:8090
       FERRYMAN_AGENT_TOKEN: f060f336356356b8049e0ebae0a6c8d4f3867a7d6edc17249a853f59baf3c559
       FERRYMAN_MODEL_ROOT: /models
+      FERRYMAN_CACHE_ROOT: /root/.cache
       FERRYMAN_IDLE_TIMEOUT_SECONDS: 600
       RUST_LOG: info
       LD_PRELOAD: ""
@@ -18,7 +19,7 @@ services:
       TORCHINDUCTOR_CACHE_DIR: /root/.cache/torchinductor
     volumes:
       - ./ferryman-agent:/usr/local/bin/ferryman-agent:ro
-      - ${LZC_AGENT_DATA_DIR}/models:/models:ro
+      - ${LZC_AGENT_DATA_DIR}/models:/models
       - ${LZC_AGENT_CACHE_DIR}/vllm:/root/.cache
     labels:
       - "traefik.enable=true"

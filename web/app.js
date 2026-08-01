@@ -28,6 +28,7 @@ const els = {
   runtimeMeta: document.querySelector("#runtime-meta"),
   startRuntime: document.querySelector("#start-runtime"),
   stopRuntime: document.querySelector("#stop-runtime"),
+  manageModels: document.querySelector("#manage-models"),
   runtimeStartup: document.querySelector("#runtime-startup"),
   startupStage: document.querySelector("#startup-stage"),
   startupPercent: document.querySelector("#startup-percent"),
@@ -38,6 +39,16 @@ const els = {
   startupLogDetails: document.querySelector("#startup-log-details"),
   startupLogCount: document.querySelector("#startup-log-count"),
   startupLogOutput: document.querySelector("#startup-log-output"),
+  modelDialog: document.querySelector("#model-dialog"),
+  closeModelDialog: document.querySelector("#close-model-dialog"),
+  doneModelDialog: document.querySelector("#done-model-dialog"),
+  modelList: document.querySelector("#model-list"),
+  modelStorageSummary: document.querySelector("#model-storage-summary"),
+  modelSource: document.querySelector("#model-source"),
+  benchmarkSources: document.querySelector("#benchmark-sources"),
+  benchmarkResults: document.querySelector("#benchmark-results"),
+  runtimeCacheSize: document.querySelector("#runtime-cache-size"),
+  clearRuntimeCache: document.querySelector("#clear-runtime-cache"),
   folderDialog: document.querySelector("#folder-dialog"),
   folderDialogTitle: document.querySelector("#folder-dialog-title"),
   folderStorage: document.querySelector("#folder-storage"),
@@ -65,6 +76,9 @@ let runtimePreset = "7b-fp8";
 let toastTimer;
 let runtimePollTimer;
 let runtimeState = "stopped";
+let modelCatalog = { models: [], available_bytes: 0, benchmark: { state: "idle", results: [] } };
+let modelsByPreset = new Map();
+let modelStorage = null;
 let lastLogText = "";
 let sourceMode = "upload";
 let sourceStorage = "documents";
@@ -178,7 +192,12 @@ function formatBytes(bytes) {
   const value = Number(bytes) || 0;
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
-  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MiB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+}
+
+function formatSpeed(bytesPerSecond) {
+  return `${formatBytes(bytesPerSecond)}/s`;
 }
 
 function displayPath(path) {
@@ -323,6 +342,107 @@ async function showFirstJobPage(silent = true) {
   await refreshJobs(silent);
 }
 
+const modelStateNames = {
+  absent: "未下载",
+  benchmarking: "正在测速",
+  downloading: "下载中",
+  paused: "已暂停",
+  verifying: "正在校验",
+  ready: "已安装",
+  failed: "准备失败",
+};
+
+function modelName(preset) {
+  return preset === "30b-fp8" ? "Hy-MT2 30B FP8" : "Hy-MT2 7B FP8";
+}
+
+function selectedModel() {
+  return modelsByPreset.get(runtimePreset) || null;
+}
+
+function modelProgress(model) {
+  if (!model?.expected_bytes) return 0;
+  return Math.max(0, Math.min(100, Math.round((model.downloaded_bytes / model.expected_bytes) * 100)));
+}
+
+function updateRuntimeControls() {
+  const model = selectedModel();
+  const label = els.startRuntime.querySelector(".button-label");
+  const preparing = model && ["benchmarking", "downloading", "verifying"].includes(model.state);
+  if (!model || model.state === "absent") label.textContent = "下载";
+  else if (model.state === "paused") label.textContent = "继续";
+  else if (model.state === "failed") label.textContent = "重试";
+  else if (preparing) label.textContent = `${modelProgress(model)}%`;
+  else label.textContent = "启动";
+  els.startRuntime.disabled = preparing || ["starting", "stopping"].includes(runtimeState);
+  const submitPreset = document.querySelector('input[name="preset"]:checked')?.value || runtimePreset;
+  const submitModel = modelsByPreset.get(submitPreset);
+  els.submitLabel.textContent = submitModel?.state === "ready"
+    ? "加入翻译队列"
+    : `下载 ${submitPreset === "30b-fp8" ? "30B" : "7B"} 模型并加入队列`;
+}
+
+function renderBenchmark(benchmark) {
+  const results = Array.isArray(benchmark?.results) ? benchmark.results : [];
+  els.benchmarkSources.disabled = benchmark?.state === "running";
+  els.benchmarkSources.textContent = benchmark?.state === "running" ? "测速中" : "重新测速";
+  if (!results.length) {
+    els.benchmarkResults.innerHTML = `<span class="muted">${benchmark?.state === "running" ? "正在检测三个下载来源" : "首次下载时会自动测速"}</span>`;
+    return;
+  }
+  els.benchmarkResults.innerHTML = results.map((result) => {
+    const recommended = benchmark.recommended === result.source;
+    const metric = result.available
+      ? `${formatSpeed(result.bytes_per_second || 0)} · ${result.latency_ms || 0} ms`
+      : "无法连接";
+    return `<div class="benchmark-row ${result.available ? "available" : "unavailable"}">
+      <span class="source-dot" aria-hidden="true"></span>
+      <strong>${escapeHtml(result.label)}</strong>
+      <span>${metric}</span>
+      ${recommended ? '<span class="recommended-source">推荐</span>' : ""}
+    </div>`;
+  }).join("");
+}
+
+function renderModelList() {
+  const models = modelCatalog.models || [];
+  if (modelStorage) {
+    els.modelStorageSummary.textContent = `模型 ${formatBytes(modelStorage.model_bytes)} · 未完成 ${formatBytes(modelStorage.partial_bytes)} · 可用 ${formatBytes(modelStorage.available_bytes)}`;
+  } else {
+    els.modelStorageSummary.textContent = `可用 ${formatBytes(modelCatalog.available_bytes)}`;
+  }
+  els.modelList.innerHTML = models.map((model) => {
+    const progress = modelProgress(model);
+    const active = ["benchmarking", "downloading", "verifying"].includes(model.state);
+    const meta = model.state === "ready"
+      ? formatBytes(model.downloaded_bytes)
+      : model.state === "absent"
+        ? `需要 ${formatBytes(model.expected_bytes)}`
+        : `${formatBytes(model.downloaded_bytes)} / ${formatBytes(model.expected_bytes)}${model.bytes_per_second ? ` · ${formatSpeed(model.bytes_per_second)}` : ""}`;
+    let action = `<button class="button secondary" data-model-action="download" data-preset="${model.preset}" type="button">下载</button>`;
+    if (active) action = `<button class="button secondary" data-model-action="pause" data-preset="${model.preset}" type="button">暂停</button>`;
+    else if (model.state === "paused") action = `<button class="button secondary" data-model-action="download" data-preset="${model.preset}" type="button">继续</button>`;
+    else if (model.state === "failed") action = `<button class="button secondary" data-model-action="download" data-preset="${model.preset}" type="button">重试</button>`;
+    else if (model.state === "ready") action = `<button class="button danger-outline" data-model-action="delete" data-preset="${model.preset}" type="button">删除</button>`;
+    return `<div class="model-row">
+      <div class="model-row-main">
+        <div class="model-row-title"><strong>${modelName(model.preset)}</strong><span class="model-state ${model.state}">${modelStateNames[model.state] || model.state}</span></div>
+        <span>${escapeHtml(model.last_error || meta)}</span>
+        ${active || model.state === "paused" ? `<div class="model-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><div style="width:${progress}%"></div></div>` : ""}
+      </div>
+      ${action}
+    </div>`;
+  }).join("");
+  renderBenchmark(modelCatalog.benchmark);
+}
+
+function renderModelCatalog(catalog) {
+  modelCatalog = catalog || modelCatalog;
+  modelsByPreset = new Map((modelCatalog.models || []).map((model) => [model.preset, model]));
+  renderModelList();
+  updateRuntimeControls();
+}
+
 function renderRuntime(runtime) {
   const state = runtime.state || "failed";
   runtimeState = state;
@@ -332,9 +452,22 @@ function renderRuntime(runtime) {
   else if (state === "failed") els.runtimeDot.classList.add("failed");
   else els.runtimeDot.classList.add("neutral");
   els.runtimeLabel.textContent = runtimeNames[state] || state;
-  els.runtimeModel.textContent = runtime.preset ? (runtime.preset === "30b-fp8" ? "Hy-MT2 30B FP8" : "Hy-MT2 7B FP8") : "未加载";
-  els.runtimeMeta.textContent = runtime.last_error || `${runtime.active_requests || 0} 个活动请求 · ${runtime.leases || 0} 个占用任务`;
-  els.startRuntime.disabled = ["starting", "stopping"].includes(state);
+  const model = selectedModel();
+  els.runtimeModel.textContent = runtime.preset ? modelName(runtime.preset) : modelName(runtimePreset);
+  if (runtime.last_error) {
+    els.runtimeMeta.textContent = runtime.last_error;
+  } else if (state !== "stopped") {
+    els.runtimeMeta.textContent = `${runtime.active_requests || 0} 个活动请求 · ${runtime.leases || 0} 个占用任务`;
+  } else if (!model || model.state === "absent") {
+    els.runtimeMeta.textContent = `尚未下载 · 需要 ${formatBytes(model?.expected_bytes || 0)}`;
+  } else if (["benchmarking", "downloading", "verifying", "paused"].includes(model.state)) {
+    els.runtimeMeta.textContent = `${modelStateNames[model.state]} · ${formatBytes(model.downloaded_bytes)} / ${formatBytes(model.expected_bytes)}`;
+  } else if (model.state === "failed") {
+    els.runtimeMeta.textContent = model.last_error || "模型准备失败";
+  } else {
+    els.runtimeMeta.textContent = "模型已安装 · 等待启动";
+  }
+  updateRuntimeControls();
   els.stopRuntime.disabled = ["stopped", "stopping"].includes(state);
 
   const showStartup = ["starting", "failed"].includes(state)
@@ -371,7 +504,9 @@ function renderRuntime(runtime) {
 
 async function refreshRuntime(silent = true) {
   try {
-    renderRuntime(await api("/api/runtime"));
+    const [runtime, catalog] = await Promise.all([api("/api/runtime"), api("/api/models")]);
+    renderModelCatalog(catalog);
+    renderRuntime(runtime);
   } catch (error) {
     renderRuntime({ state: "failed", last_error: "无法连接算力舱 Agent" });
     if (!silent) showToast(error.message);
@@ -381,7 +516,9 @@ async function refreshRuntime(silent = true) {
 async function pollRuntime() {
   await refreshRuntime();
   clearTimeout(runtimePollTimer);
-  runtimePollTimer = setTimeout(pollRuntime, runtimeState === "starting" ? 1000 : 2500);
+  const modelBusy = (modelCatalog.models || []).some((model) => ["benchmarking", "downloading", "verifying"].includes(model.state))
+    || modelCatalog.benchmark?.state === "running";
+  runtimePollTimer = setTimeout(pollRuntime, runtimeState === "starting" || modelBusy ? 1000 : 2500);
 }
 
 function updateFile(file) {
@@ -761,6 +898,37 @@ function selectPreset(preset) {
       segment.classList.toggle("active", segment.contains(jobPreset));
     });
   }
+  updateRuntimeControls();
+  if (runtimeState === "stopped") {
+    renderRuntime({ state: "stopped", active_requests: 0, leases: 0 });
+  }
+}
+
+async function requestModelDownload(preset) {
+  await api(`/api/models/${preset}/download`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source: els.modelSource.value || "auto" }),
+  });
+  await refreshRuntime(false);
+}
+
+async function openModelDialog() {
+  if (!els.modelDialog.open) els.modelDialog.showModal();
+  document.body.classList.add("model-dialog-open");
+  try {
+    const [catalog, storage] = await Promise.all([api("/api/models"), api("/api/storage")]);
+    modelStorage = storage;
+    renderModelCatalog(catalog);
+    els.runtimeCacheSize.textContent = `${formatBytes(storage.cache_bytes)} · 可安全清理`;
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function closeModelDialog() {
+  els.modelDialog.close();
+  document.body.classList.remove("model-dialog-open");
 }
 
 document.querySelectorAll(".segmented input").forEach((input) => {
@@ -796,6 +964,12 @@ els.form.addEventListener("submit", async (event) => {
   els.submit.disabled = true;
   try {
     const form = new FormData(els.form);
+    const preset = form.get("preset");
+    const model = modelsByPreset.get(preset);
+    if (!model || !["ready", "benchmarking", "downloading", "verifying"].includes(model.state)) {
+      await requestModelDownload(preset);
+      showToast("模型开始准备，任务会在模型就绪后自动执行");
+    }
     const settings = {
       batch_size: Number(form.get("batch_size")),
       context_segments: Number(form.get("context_segments")),
@@ -876,17 +1050,91 @@ els.jobsBody.addEventListener("click", async (event) => {
 els.startRuntime.addEventListener("click", async () => {
   els.startRuntime.disabled = true;
   try {
-    await api("/api/runtime/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ preset: runtimePreset }),
-    });
-    showToast("模型启动请求已提交");
+    const model = selectedModel();
+    if (!model || model.state !== "ready") {
+      await requestModelDownload(runtimePreset);
+      showToast("模型下载请求已提交");
+      await openModelDialog();
+    } else {
+      await api("/api/runtime/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ preset: runtimePreset }),
+      });
+      showToast("模型启动请求已提交");
+    }
     await refreshRuntime(false);
   } catch (error) {
     showToast(error.message);
   } finally {
-    els.startRuntime.disabled = false;
+    updateRuntimeControls();
+  }
+});
+
+els.manageModels.addEventListener("click", openModelDialog);
+els.closeModelDialog.addEventListener("click", closeModelDialog);
+els.doneModelDialog.addEventListener("click", closeModelDialog);
+els.modelDialog.addEventListener("cancel", () => document.body.classList.remove("model-dialog-open"));
+
+els.modelList.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-model-action]");
+  if (!button) return;
+  const preset = button.dataset.preset;
+  const action = button.dataset.modelAction;
+  if (action === "delete" && !window.confirm(`删除 ${modelName(preset)}？以后使用时需要重新下载。`)) return;
+  button.disabled = true;
+  try {
+    if (action === "download") {
+      await requestModelDownload(preset);
+      showToast("模型下载已开始");
+    } else if (action === "pause") {
+      await api(`/api/models/${preset}/pause`, { method: "POST" });
+      showToast("正在暂停下载，已下载内容会保留");
+    } else if (action === "delete") {
+      await api(`/api/models/${preset}`, { method: "DELETE" });
+      showToast("模型已删除");
+    }
+    await refreshRuntime(false);
+    const storage = await api("/api/storage");
+    modelStorage = storage;
+    renderModelList();
+    els.runtimeCacheSize.textContent = `${formatBytes(storage.cache_bytes)} · 可安全清理`;
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+els.benchmarkSources.addEventListener("click", async () => {
+  els.benchmarkSources.disabled = true;
+  try {
+    await api("/api/model-sources/benchmark", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ preset: runtimePreset }),
+    });
+    showToast("正在从算力舱测试真实模型分片");
+    await refreshRuntime(false);
+  } catch (error) {
+    showToast(error.message);
+  }
+});
+
+els.clearRuntimeCache.addEventListener("click", async () => {
+  if (!window.confirm("清理推理缓存？模型不会删除，但下次启动需要重新编译。")) return;
+  els.clearRuntimeCache.disabled = true;
+  try {
+    await api("/api/runtime-cache", { method: "DELETE" });
+    const storage = await api("/api/storage");
+    modelStorage = storage;
+    renderModelList();
+    els.runtimeCacheSize.textContent = `${formatBytes(storage.cache_bytes)} · 可安全清理`;
+    showToast("推理缓存已清理");
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    els.clearRuntimeCache.disabled = false;
   }
 });
 

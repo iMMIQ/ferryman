@@ -16,6 +16,10 @@ pub enum Preset {
 pub struct PresetConfig {
     pub model_dir_name: &'static str,
     pub serve_model: &'static str,
+    pub huggingface_repo: &'static str,
+    pub huggingface_revision: &'static str,
+    pub modelscope_repo: &'static str,
+    pub download_bytes: u64,
     pub dtype: &'static str,
     pub kv_cache_dtype: &'static str,
     pub gpu_memory_utilization: f32,
@@ -32,6 +36,10 @@ impl Preset {
             Preset::SevenBFp8 => PresetConfig {
                 model_dir_name: "Hy-MT2-7B-FP8",
                 serve_model: "/models/Hy-MT2-7B-FP8",
+                huggingface_repo: "tencent/Hy-MT2-7B-FP8",
+                huggingface_revision: "883d09eb21d9be92058556cd0a4016d8a648c7db",
+                modelscope_repo: "Tencent-Hunyuan/Hy-MT2-7B-FP8",
+                download_bytes: 8_046_402_613,
                 dtype: "float16",
                 kv_cache_dtype: "fp8",
                 gpu_memory_utilization: 0.30,
@@ -44,6 +52,10 @@ impl Preset {
             Preset::ThirtyBFp8 => PresetConfig {
                 model_dir_name: "Hy-MT2-30B-A3B-FP8",
                 serve_model: "/models/Hy-MT2-30B-A3B-FP8",
+                huggingface_repo: "tencent/Hy-MT2-30B-A3B-FP8",
+                huggingface_revision: "b69671c83c2137c6982209715030df82f0093ee1",
+                modelscope_repo: "Tencent-Hunyuan/Hy-MT2-30B-A3B-FP8",
+                download_bytes: 30_593_608_342,
                 dtype: "auto",
                 kv_cache_dtype: "fp8",
                 gpu_memory_utilization: 0.55,

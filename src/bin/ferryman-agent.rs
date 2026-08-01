@@ -20,9 +20,15 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+#[path = "ferryman_agent/model_manager.rs"]
+mod model_manager;
+
+use model_manager::{DownloadRequest, ModelManager, ModelPhase};
+
 #[derive(Clone)]
 struct AppState {
     controller: Controller,
+    models: ModelManager,
     client: reqwest::Client,
     token: Arc<str>,
     vllm_endpoint: Arc<str>,
@@ -819,6 +825,123 @@ async fn runtime_status(
     Ok(Json(state.controller.snapshot()))
 }
 
+async fn model_catalog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<model_manager::ModelCatalog>, Response> {
+    authorize(&headers, &state.token).map_err(|_| unauthorized_response())?;
+    Ok(Json(state.models.catalog().await))
+}
+
+async fn start_model_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(preset): Path<Preset>,
+    Json(request): Json<DownloadRequest>,
+) -> Response {
+    if authorize(&headers, &state.token).is_err() {
+        return unauthorized_response();
+    }
+    match state.models.start_download(preset, request.source).await {
+        Ok(()) => (StatusCode::ACCEPTED, Json(state.models.catalog().await)).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(ErrorBody { error })).into_response(),
+    }
+}
+
+async fn pause_model_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(preset): Path<Preset>,
+) -> Response {
+    if authorize(&headers, &state.token).is_err() {
+        return unauthorized_response();
+    }
+    match state.models.pause_download(preset).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(ErrorBody { error })).into_response(),
+    }
+}
+
+async fn delete_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(preset): Path<Preset>,
+) -> Response {
+    if authorize(&headers, &state.token).is_err() {
+        return unauthorized_response();
+    }
+    let runtime = state.controller.snapshot();
+    if runtime.preset == Some(preset) && runtime.state != RuntimePhase::Stopped {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "unload the model before deleting it".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    match state.models.delete_model(preset).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(ErrorBody { error })).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct BenchmarkRequest {
+    preset: Preset,
+}
+
+async fn start_source_benchmark(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<BenchmarkRequest>,
+) -> Response {
+    if authorize(&headers, &state.token).is_err() {
+        return unauthorized_response();
+    }
+    match state.models.start_benchmark(request.preset).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(ErrorBody { error })).into_response(),
+    }
+}
+
+async fn cancel_source_benchmark(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize(&headers, &state.token).is_err() {
+        return unauthorized_response();
+    }
+    state.models.cancel_benchmark().await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn storage_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<model_manager::StorageStatus>, Response> {
+    authorize(&headers, &state.token).map_err(|_| unauthorized_response())?;
+    Ok(Json(state.models.storage_status().await))
+}
+
+async fn clear_runtime_cache(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize(&headers, &state.token).is_err() {
+        return unauthorized_response();
+    }
+    if state.controller.snapshot().state != RuntimePhase::Stopped {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "unload the model before clearing the runtime cache".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    match state.models.clear_cache().await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { error })).into_response()
+        }
+    }
+}
+
 async fn acquire_runtime(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -826,6 +949,19 @@ async fn acquire_runtime(
 ) -> Response {
     if authorize(&headers, &state.token).is_err() {
         return unauthorized_response();
+    }
+    let model = state.models.status(request.preset).await;
+    if model.state != ModelPhase::Ready {
+        if let Err(error) = state.models.ensure_download(request.preset).await {
+            return (StatusCode::CONFLICT, Json(ErrorBody { error })).into_response();
+        }
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: format!("model is being prepared ({:?})", model.state),
+            }),
+        )
+            .into_response();
     }
     match state.controller.acquire(request).await {
         Ok(status) => (StatusCode::ACCEPTED, Json(status)).into_response(),
@@ -947,6 +1083,7 @@ async fn main() -> anyhow::Result<()> {
         .max(30);
     let vllm_bin = env::var("FERRYMAN_VLLM_BIN").unwrap_or_else(|_| "vllm".into());
     let model_root = env::var("FERRYMAN_MODEL_ROOT").unwrap_or_else(|_| "/models".into());
+    let cache_root = env::var("FERRYMAN_CACHE_ROOT").unwrap_or_else(|_| "/root/.cache".into());
     let vllm_endpoint =
         env::var("FERRYMAN_VLLM_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:8001".into());
     let client = reqwest::Client::builder()
@@ -956,12 +1093,16 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(idle_timeout),
         Duration::from_secs(start_timeout),
         vllm_bin,
-        model_root,
+        model_root.clone(),
         vllm_endpoint.clone(),
         client.clone(),
     );
+    let models = ModelManager::new(model_root.into(), cache_root.into())
+        .await
+        .map_err(anyhow::Error::msg)?;
     let state = AppState {
         controller: controller.clone(),
+        models,
         client,
         token: Arc::from(token),
         vllm_endpoint: Arc::from(vllm_endpoint),
@@ -972,6 +1113,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/runtime/acquire", post(acquire_runtime))
         .route("/runtime/leases/{lease_id}", delete(release_runtime))
         .route("/runtime/stop", post(stop_runtime))
+        .route("/models", get(model_catalog))
+        .route("/models/{preset}/download", post(start_model_download))
+        .route("/models/{preset}", delete(delete_model))
+        .route("/models/{preset}/pause", post(pause_model_download))
+        .route(
+            "/model-sources/benchmark",
+            post(start_source_benchmark).delete(cancel_source_benchmark),
+        )
+        .route("/storage", get(storage_status))
+        .route("/cache", delete(clear_runtime_cache))
         .route("/v1/chat/completions", post(proxy_chat))
         .layer(TraceLayer::new_for_http())
         .with_state(state);

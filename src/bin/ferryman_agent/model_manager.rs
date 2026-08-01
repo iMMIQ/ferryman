@@ -198,8 +198,10 @@ impl ModelManager {
 
     pub async fn catalog(&self) -> ModelCatalog {
         let models = self.inner.models.read().await;
-        let mut values: Vec<_> = models.values().cloned().collect();
-        values.sort_by_key(|status| status.preset.as_str());
+        let values = [Preset::SevenBFp8, Preset::ThirtyBFp8]
+            .into_iter()
+            .filter_map(|preset| models.get(&preset).cloned())
+            .collect();
         ModelCatalog {
             models: values,
             available_bytes: available_bytes(&self.inner.model_root),

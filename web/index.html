@@ -37,6 +37,7 @@
           <button class="segment active" data-runtime-preset="7b-fp8" type="button" aria-pressed="true">7B FP8</button>
           <button class="segment" data-runtime-preset="30b-fp8" type="button" aria-pressed="false">30B FP8</button>
         </div>
+        <button id="manage-models" class="button secondary" type="button">模型管理</button>
         <button id="start-runtime" class="button secondary" type="button">
           <span aria-hidden="true">▶</span><span class="button-label">启动</span>
         </button>
@@ -306,6 +307,61 @@
           </div>
           <button id="cancel-folder-dialog" class="button secondary" type="button">取消</button>
           <button id="select-current-folder" class="button primary" type="button">确认选择</button>
+        </footer>
+      </div>
+    </dialog>
+
+    <dialog id="model-dialog" class="model-dialog" aria-labelledby="model-dialog-title">
+      <div class="model-dialog-shell">
+        <header class="model-dialog-header">
+          <div>
+            <span class="eyebrow">算力舱存储</span>
+            <h2 id="model-dialog-title">模型管理</h2>
+          </div>
+          <button id="close-model-dialog" class="icon-button" type="button" aria-label="关闭模型管理">×</button>
+        </header>
+
+        <section class="model-dialog-section" aria-labelledby="installed-models-title">
+          <div class="model-section-heading">
+            <div>
+              <h3 id="installed-models-title">翻译模型</h3>
+              <span id="model-storage-summary">正在读取算力舱存储</span>
+            </div>
+          </div>
+          <div id="model-list" class="model-list"></div>
+        </section>
+
+        <section class="model-dialog-section source-section" aria-labelledby="download-source-title">
+          <div class="model-section-heading source-heading">
+            <div>
+              <h3 id="download-source-title">下载来源</h3>
+              <span>测速约使用 24 MiB 流量</span>
+            </div>
+            <button id="benchmark-sources" class="button secondary" type="button">测速</button>
+          </div>
+          <label class="source-select-label" for="model-source">默认来源</label>
+          <select id="model-source">
+            <option value="auto">自动选择（推荐）</option>
+            <option value="modelscope">ModelScope</option>
+            <option value="hf_mirror">HF Mirror</option>
+            <option value="huggingface">Hugging Face</option>
+          </select>
+          <div id="benchmark-results" class="benchmark-results">
+            <span class="muted">首次下载时会自动测速</span>
+          </div>
+        </section>
+
+        <section class="model-dialog-section cache-section" aria-labelledby="runtime-cache-title">
+          <div>
+            <h3 id="runtime-cache-title">推理缓存</h3>
+            <span id="runtime-cache-size">正在统计</span>
+          </div>
+          <button id="clear-runtime-cache" class="button secondary" type="button">清理缓存</button>
+        </section>
+
+        <footer class="model-dialog-footer">
+          <span>模型保存在当前算力舱，切换算力舱后需要重新下载。</span>
+          <button id="done-model-dialog" class="button primary" type="button">完成</button>
         </footer>
       </div>
     </dialog>

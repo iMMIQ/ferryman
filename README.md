@@ -62,7 +62,9 @@ Ferryman's Web deployment has two processes:
   so the scheduler never tries to switch models while jobs are active.
 - `ferryman-agent` is the lightweight AI Pod controller. It starts exactly one
   Hy-MT2 vLLM child process (`7b-fp8` or `30b-fp8`) on demand and unloads it
-  after all leases expire and the idle timeout elapses.
+  after all leases expire and the idle timeout elapses. It also detects existing
+  models, downloads missing weights with pause/resume and integrity checks, and
+  benchmarks ModelScope, HF Mirror and Hugging Face using real model shards.
 
 The Web UI accepts an uploaded file or a mixed selection of files and directories
 from the user's MicroServer documents and mounted Lazycat cloud drives. The picker
@@ -109,12 +111,19 @@ binary directly inside `ai-pod-service` and reuses the official vLLM image:
 sh scripts/build-release.sh
 ```
 
-Place the model directories under the app's AI Pod data directory:
+Models are downloaded from the Web model manager into the app's persistent AI
+Pod data directory. Existing directories in these locations are detected without
+another download:
 
 ```text
 models/Hy-MT2-7B-FP8
 models/Hy-MT2-30B-A3B-FP8
 ```
+
+Model weights and incomplete downloads live under `LZC_AGENT_DATA_DIR` on the
+selected AI Pod, not on the MicroServer. Rebuildable vLLM/JIT caches live under
+`LZC_AGENT_CACHE_DIR`. Upgrading the app or restarting the AI Pod preserves the
+models; switching to another AI Pod requires that pod to download its own copy.
 
 The `FERRYMAN_AGENT_TOKEN` in `lzc-manifest.yml` and
 `ai-pod-service/docker-compose.yml` must always contain the same production

@@ -405,6 +405,10 @@ impl RuntimeManager {
                 "--gpu-memory-utilization",
                 &cfg.gpu_memory_utilization.to_string(),
             ])
+            .args([
+                "--kv-cache-memory-bytes",
+                &cfg.kv_cache_memory_bytes.to_string(),
+            ])
             .args(["--max-model-len", &cfg.max_model_len.to_string()])
             .arg("--enable-prefix-caching")
             .stdout(Stdio::piped())

@@ -13,3 +13,5 @@ ${LZC_AGENT_DATA_DIR}/models/Hy-MT2-30B-A3B-FP8
 
 Only the Rust controller remains resident. It starts one `vllm serve` child at
 a time and unloads it after the final lease expires plus the idle timeout.
+The controller fixes the FP8 KV cache at 8 GiB for 7B and 3 GiB for 30B so
+Jetson UMA and zram activity cannot change cache capacity between launches.

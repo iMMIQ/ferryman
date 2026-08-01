@@ -166,6 +166,11 @@ struct Cli {
     #[arg(long)]
     gpu_memory_utilization: Option<f32>,
 
+    /// Fixed KV cache size in bytes (default: 8 GiB for 7b, 3 GiB for 30b).
+    /// This takes precedence over gpu-memory-utilization for KV cache sizing.
+    #[arg(long)]
+    kv_cache_memory_bytes: Option<u64>,
+
     /// max-model-len (default: 8192 for 7b, 4096 for 30b).
     #[arg(long)]
     max_model_len: Option<u32>,
@@ -245,17 +250,19 @@ async fn main() -> Result<()> {
     let gpu_memory_utilization = cli
         .gpu_memory_utilization
         .unwrap_or(p.gpu_memory_utilization);
+    let kv_cache_memory_bytes = cli.kv_cache_memory_bytes.unwrap_or(p.kv_cache_memory_bytes);
     let max_model_len = cli.max_model_len.unwrap_or(p.max_model_len);
     let max_num_seqs = cli.max_num_seqs.or(p.max_num_seqs);
     let enforce_eager = cli.enforce_eager || p.enforce_eager;
     let concurrency = cli.concurrency.unwrap_or(p.concurrency);
 
     eprintln!(
-        "preset: {:?} | model {} | concurrency {} | {} KV | util {} | max-model-len {} | graphs {}",
+        "preset: {:?} | model {} | concurrency {} | {} KV | KV bytes {} | util {} | max-model-len {} | graphs {}",
         cli.preset,
         serve_model,
         concurrency,
         kv_cache_dtype,
+        kv_cache_memory_bytes,
         gpu_memory_utilization,
         max_model_len,
         if enforce_eager { "off (eager)" } else { "on" }
@@ -273,6 +280,7 @@ async fn main() -> Result<()> {
         dtype: dtype.clone(),
         kv_cache_dtype: kv_cache_dtype.clone(),
         gpu_memory_utilization,
+        kv_cache_memory_bytes,
         max_model_len,
         max_num_seqs,
         enforce_eager,

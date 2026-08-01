@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -374,6 +375,14 @@ fn agent_response(status: StatusCode, value: serde_json::Value) -> Response {
     } else {
         (status, Json(value)).into_response()
     }
+}
+
+async fn require_cache_revalidation(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
 }
 
 fn user_owner(headers: &HeaderMap, allow_local: bool) -> Result<String, StatusCode> {
@@ -2279,6 +2288,7 @@ async fn main() -> Result<()> {
             axum::routing::delete(clear_runtime_cache),
         )
         .fallback_service(ServeDir::new(web_dir).append_index_html_on_directories(true))
+        .layer(middleware::from_fn(require_cache_revalidation))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&listen).await?;
@@ -2290,6 +2300,14 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_assets_use_the_package_version_as_the_cache_key() {
+        let index = include_str!("../../web/index.html");
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(index.contains(&format!("/app.js?v={version}")));
+        assert!(index.contains(&format!("/styles.css?v={version}")));
+    }
 
     #[test]
     fn job_records_receive_optional_field_defaults() {

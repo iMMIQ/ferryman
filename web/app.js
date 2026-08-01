@@ -405,9 +405,11 @@ function renderBenchmark(benchmark) {
 }
 
 function renderModelList() {
-  const models = modelCatalog.models || [];
+  const modelOrder = { "7b-fp8": 0, "30b-fp8": 1 };
+  const models = [...(modelCatalog.models || [])]
+    .sort((left, right) => (modelOrder[left.preset] ?? 99) - (modelOrder[right.preset] ?? 99));
   if (modelStorage) {
-    els.modelStorageSummary.textContent = `模型 ${formatBytes(modelStorage.model_bytes)} · 未完成 ${formatBytes(modelStorage.partial_bytes)} · 可用 ${formatBytes(modelStorage.available_bytes)}`;
+    els.modelStorageSummary.textContent = `模型目录 ${formatBytes(modelStorage.model_bytes)} · 未完成 ${formatBytes(modelStorage.partial_bytes)} · 可用 ${formatBytes(modelStorage.available_bytes)}`;
   } else {
     els.modelStorageSummary.textContent = `可用 ${formatBytes(modelCatalog.available_bytes)}`;
   }

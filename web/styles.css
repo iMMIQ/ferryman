@@ -1736,6 +1736,20 @@ body:has(.model-dialog[open]) {
 
   .model-dialog-footer {
     align-items: flex-end;
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    min-height: calc(64px + env(safe-area-inset-bottom));
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+    background: var(--surface);
+    border-top: 1px solid var(--line);
+  }
+
+  .model-dialog-header {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--surface);
   }
 
   .benchmark-row {
@@ -1803,6 +1817,20 @@ body:has(.model-dialog[open]) {
   .brand-block p,
   .runtime-summary .label {
     display: none;
+  }
+}
+
+@media (max-width: 360px) {
+  .runtime-actions {
+    grid-template-columns: minmax(0, 1fr) 72px 44px;
+  }
+
+  .runtime-actions .segmented {
+    grid-column: 1 / -1;
+  }
+
+  #manage-models {
+    min-width: 0;
   }
 }
 

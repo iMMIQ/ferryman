@@ -19,6 +19,7 @@ pub struct PresetConfig {
     pub dtype: &'static str,
     pub kv_cache_dtype: &'static str,
     pub gpu_memory_utilization: f32,
+    pub kv_cache_memory_bytes: u64,
     pub max_model_len: u32,
     pub max_num_seqs: Option<u32>,
     pub enforce_eager: bool,
@@ -34,6 +35,7 @@ impl Preset {
                 dtype: "float16",
                 kv_cache_dtype: "fp8",
                 gpu_memory_utilization: 0.30,
+                kv_cache_memory_bytes: 8 * 1024 * 1024 * 1024,
                 max_model_len: 8192,
                 max_num_seqs: Some(512),
                 enforce_eager: false,
@@ -45,6 +47,7 @@ impl Preset {
                 dtype: "auto",
                 kv_cache_dtype: "fp8",
                 gpu_memory_utilization: 0.55,
+                kv_cache_memory_bytes: 3 * 1024 * 1024 * 1024,
                 max_model_len: 4096,
                 max_num_seqs: Some(512),
                 enforce_eager: false,
@@ -68,5 +71,22 @@ impl Preset {
 impl fmt::Display for Preset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Preset;
+
+    #[test]
+    fn presets_use_fixed_kv_cache_budgets() {
+        assert_eq!(
+            Preset::SevenBFp8.config().kv_cache_memory_bytes,
+            8 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            Preset::ThirtyBFp8.config().kv_cache_memory_bytes,
+            3 * 1024 * 1024 * 1024
+        );
     }
 }

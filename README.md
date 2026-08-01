@@ -234,6 +234,7 @@ on-disk cache means already-translated blocks are instant.
 | `--vllm-dtype` | `float16` (7b) / `auto` (30b) | compute dtype (`--serve`) |
 | `--kv-cache-dtype` | `fp8` | KV cache dtype (`fp8` halves KV memory + boosts decode; `auto` = native) (`--serve`) |
 | `--gpu-memory-utilization` | `0.30` (7b) / `0.55` (30b) | vLLM GPU memory util (`--serve`) |
+| `--kv-cache-memory-bytes` | `8 GiB` (7b) / `3 GiB` (30b) | fixed KV cache capacity; avoids Jetson UMA profiling variance (`--serve`) |
 | `--max-model-len` | `8192` (7b) / `4096` (30b) | model context (`--serve`) |
 | `--max-num-seqs` | `512` (both) | vLLM admission cap; 512 unlocks the 30B throughput ceiling (`--serve`) |
 | `--enforce-eager` | off | force eager mode (disable CUDA graphs). Both presets leave it off (graphs are faster on this Jetson); set only to A/B test eager (`--serve`) |
@@ -243,6 +244,8 @@ on-disk cache means already-translated blocks are instant.
 > Jetson: 30B ~2.9x faster single-stream + peak ~1222 tok/s; 7B +8% ceiling
 > (868→938 tok/s) + 15% at low concurrency. (The old "graphs hurt on Jetson"
 > note was AWQ-specific; for FP8 on this vLLM build graphs are a net win.)
+> KV cache capacity is fixed per preset because CUDA free-memory deltas are not
+> stable on Jetson UMA systems when Linux reclaims memory or uses zram swap.
 
 ## Resumability & interruption
 

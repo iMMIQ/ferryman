@@ -28,6 +28,9 @@ pub struct ServeSpec {
     /// KV cache dtype passed as `--kv-cache-dtype` (e.g. "fp8", "auto").
     pub kv_cache_dtype: String,
     pub gpu_memory_utilization: f32,
+    /// Fixed KV cache capacity in bytes. This avoids UMA memory-profiler
+    /// variance from changing the cache size between launches.
+    pub kv_cache_memory_bytes: u64,
     pub max_model_len: u32,
     /// vLLM admission cap (`--max-num-seqs`); None = vLLM default (256).
     /// 512 unlocks the 30B's throughput ceiling (short blocks).
@@ -106,6 +109,8 @@ impl ContainerGuard {
             spec.max_model_len.to_string(),
             "--gpu-memory-utilization".into(),
             spec.gpu_memory_utilization.to_string(),
+            "--kv-cache-memory-bytes".into(),
+            spec.kv_cache_memory_bytes.to_string(),
             "--kv-cache-dtype".into(),
             spec.kv_cache_dtype.clone(),
             "--enable-prefix-caching".into(),

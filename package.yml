@@ -1,5 +1,5 @@
 package: cloud.lazycat.app.ferryman
-version: 0.2.10
+version: 0.2.11
 name: Ferryman
 description: 使用 Hy-MT2 翻译上传文件、用户文稿或网盘挂载目录，并保存双语或纯译文结果
 author: iMMIQ

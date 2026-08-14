@@ -152,6 +152,7 @@ struct RuntimeManager {
     leases: HashMap<String, Lease>,
     last_activity: Instant,
     last_health_check: Instant,
+    ready_probe_failures: u32,
     started_at: Option<Instant>,
     idle_timeout: Duration,
     start_timeout: Duration,
@@ -169,6 +170,16 @@ struct RuntimeManager {
 const MAX_RECENT_LOGS: usize = 40;
 const MAX_LOG_LINE_CHARS: usize = 600;
 const EXPECTED_STARTUP_SECONDS: u64 = 360;
+/// While Ready, probe vLLM's `/health` this often. The process-exit poll in
+/// `on_tick` catches a crash; this catches a *wedge* — the process alive but
+/// the server wedged (GPU stuck, deadlocked event loop) — where every proxied
+/// request would otherwise burn its full 190 s timeout against a corpse.
+const READY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+/// Consecutive failed probes before the runtime is declared Failed. One miss
+/// (or a handful, at 30 s spacing) must not unload a model under transient
+/// load; ~90 s of sustained failure means it is really gone.
+const READY_PROBE_FAILURE_LIMIT: u32 = 3;
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn default_lease_ttl() -> u64 {
     120
@@ -219,6 +230,7 @@ impl Controller {
             leases: HashMap::new(),
             last_activity: Instant::now(),
             last_health_check: Instant::now() - Duration::from_secs(10),
+            ready_probe_failures: 0,
             started_at: None,
             idle_timeout,
             start_timeout,
@@ -542,6 +554,7 @@ impl RuntimeManager {
             if health.is_ok_and(|response| response.status().is_success()) {
                 self.phase = RuntimePhase::Ready;
                 self.last_error = None;
+                self.ready_probe_failures = 0;
                 self.startup_elapsed_seconds =
                     self.started_at.map(|started| started.elapsed().as_secs());
                 self.started_at = None;
@@ -549,6 +562,52 @@ impl RuntimeManager {
                 self.startup_progress = 100;
                 info!(preset = ?self.preset, "vLLM is ready");
                 self.publish();
+            }
+        }
+
+        // Ready-state probe: the process-exit poll above only catches a crash,
+        // not a wedge. Sustained /health failure flips the runtime to Failed so
+        // callers stop routing requests into a dead server (and the next
+        // acquire restarts the model).
+        if self.phase == RuntimePhase::Ready
+            && self.last_health_check.elapsed() >= READY_PROBE_INTERVAL
+        {
+            self.last_health_check = Instant::now();
+            let health = self
+                .client
+                .get(format!("{}/health", self.vllm_endpoint))
+                .timeout(READY_PROBE_TIMEOUT)
+                .send()
+                .await;
+            if health.is_ok_and(|response| response.status().is_success()) {
+                self.ready_probe_failures = 0;
+            } else {
+                self.ready_probe_failures += 1;
+                warn!(
+                    failures = self.ready_probe_failures,
+                    limit = READY_PROBE_FAILURE_LIMIT,
+                    "vLLM health probe failed while ready"
+                );
+                if self.ready_probe_failures >= READY_PROBE_FAILURE_LIMIT {
+                    let preset = self.preset;
+                    let recent_logs = self.recent_logs.clone();
+                    let startup_elapsed_seconds = self.startup_elapsed_seconds;
+                    let _ = self.stop_child(true).await;
+                    self.phase = RuntimePhase::Failed;
+                    self.preset = preset;
+                    self.leases.clear();
+                    self.startup_stage = Some(StartupStage::Failed);
+                    self.startup_elapsed_seconds = startup_elapsed_seconds;
+                    self.recent_logs = recent_logs;
+                    self.last_error = Some(format!(
+                        "vLLM health check failed {} consecutive times while ready",
+                        self.ready_probe_failures
+                    ));
+                    self.ready_probe_failures = 0;
+                    error!(preset = ?self.preset, "vLLM wedged while ready; runtime failed");
+                    self.publish();
+                    return;
+                }
             }
         }
 

@@ -18,13 +18,13 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 use std::path::{Component, Path as FsPath, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -55,6 +55,12 @@ const DEFAULT_JOB_PAGE_SIZE: usize = 50;
 const MAX_JOB_PAGE_SIZE: usize = 100;
 const MAX_USER_NONTERMINAL_JOBS: usize = 2000;
 const MAX_MODEL_START_ATTEMPTS: usize = 3;
+/// Terminal jobs (completed/failed/cancelled) older than this are swept: job
+/// directory and DB row both go. 0 disables the sweep via env
+/// `FERRYMAN_JOB_RETENTION_SECONDS`.
+const DEFAULT_JOB_RETENTION_SECONDS: u64 = 7 * 24 * 3600;
+const JOB_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
+const JOB_SWEEP_BATCH: usize = 500;
 
 #[derive(Clone)]
 struct AppState {
@@ -65,6 +71,7 @@ struct AppState {
     request_limiters: Arc<HashMap<Preset, Arc<Semaphore>>>,
     translation_client: reqwest::Client,
     config: Arc<Config>,
+    persister: JobPersister,
 }
 
 struct Config {
@@ -330,27 +337,121 @@ async fn resolve_storage_path(
     Ok((root, candidate, relative))
 }
 
+/// Minimum spacing between disk writes of pure-progress updates. A translating
+/// job ticks its counters every 350 ms; the terminal update that follows always
+/// carries the final counters, so skipping intermediate writes loses nothing
+/// that a crash-recovery requeue wouldn't reset anyway.
+const PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(3);
+
+struct PersistMessage {
+    entry: JobEntry,
+    /// Set for status/error changes: the sender awaits the reply so callers
+    /// observe `mutate_job` as durable, without holding any lock across the
+    /// database write. Progress writes are fire-and-forget.
+    done: Option<oneshot::Sender<()>>,
+}
+
+/// Serializes job persistence off the workers' critical path. `mutate_job`
+/// snapshots the entry under the in-memory lock and hands it to a single
+/// writer task through an ordered channel — the lock is never held across a
+/// database write, yet snapshots still hit the disk in mutation order (the
+/// channel send happens while the lock is held, so two concurrent mutations
+/// cannot reorder).
+#[derive(Clone)]
+struct JobPersister {
+    tx: mpsc::UnboundedSender<PersistMessage>,
+    last_progress_write: Arc<StdMutex<HashMap<Uuid, Instant>>>,
+}
+
+impl JobPersister {
+    fn spawn(store: JobStore) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel::<PersistMessage>();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if let Err(error) = store.update(message.entry.clone()).await {
+                    error!(
+                        id = %message.entry.record.id,
+                        %error, "persist job state"
+                    );
+                }
+                if let Some(done) = message.done {
+                    let _ = done.send(());
+                }
+            }
+        });
+        Self {
+            tx,
+            last_progress_write: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    /// Whether a progress-only write for `id` should go out now (and record
+    /// the decision). Sync + brief: called with the `active_jobs` lock held.
+    fn progress_write_due(&self, id: Uuid) -> bool {
+        let mut last = self.last_progress_write.lock().unwrap();
+        match last.get(&id) {
+            Some(at) if at.elapsed() < PROGRESS_WRITE_INTERVAL => false,
+            _ => {
+                last.insert(id, Instant::now());
+                true
+            }
+        }
+    }
+}
+
 async fn mutate_job<F>(state: &AppState, id: Uuid, mutate: F) -> Option<JobRecord>
 where
     F: FnOnce(&mut JobRecord),
 {
-    // Keep persistence ordered with in-memory mutations. Progress and terminal
-    // updates can arrive close together; writing cloned snapshots after dropping
-    // the lock could let an older snapshot overwrite the completed job on disk.
-    let mut jobs = state.active_jobs.write().await;
-    let entry = jobs.get_mut(&id)?;
-    mutate(&mut entry.record);
-    entry.record.updated_at = now_epoch_seconds();
-    let entry = entry.clone();
-    if let Err(error) = state.store.update(entry.clone()).await {
-        error!(%id, %error, "persist job state");
+    // Mutate in memory and enqueue persistence while the lock is held (the
+    // channel send is sync and never blocks), then drop the lock before
+    // awaiting the disk write. Status/error/result mutations wait for the
+    // write to land; progress-only mutations are throttled and fire-and-forget.
+    let (record, done) = {
+        let mut jobs = state.active_jobs.write().await;
+        let entry = jobs.get_mut(&id)?;
+        let before = entry.record.clone();
+        mutate(&mut entry.record);
+        let progress_only = entry.record.status == before.status
+            && entry.record.error == before.error
+            && entry.record.result_available == before.result_available;
+        entry.record.updated_at = now_epoch_seconds();
+        let mut done = None;
+        let message = if progress_only {
+            state
+                .persister
+                .progress_write_due(id)
+                .then(|| PersistMessage {
+                    entry: entry.clone(),
+                    done: None,
+                })
+        } else {
+            let (sender, rx) = oneshot::channel();
+            done = Some(rx);
+            Some(PersistMessage {
+                entry: entry.clone(),
+                done: Some(sender),
+            })
+        };
+        if let Some(message) = message {
+            let _ = state.persister.tx.send(message);
+        }
+        (entry.record.clone(), done)
+    };
+    if let Some(done) = done {
+        let _ = done.await;
     }
-    Some(entry.record)
+    Some(record)
 }
 
 async fn claim_queued_job(state: &AppState, id: Uuid) -> Option<JobEntry> {
-    let mut jobs = state.active_jobs.write().await;
-    if jobs
+    // The in-memory check is only a fast gate; SQLite's
+    // `UPDATE ... WHERE status='queued'` is the real double-claim guard, so the
+    // lock must not be held across the claim.
+    if state
+        .active_jobs
+        .read()
+        .await
         .get(&id)
         .is_none_or(|entry| entry.record.status != JobStatus::Queued)
     {
@@ -358,7 +459,7 @@ async fn claim_queued_job(state: &AppState, id: Uuid) -> Option<JobEntry> {
     }
     match state.store.claim(id, now_epoch_seconds()).await {
         Ok(Some(entry)) => {
-            jobs.insert(id, entry.clone());
+            state.active_jobs.write().await.insert(id, entry.clone());
             Some(entry)
         }
         Ok(None) => None,
@@ -381,6 +482,65 @@ async fn config() -> Json<serde_json::Value> {
             "max_context_segments": MAX_WEB_CONTEXT_SEGMENTS
         }
     }))
+}
+
+/// One retention pass: remove the job directories of expired terminal jobs,
+/// then their DB rows. Rows whose directory refuses removal keep their row so
+/// the next sweep retries instead of orphaning files on disk.
+async fn sweep_terminal_jobs(state: &AppState, retention: Duration) {
+    sweep_terminal_jobs_at(state, retention, now_epoch_seconds()).await;
+}
+
+async fn sweep_terminal_jobs_at(state: &AppState, retention: Duration, now: u64) {
+    let cutoff = now.saturating_sub(retention.as_secs());
+    let mut swept = 0usize;
+    loop {
+        let expired = match state.store.expired_terminal(cutoff, JOB_SWEEP_BATCH).await {
+            Ok(expired) => expired,
+            Err(error) => {
+                error!(%error, "list expired terminal jobs");
+                return;
+            }
+        };
+        if expired.is_empty() {
+            break;
+        }
+        let mut removed = Vec::with_capacity(expired.len());
+        for entry in &expired {
+            match tokio::fs::remove_dir_all(&entry.dir).await {
+                Ok(()) => removed.push(entry.record.id),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    removed.push(entry.record.id)
+                }
+                Err(error) => {
+                    warn!(
+                        id = %entry.record.id,
+                        dir = %entry.dir.display(),
+                        %error,
+                        "remove expired job directory"
+                    );
+                }
+            }
+        }
+        if removed.is_empty() {
+            // Every dir in this batch failed; deleting nothing and looping
+            // again would spin forever on the same rows.
+            break;
+        }
+        match state.store.delete_terminal_ids(removed).await {
+            Ok(count) => swept += count,
+            Err(error) => {
+                error!(%error, "delete expired terminal job rows");
+                break;
+            }
+        }
+        if expired.len() < JOB_SWEEP_BATCH {
+            break;
+        }
+    }
+    if swept > 0 {
+        info!(jobs = swept, "swept expired terminal jobs");
+    }
 }
 
 #[tokio::main]
@@ -441,11 +601,13 @@ async fn main() -> Result<()> {
         .map(|entry| (entry.record.id, entry))
         .collect();
     let (queue, receiver) = mpsc::channel(256);
+    let persister = JobPersister::spawn(store.clone());
     let state = AppState {
         active_jobs: Arc::new(RwLock::new(active_jobs)),
         store,
         cancellations: Arc::new(Mutex::new(HashMap::new())),
         queue,
+        persister,
         request_limiters: Arc::new(HashMap::from([
             (
                 Preset::SevenBFp8,
@@ -470,6 +632,22 @@ async fn main() -> Result<()> {
     tokio::spawn(scheduler::job_worker(state.clone(), receiver));
     for id in pending {
         state.queue.send(id).await.ok();
+    }
+
+    // Retention sweep for terminal jobs (dirs + rows). 0 disables.
+    let retention_seconds = env::var("FERRYMAN_JOB_RETENTION_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_JOB_RETENTION_SECONDS);
+    if retention_seconds > 0 {
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            let retention = Duration::from_secs(retention_seconds);
+            loop {
+                sweep_terminal_jobs(&sweep_state, retention).await;
+                tokio::time::sleep(JOB_SWEEP_INTERVAL).await;
+            }
+        });
     }
 
     let app = Router::new()
@@ -564,6 +742,209 @@ mod tests {
         assert_eq!(record.mode, OutputMode::Bilingual);
         assert_eq!(record.settings, TranslationSettings::default());
         assert!(!record.result_available);
+    }
+
+    async fn persister_test_state(base: &FsPath) -> AppState {
+        let store = JobStore::open(base.join("jobs.sqlite3")).await.unwrap();
+        AppState {
+            active_jobs: Arc::new(RwLock::new(HashMap::new())),
+            store: store.clone(),
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
+            queue: mpsc::channel(1).0,
+            request_limiters: Arc::new(HashMap::new()),
+            translation_client: reqwest::Client::new(),
+            config: Arc::new(Config {
+                data_dir: base.join("data"),
+                user_documents_dir: base.join("documents"),
+                remote_fs_dir: base.join("remote-fs"),
+                agent_url: String::new(),
+                agent_token: String::new(),
+                allow_local_user: true,
+                client: reqwest::Client::new(),
+            }),
+            persister: JobPersister::spawn(store),
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_writes_are_throttled_and_terminal_writes_are_durable() {
+        let base = env::temp_dir().join(format!("ferryman-persist-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let state = persister_test_state(&base).await;
+        let id = Uuid::new_v4();
+        let entry = JobEntry {
+            owner: "alice".to_string(),
+            dir: base.join("job"),
+            input: base.join("job/input.txt"),
+            output: base.join("job/result.txt"),
+            save_to: None,
+            save_root: None,
+            overwrite: false,
+            record: JobRecord {
+                id,
+                filename: "notes.txt".to_string(),
+                preset: Preset::SevenBFp8,
+                target: "中文".to_string(),
+                mode: OutputMode::Bilingual,
+                status: JobStatus::Translating,
+                total: 100,
+                completed: 0,
+                translated: 0,
+                failed_segments: 0,
+                error: None,
+                settings: TranslationSettings::default(),
+                result_available: false,
+                source_path: None,
+                source_storage: None,
+                save_path: None,
+                save_storage: None,
+                created_at: 1,
+                updated_at: 1,
+            },
+        };
+        state.store.insert(entry.clone(), 10).await.unwrap();
+        state.active_jobs.write().await.insert(id, entry);
+
+        // First progress tick lands on disk (the throttle window opens here).
+        // Progress writes are fire-and-forget, so poll for the row.
+        mutate_job(&state, id, |job| job.completed = 10)
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            let row = state
+                .store
+                .get("alice".to_string(), id)
+                .await
+                .unwrap()
+                .unwrap();
+            if row.record.completed == 10 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let row = state
+            .store
+            .get("alice".to_string(), id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.record.completed, 10);
+
+        // Within the throttle window a second tick stays in memory only…
+        mutate_job(&state, id, |job| job.completed = 20)
+            .await
+            .unwrap();
+        let row = state
+            .store
+            .get("alice".to_string(), id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.record.completed, 10);
+
+        // …and the terminal update — awaited by contract — carries the final
+        // counters and status to disk in one write.
+        mutate_job(&state, id, |job| {
+            job.status = JobStatus::Completed;
+            job.completed = 100;
+            job.result_available = true;
+        })
+        .await
+        .unwrap();
+        let row = state
+            .store
+            .get("alice".to_string(), id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.record.status, JobStatus::Completed);
+        assert_eq!(row.record.completed, 100);
+        assert!(row.record.result_available);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_sweep_removes_expired_terminal_dirs_and_rows_only() {
+        let base = env::temp_dir().join(format!("ferryman-sweep-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let state = persister_test_state(&base).await;
+
+        // One expired terminal job (dir + row), one fresh terminal job, and
+        // one expired-but-nonterminal job — only the first may be swept.
+        let old_done = Uuid::new_v4();
+        let fresh_done = Uuid::new_v4();
+        let old_live = Uuid::new_v4();
+        for (id, created, status) in [
+            (old_done, 1_u64, JobStatus::Completed),
+            (fresh_done, 10_000, JobStatus::Failed),
+            (old_live, 1, JobStatus::Cancelled),
+        ] {
+            let mut entry = JobEntry {
+                owner: "alice".to_string(),
+                dir: base.join("jobs").join(id.to_string()),
+                input: base.join("jobs").join(id.to_string()).join("input.txt"),
+                output: base.join("jobs").join(id.to_string()).join("result.txt"),
+                save_to: None,
+                save_root: None,
+                overwrite: false,
+                record: JobRecord {
+                    id,
+                    filename: "notes.txt".to_string(),
+                    preset: Preset::SevenBFp8,
+                    target: "中文".to_string(),
+                    mode: OutputMode::Bilingual,
+                    status,
+                    total: 0,
+                    completed: 0,
+                    translated: 0,
+                    failed_segments: 0,
+                    error: None,
+                    settings: TranslationSettings::default(),
+                    result_available: false,
+                    source_path: None,
+                    source_storage: None,
+                    save_path: None,
+                    save_storage: None,
+                    created_at: created,
+                    updated_at: created,
+                },
+            };
+            tokio::fs::create_dir_all(&entry.dir).await.unwrap();
+            state.store.insert(entry.clone(), 10).await.unwrap();
+            if status == JobStatus::Cancelled {
+                // Nonterminal rows would never reach the sweep, but keep the
+                // invariant honest: only terminal statuses are ever listed.
+                entry.record.status = JobStatus::Translating;
+                state.store.update(entry).await.unwrap();
+            }
+        }
+
+        // "now" such that updated_at 1 is far past the retention window.
+        sweep_terminal_jobs_at(&state, Duration::from_secs(100), 5_000).await;
+
+        assert!(!state
+            .store
+            .get("alice".to_string(), old_done)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(!base.join("jobs").join(old_done.to_string()).exists());
+        assert!(state
+            .store
+            .get("alice".to_string(), fresh_done)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(base.join("jobs").join(fresh_done.to_string()).exists());
+        assert!(state
+            .store
+            .get("alice".to_string(), old_live)
+            .await
+            .unwrap()
+            .is_some());
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

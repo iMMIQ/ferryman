@@ -136,7 +136,9 @@ impl JobStore {
                 rusqlite::params_from_iter(entry_params(&entry)?),
             )?;
             if changed != 1 {
-                anyhow::bail!("job {} is missing from the database", entry.record.id);
+                // The row was deleted concurrently (user delete racing a queued
+                // persistence snapshot) — nothing left to update, not an error.
+                return Ok(());
             }
             Ok(())
         })
@@ -359,6 +361,51 @@ impl JobStore {
                  WHERE id=?1 AND owner=?2 AND status IN ('completed', 'failed', 'cancelled')",
                 params![id.to_string(), owner],
             )? == 1)
+        })
+        .await
+    }
+
+    /// Terminal jobs whose `updated_at` fell below `cutoff` (epoch seconds),
+    /// oldest first, at most `limit` — the retention sweep's work list. The
+    /// rows are not deleted here: the caller removes each job directory first
+    /// and only then deletes the rows that succeeded, so a dir that refuses to
+    /// be removed keeps its row and is retried on the next sweep instead of
+    /// leaking on disk forever.
+    pub(crate) async fn expired_terminal(
+        &self,
+        cutoff: u64,
+        limit: usize,
+    ) -> Result<Vec<JobEntry>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT * FROM jobs
+                 WHERE status IN ('completed', 'failed', 'cancelled') AND updated_at < ?1
+                 ORDER BY updated_at ASC, id ASC LIMIT ?2",
+            )?;
+            let jobs = statement
+                .query_map(params![to_i64(cutoff)?, to_i64(limit)?], row_to_entry)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into);
+            jobs
+        })
+        .await
+    }
+
+    /// Delete terminal rows by id (the second half of the retention sweep).
+    pub(crate) async fn delete_terminal_ids(&self, ids: Vec<Uuid>) -> Result<usize> {
+        self.call(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut removed = 0;
+            for id in &ids {
+                removed += transaction.execute(
+                    "DELETE FROM jobs
+                     WHERE id=?1 AND status IN ('completed', 'failed', 'cancelled')",
+                    [id.to_string()],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(removed)
         })
         .await
     }
@@ -854,6 +901,58 @@ mod tests {
                 .unwrap(),
             RetryJobOutcome::NotFailed
         ));
+
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_terminal_lists_and_deletes_only_old_terminal_rows() {
+        let (root, store) = test_store().await;
+        // Terminal + old (updated_at = created_at = 1) → swept.
+        let old_done = Uuid::new_v4();
+        store
+            .insert(test_entry("alice", old_done, 1, JobStatus::Completed), 10)
+            .await
+            .unwrap();
+        // Terminal + fresh → kept.
+        let fresh_done = Uuid::new_v4();
+        store
+            .insert(
+                test_entry("alice", fresh_done, 100, JobStatus::Completed),
+                10,
+            )
+            .await
+            .unwrap();
+        // Nonterminal + old → kept.
+        let old_live = Uuid::new_v4();
+        store
+            .insert(test_entry("alice", old_live, 1, JobStatus::Translating), 10)
+            .await
+            .unwrap();
+
+        let expired = store.expired_terminal(50, 10).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].record.id, old_done);
+        assert_eq!(store.delete_terminal_ids(vec![old_done]).await.unwrap(), 1);
+        // Deleting again (already gone, or nonterminal) removes nothing.
+        assert_eq!(
+            store
+                .delete_terminal_ids(vec![old_done, old_live])
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(store
+            .get("alice".to_string(), fresh_done)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get("alice".to_string(), old_live)
+            .await
+            .unwrap()
+            .is_some());
 
         drop(store);
         std::fs::remove_dir_all(root).unwrap();

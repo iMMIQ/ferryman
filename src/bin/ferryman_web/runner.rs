@@ -98,7 +98,7 @@ async fn save_job_result(entry: &JobEntry) -> Result<()> {
     copy_result.with_context(|| format!("save result to {}", target.display()))
 }
 
-async fn files_are_identical(left: &FsPath, right: &FsPath) -> Result<bool> {
+pub(crate) async fn files_are_identical(left: &FsPath, right: &FsPath) -> Result<bool> {
     let left_metadata = tokio::fs::metadata(left).await?;
     let right_metadata = tokio::fs::metadata(right).await?;
     if left_metadata.len() != right_metadata.len() {
@@ -219,6 +219,7 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
                 batch_size: entry.record.settings.batch_size,
                 context: entry.record.settings.context_segments,
                 limit: None,
+                prompt_char_budget: entry.record.preset.prompt_char_budget(),
             },
             cancel.clone(),
             callback,

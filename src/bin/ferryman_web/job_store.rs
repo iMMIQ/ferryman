@@ -1,4 +1,5 @@
-use super::{JobEntry, JobPhase, JobRecord, JobStatus, StorageKind};
+use super::jobs_api::JobPhase;
+use super::{JobEntry, JobRecord, JobStatus, StorageKind};
 use anyhow::{Context, Result};
 use ferryman::format::OutputMode;
 use ferryman::preset::Preset;
@@ -13,23 +14,23 @@ use uuid::Uuid;
 const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Clone)]
-pub(super) struct JobStore {
+pub(crate) struct JobStore {
     connection: Arc<StdMutex<Connection>>,
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct JobCursor {
-    pub(super) created_at: u64,
-    pub(super) id: Uuid,
+pub(crate) struct JobCursor {
+    pub(crate) created_at: u64,
+    pub(crate) id: Uuid,
 }
 
-pub(super) struct JobPage {
-    pub(super) jobs: Vec<JobRecord>,
-    pub(super) next_cursor: Option<JobCursor>,
-    pub(super) total: usize,
+pub(crate) struct JobPage {
+    pub(crate) jobs: Vec<JobRecord>,
+    pub(crate) next_cursor: Option<JobCursor>,
+    pub(crate) total: usize,
 }
 
-pub(super) enum RetryJobOutcome {
+pub(crate) enum RetryJobOutcome {
     Retried(Box<JobEntry>),
     NotFound,
     NotFailed,
@@ -37,7 +38,7 @@ pub(super) enum RetryJobOutcome {
 }
 
 impl JobStore {
-    pub(super) async fn open(path: PathBuf) -> Result<Self> {
+    pub(crate) async fn open(path: PathBuf) -> Result<Self> {
         task::spawn_blocking(move || {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -82,7 +83,7 @@ impl JobStore {
         .context("join database operation")?
     }
 
-    pub(super) async fn insert(&self, entry: JobEntry, active_limit: usize) -> Result<()> {
+    pub(crate) async fn insert(&self, entry: JobEntry, active_limit: usize) -> Result<()> {
         self.call(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -119,7 +120,7 @@ impl JobStore {
         .await
     }
 
-    pub(super) async fn update(&self, entry: JobEntry) -> Result<()> {
+    pub(crate) async fn update(&self, entry: JobEntry) -> Result<()> {
         self.call(move |connection| {
             let changed = connection.execute(
                 "UPDATE jobs SET
@@ -142,7 +143,7 @@ impl JobStore {
         .await
     }
 
-    pub(super) async fn recover_nonterminal(&self, updated_at: u64) -> Result<Vec<JobEntry>> {
+    pub(crate) async fn recover_nonterminal(&self, updated_at: u64) -> Result<Vec<JobEntry>> {
         self.call(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -168,7 +169,7 @@ impl JobStore {
         .await
     }
 
-    pub(super) async fn claim(&self, id: Uuid, updated_at: u64) -> Result<Option<JobEntry>> {
+    pub(crate) async fn claim(&self, id: Uuid, updated_at: u64) -> Result<Option<JobEntry>> {
         self.call(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -192,7 +193,7 @@ impl JobStore {
         .await
     }
 
-    pub(super) async fn get(&self, owner: String, id: Uuid) -> Result<Option<JobEntry>> {
+    pub(crate) async fn get(&self, owner: String, id: Uuid) -> Result<Option<JobEntry>> {
         self.call(move |connection| {
             connection
                 .query_row(
@@ -206,7 +207,7 @@ impl JobStore {
         .await
     }
 
-    pub(super) async fn list_page(
+    pub(crate) async fn list_page(
         &self,
         owner: String,
         phase: Option<JobPhase>,
@@ -272,7 +273,7 @@ impl JobStore {
         .await
     }
 
-    pub(super) async fn list_active(&self, owner: String) -> Result<Vec<JobRecord>> {
+    pub(crate) async fn list_active(&self, owner: String) -> Result<Vec<JobRecord>> {
         self.call(move |connection| {
             let mut statement = connection.prepare(
                 "SELECT * FROM jobs
@@ -289,7 +290,7 @@ impl JobStore {
         .await
     }
 
-    pub(super) async fn count_active(&self, owner: String) -> Result<usize> {
+    pub(crate) async fn count_active(&self, owner: String) -> Result<usize> {
         self.call(move |connection| {
             Ok(connection.query_row(
                 "SELECT COUNT(*) FROM jobs
@@ -301,7 +302,7 @@ impl JobStore {
         .await
     }
 
-    pub(super) async fn retry_failed(
+    pub(crate) async fn retry_failed(
         &self,
         owner: String,
         id: Uuid,
@@ -351,7 +352,7 @@ impl JobStore {
         .await
     }
 
-    pub(super) async fn delete_terminal(&self, owner: String, id: Uuid) -> Result<bool> {
+    pub(crate) async fn delete_terminal(&self, owner: String, id: Uuid) -> Result<bool> {
         self.call(move |connection| {
             Ok(connection.execute(
                 "DELETE FROM jobs

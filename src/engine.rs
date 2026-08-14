@@ -218,17 +218,17 @@ impl Engine {
                     .collect();
 
                 // All-cached fast path: skip the HTTP round-trip entirely.
-                let cached: Vec<Option<String>> = keys
+                let mut results: Vec<Option<String>> = keys
                     .iter()
                     .map(|k| {
                         k.as_deref()
                             .and_then(|kk| cache.as_ref().and_then(|c| c.get(kk)))
                     })
                     .collect();
-                if cached.iter().all(|v| v.is_some()) {
+                if results.iter().all(|v| v.is_some()) {
                     let pairs = ids
                         .into_iter()
-                        .zip(cached.into_iter().map(|v| v.unwrap()))
+                        .zip(results.into_iter().map(|v| v.unwrap()))
                         .collect();
                     return UnitDone {
                         file,
@@ -237,18 +237,29 @@ impl Engine {
                     };
                 }
 
+                // Partial-cache path: request only the misses and keep the
+                // hits. Re-running a batch whose previous attempt half-failed
+                // must not re-translate (and re-bill) the cues that already
+                // succeeded.
+                let miss_idx: Vec<usize> = (0..n).filter(|&idx| results[idx].is_none()).collect();
+                let miss_cues: Vec<&str> = miss_idx.iter().map(|&idx| cue_refs[idx]).collect();
                 let _request_permit = self.acquire_request_permit().await;
                 let trs = translate::translate_batch(
-                    client, endpoint, model, &cue_refs, &ctx_refs, target,
+                    client, endpoint, model, &miss_cues, &ctx_refs, target,
                 )
                 .await;
-                let mut pairs = Vec::with_capacity(n);
-                for idx in 0..n {
-                    if let Some(tr) = &trs[idx] {
+                for (slot, &idx) in miss_idx.iter().enumerate() {
+                    if let Some(tr) = &trs[slot] {
                         if let (Some(c), Some(k)) = (cache.as_ref(), keys[idx].as_deref()) {
                             c.put(k, tr);
                         }
-                        pairs.push((ids[idx], tr.clone()));
+                        results[idx] = Some(tr.clone());
+                    }
+                }
+                let mut pairs = Vec::with_capacity(n);
+                for idx in 0..n {
+                    if let Some(tr) = results[idx].take() {
+                        pairs.push((ids[idx], tr));
                     }
                 }
                 UnitDone {
@@ -297,5 +308,97 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    /// A partial-cache batch must send only the missing cues to vLLM and reuse
+    /// the cached translations for the rest — a rerun after a half-failed
+    /// batch must not re-translate (or re-bill) the cues that already landed.
+    #[tokio::test]
+    async fn batch_units_translate_only_cache_misses() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let prompts: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_prompts = prompts.clone();
+        let handler_attempts = attempts.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    let content = body["messages"][0]["content"].as_str().unwrap().to_string();
+                    handler_prompts.lock().unwrap().push(content.clone());
+                    handler_attempts.fetch_add(1, Ordering::Relaxed);
+                    // Echo every <cN>…</cN> tag back with a translated marker so
+                    // parse_tagged sees a perfect response.
+                    let translated = translate::parse_tagged(&content, 64);
+                    let mut out = String::new();
+                    for (idx, slot) in translated.iter().enumerate() {
+                        if let Some(text) = slot {
+                            out.push_str(&format!("<c{}>{}</c{}>\n", idx + 1, text, idx + 1));
+                        }
+                    }
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"content": out.trim_end()}}]
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let cache_dir = std::env::temp_dir().join(format!("ferryman-cache-test-{}", uuid()));
+        let cache = Cache::open(Some(cache_dir.clone())).unwrap();
+        // Prime the cache for two of the three cues.
+        for text in ["one", "two"] {
+            let key = cache.key("model", "target", text);
+            cache.put(&key, &format!("cached-{text}"));
+        }
+
+        let engine = Engine::new(
+            reqwest::Client::new(),
+            format!("http://{addr}"),
+            "model".to_string(),
+            "target".to_string(),
+            4,
+            Some(cache),
+        );
+        let done = engine
+            .exec_unit(Unit::Batch {
+                file: 0,
+                ids: vec![1, 2, 3],
+                cues: vec!["one".to_string(), "two".to_string(), "three".to_string()],
+                context: vec![],
+            })
+            .await;
+
+        assert_eq!(done.attempted, 3);
+        assert_eq!(
+            done.pairs,
+            vec![
+                (1, "cached-one".to_string()),
+                (2, "cached-two".to_string()),
+                (3, "three".to_string()), // round-tripped through the fake server
+            ]
+        );
+        // Exactly one request, carrying only the missing cue.
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            prompts[0].contains("<c1>three</c1>"),
+            "only the miss goes out"
+        );
+        assert!(
+            !prompts[0].contains("<c1>one</c1>"),
+            "cached cues stay home"
+        );
+
+        std::fs::remove_dir_all(cache_dir).ok();
+    }
+
+    fn uuid() -> String {
+        uuid::Uuid::new_v4().to_string()
     }
 }

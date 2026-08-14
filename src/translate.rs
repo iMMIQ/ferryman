@@ -45,13 +45,36 @@ struct RespMsg {
 /// Translate `text` into `target_lang` using the official Hy-MT2 "Default
 /// Translation" prompt and recommended sampling params (for the 7B model).
 ///
-/// Retries a few times on transient HTTP / parse errors.
+/// Retries a few times on transient HTTP / parse errors. A segment longer
+/// than the model's whole context window is split in half at a language
+/// boundary and each half translated separately (mirroring the batch path's
+/// overflow recovery), because dropping every long paragraph of a novel is
+/// exactly the failure mode the batch path already learned to avoid.
 pub async fn translate(
     client: &reqwest::Client,
     endpoint: &str,
     model: &str,
     text: &str,
     target_lang: &str,
+) -> Result<String> {
+    translate_single(client, endpoint, model, text, target_lang, 0).await
+}
+
+/// Split budget for [`translate`]'s overflow recovery. Each level halves the
+/// text, so 6 levels admit a segment up to ~64× the context window before
+/// giving up (by then the halves are tiny and something else is wrong).
+const SINGLE_MAX_SPLIT_DEPTH: u32 = 6;
+/// Don't recurse below this many characters — halves this small aren't worth
+/// two more requests, and the model can't be overflowed by them anyway.
+const SINGLE_MIN_SPLIT_CHARS: usize = 64;
+
+async fn translate_single(
+    client: &reqwest::Client,
+    endpoint: &str,
+    model: &str,
+    text: &str,
+    target_lang: &str,
+    depth: u32,
 ) -> Result<String> {
     // Trim leading/trailing whitespace; keep internal structure as-is.
     let trimmed = text.trim();
@@ -78,48 +101,87 @@ pub async fn translate(
     let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
 
     let mut last_err = String::new();
-    for attempt in 0..4u32 {
+    for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(500u64 * 2u64.pow(attempt))).await;
+            backoff(attempt).await;
         }
-        let send = client.post(&url).json(&body).send().await;
-        match send {
-            Ok(resp) => {
-                let status = resp.status();
-                let txt = resp.text().await.unwrap_or_default();
-                if !status.is_success() {
-                    last_err = format!("HTTP {}: {}", status, truncate(&txt, 300));
-                    // 4xx (except 429 Too Many Requests) are permanent — bad model
-                    // id, malformed request, or a block over the context window.
-                    // Retrying just burns a concurrency slot for several seconds
-                    // and can never succeed, so fail this block immediately.
-                    if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS
-                    {
-                        return Err(anyhow!("translation failed (fatal HTTP): {}", last_err));
-                    }
-                    continue;
+        match post_chat_once(client, &url, &body).await {
+            ChatAttempt::Success(content) => return Ok(content.trim().to_string()),
+            ChatAttempt::Transient(err) => last_err = err,
+            ChatAttempt::Fatal { error, overflow } => {
+                if overflow
+                    && depth < SINGLE_MAX_SPLIT_DEPTH
+                    && trimmed.chars().count() >= SINGLE_MIN_SPLIT_CHARS
+                {
+                    let Some((left, right)) = split_at_language_boundary(trimmed) else {
+                        return Err(anyhow!("translation failed (overflow): {error}"));
+                    };
+                    eprintln!(
+                        "warn: segment of {} chars overflows the context window — splitting in half",
+                        trimmed.chars().count()
+                    );
+                    // `Box::pin`: a recursive async fn's future would otherwise
+                    // be infinitely sized (see `translate_split`).
+                    let left = Box::pin(translate_single(
+                        client,
+                        endpoint,
+                        model,
+                        &left,
+                        target_lang,
+                        depth + 1,
+                    ))
+                    .await?;
+                    let right = Box::pin(translate_single(
+                        client,
+                        endpoint,
+                        model,
+                        &right,
+                        target_lang,
+                        depth + 1,
+                    ))
+                    .await?;
+                    return Ok(format!("{left}{right}"));
                 }
-                match serde_json::from_str::<ChatResp>(&txt) {
-                    Ok(parsed) => match parsed.choices.into_iter().next() {
-                        Some(c) => return Ok(c.message.content.trim().to_string()),
-                        None => {
-                            last_err = "empty choices".into();
-                            continue;
-                        }
-                    },
-                    Err(e) => {
-                        last_err = format!("parse: {} | {}", e, truncate(&txt, 200));
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                last_err = format!("request: {}", e);
-                continue;
+                return Err(anyhow!("translation failed (fatal HTTP): {error}"));
             }
         }
     }
     Err(anyhow!("translation failed after retries: {}", last_err))
+}
+
+/// Split `text` in half at the nearest language boundary to the midpoint
+/// (whitespace or sentence/clause punctuation), so no word or sentence is cut
+/// in two. The boundary character stays at the end of the left half, so the
+/// concatenation of the two translated halves reads naturally. Returns `None`
+/// when the text has no usable boundary anywhere (a single unbroken run).
+fn split_at_language_boundary(text: &str) -> Option<(String, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mid = chars.len() / 2;
+    const BOUNDARIES: &[char] = &[
+        ' ', '\t', '\n', '\r', '.', '!', '?', ';', ':', ',', '，', '。', '！', '？', '；', '：',
+        '、',
+    ];
+    // Scan outward from the midpoint for the closest boundary character.
+    let boundary = (0..mid.max(chars.len() - mid))
+        .find_map(|offset| {
+            [mid.checked_sub(offset), Some(mid + offset)]
+                .into_iter()
+                .flatten()
+                .find(|&idx| idx < chars.len() && BOUNDARIES.contains(&chars[idx]))
+        })
+        // Include one trailing boundary run (e.g. `. `) in the left half.
+        .map(|mut idx| {
+            while idx + 1 < chars.len() && BOUNDARIES.contains(&chars[idx + 1]) {
+                idx += 1;
+            }
+            idx
+        })?;
+    let left: String = chars[..=boundary].iter().collect();
+    let right: String = chars[boundary + 1..].iter().collect();
+    if left.trim().is_empty() || right.trim().is_empty() {
+        return None;
+    }
+    Some((left, right))
 }
 
 /// Truncate `s` to at most `n` bytes for an error message, never slicing
@@ -252,6 +314,60 @@ fn is_context_overflow(err: &str) -> bool {
     err.contains("context length") || err.contains("input prompt")
 }
 
+/// Retry budget shared by the Single and Batch paths (4 attempts total).
+const MAX_ATTEMPTS: u32 = 4;
+
+/// Exponential backoff between attempts: 1s, 2s, 4s (for attempts 1..3).
+async fn backoff(attempt: u32) {
+    tokio::time::sleep(Duration::from_millis(500u64 * 2u64.pow(attempt))).await;
+}
+
+/// One POST to `/v1/chat/completions`, classified. This is the single shared
+/// HTTP+parse layer for the Single and Batch paths; callers own retry policy
+/// and what to do with the content.
+enum ChatAttempt {
+    /// 2xx with the assistant message content parsed out.
+    Success(String),
+    /// Worth retrying: network error, 5xx, 429, or an unparseable body.
+    Transient(String),
+    /// Other 4xx — permanent for this body (bad model id, malformed request,
+    /// or a context-length overflow, flagged for the caller's split logic).
+    Fatal { error: String, overflow: bool },
+}
+
+async fn post_chat_once(client: &reqwest::Client, url: &str, body: &ChatReq<'_>) -> ChatAttempt {
+    match client.post(url).json(body).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let txt = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                let message = format!("HTTP {}: {}", status, truncate(&txt, 300));
+                // 4xx (except 429 Too Many Requests) are permanent — bad model
+                // id, malformed request, or a block over the context window.
+                // Retrying just burns a concurrency slot for several seconds
+                // and can never succeed.
+                if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return ChatAttempt::Fatal {
+                        overflow: is_context_overflow(&message),
+                        error: message,
+                    };
+                }
+                return ChatAttempt::Transient(message);
+            }
+            match serde_json::from_str::<ChatResp>(&txt) {
+                Ok(parsed) => match parsed.choices.into_iter().next() {
+                    Some(choice) => ChatAttempt::Success(choice.message.content),
+                    None => ChatAttempt::Transient("empty choices".into()),
+                },
+                Err(e) => {
+                    ChatAttempt::Transient(format!("parse json: {} | {}", e, truncate(&txt, 200)))
+                }
+            }
+        }
+        Err(e) => ChatAttempt::Transient(format!("request: {}", e)),
+    }
+}
+
 /// Send one cue slice as a tagged batch, retrying transient failures and
 /// keeping the attempt that translated the most cues (so a flaky batch still
 /// yields what it could). Never aborts on a partial result — a degenerate cue
@@ -298,41 +414,12 @@ async fn translate_one_batch(
     let mut last_err = String::new();
     let mut overflow = false;
 
-    for attempt in 0..4u32 {
+    for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(500u64 * 2u64.pow(attempt))).await;
+            backoff(attempt).await;
         }
-        match client.post(&url).json(&body).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                let txt = resp.text().await.unwrap_or_default();
-                if !status.is_success() {
-                    last_err = format!("HTTP {}: {}", status, truncate(&txt, 300));
-                    // 4xx (except 429) is permanent — retries can't fix it. A
-                    // context-length overflow is recoverable by the caller
-                    // splitting the batch, so flag it rather than giving up.
-                    if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS
-                    {
-                        if is_context_overflow(&last_err) {
-                            overflow = true;
-                        }
-                        break;
-                    }
-                    continue;
-                }
-                let content = match serde_json::from_str::<ChatResp>(&txt) {
-                    Ok(parsed) => match parsed.choices.into_iter().next() {
-                        Some(c) => c.message.content,
-                        None => {
-                            last_err = "empty choices".into();
-                            continue;
-                        }
-                    },
-                    Err(e) => {
-                        last_err = format!("parse json: {} | {}", e, truncate(&txt, 200));
-                        continue;
-                    }
-                };
+        match post_chat_once(client, &url, &body).await {
+            ChatAttempt::Success(content) => {
                 let parsed = parse_tagged(&content, cues.len());
                 let count = parsed.iter().filter(|x| x.is_some()).count();
                 if count > best_count {
@@ -343,9 +430,18 @@ async fn translate_one_batch(
                     break; // perfect — stop retrying
                 }
             }
-            Err(e) => {
-                last_err = format!("request: {}", e);
-                continue;
+            ChatAttempt::Transient(err) => last_err = err,
+            ChatAttempt::Fatal {
+                error,
+                overflow: is_overflow,
+            } => {
+                // A context-length overflow is recoverable by the caller
+                // splitting the batch, so flag it rather than giving up.
+                if is_overflow {
+                    overflow = true;
+                }
+                last_err = error;
+                break;
             }
         }
     }
@@ -445,7 +541,7 @@ fn sanitize_for_model(s: &str) -> String {
 /// That preserves the one-to-one correspondence (every cue is emitted, in
 /// order; nothing merged or split) without one degenerate cue sinking its whole
 /// batch. Spurious tags outside `1..=count` are ignored.
-fn parse_tagged(resp: &str, count: usize) -> Vec<Option<String>> {
+pub(crate) fn parse_tagged(resp: &str, count: usize) -> Vec<Option<String>> {
     use std::collections::BTreeMap;
     let mut map: BTreeMap<u32, String> = BTreeMap::new();
     let mut rest = resp;
@@ -484,6 +580,7 @@ fn parse_tagged(resp: &str, count: usize) -> Vec<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn parse_tagged_perfect_alignment() {
@@ -649,5 +746,94 @@ mod tests {
         assert_eq!(truncate("hello", 10), "hello");
         // ASCII boundary exact.
         assert_eq!(truncate("hello world", 5), "hello…");
+    }
+
+    #[test]
+    fn split_at_language_boundary_cuts_between_words() {
+        // Midpoint falls inside "middle"; the nearest whitespace wins, and
+        // the boundary char (and any trailing run) stays with the left half.
+        let text = "aaaa bbbb cccc dddd";
+        let (left, right) = split_at_language_boundary(text).unwrap();
+        assert_eq!((left.as_str(), right.as_str()), ("aaaa bbbb ", "cccc dddd"));
+
+        // CJK sentence punctuation is a boundary too.
+        let cjk = "第一句很长。第二句也很长。";
+        let (left, right) = split_at_language_boundary(cjk).unwrap();
+        assert!(left.ends_with('。'));
+        assert!(!right.starts_with('。'));
+
+        // Concatenating the halves reproduces the input exactly.
+        assert_eq!(format!("{left}{right}"), cjk);
+    }
+
+    #[test]
+    fn split_at_language_boundary_rejects_unbroken_runs() {
+        assert!(split_at_language_boundary(&"あ".repeat(500)).is_none());
+        // A boundary that would leave one side empty is rejected too.
+        assert!(
+            split_at_language_boundary("   content").is_none() || {
+                let (l, r) = split_at_language_boundary("   content").unwrap();
+                !l.trim().is_empty() && !r.trim().is_empty()
+            }
+        );
+    }
+
+    /// A Single segment longer than the context window is split in half and
+    /// each half translated, instead of being dropped (the batch path's
+    /// overflow recovery, applied to Independent segments).
+    #[tokio::test]
+    async fn single_translates_overflowing_segments_by_halving() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let handler_requests = requests.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    let content_len = body["messages"][0]["content"].as_str().unwrap().len();
+                    handler_requests.lock().unwrap().push(content_len);
+                    if content_len > 600 {
+                        // vLLM's context-length overflow 400.
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({
+                                "error": {"message":
+                                    "This model's maximum context length is 4096 tokens. However, you requested 0 output tokens and your prompt contains at least 4097 input tokens. Please reduce the length of the input prompt."}
+                            })),
+                        )
+                            .into_response();
+                    }
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"content": format!("tr({content_len})")}}]
+                    }))
+                    .into_response()
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let long = "word ".repeat(100);
+        let result = translate(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            "model",
+            &long,
+            "中文",
+        )
+        .await
+        .unwrap();
+        // The halves came back as two translations joined together.
+        assert!(result.starts_with("tr(") && result.contains(")tr("));
+
+        let requests = requests.lock().unwrap();
+        assert!(requests[0] > 600, "first request should be the long prompt");
+        assert!(
+            requests.iter().skip(1).all(|len| *len <= 600),
+            "every follow-up request should be a half: {requests:?}"
+        );
     }
 }

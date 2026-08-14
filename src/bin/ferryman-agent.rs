@@ -1013,36 +1013,75 @@ async fn proxy_chat(State(state): State<AppState>, headers: HeaderMap, body: Byt
 
     let _request_guard = ActiveRequestGuard::new(state.controller.active_requests.clone());
     state.controller.touch().await;
-    let response = state
+    // Streaming requests must be relayed chunk-by-chunk: buffering them until
+    // generation finishes would defeat SSE and trip the client's total
+    // timeout on long generations. Non-streaming requests keep the buffered
+    // path so the 190s total timeout still bounds them.
+    let wants_stream = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(|flag| flag.as_bool()))
+        .unwrap_or(false);
+    let mut request = match state
         .client
         .post(format!("{}/v1/chat/completions", state.vllm_endpoint))
         .header(header::CONTENT_TYPE, "application/json")
         .body(body)
-        .send()
-        .await;
+        .build()
+    {
+        Ok(request) => request,
+        Err(error) => {
+            error!(%error, "build vLLM request");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorBody {
+                    error: format!("build vLLM request: {error}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if wants_stream {
+        // SSE chunks arrive continuously, so inactivity is not a concern;
+        // the downstream client applies its own overall timeout.
+        *request.timeout_mut() = None;
+    }
+    let response = state.client.execute(request).await;
 
     let response = match response {
         Ok(response) => {
             let status = response.status();
             let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
-            match response.bytes().await {
-                Ok(bytes) => {
-                    let mut builder = Response::builder().status(status);
-                    if let Some(content_type) = content_type {
-                        builder = builder.header(header::CONTENT_TYPE, content_type);
-                    }
-                    builder.body(Body::from(bytes)).unwrap_or_else(|error| {
+            if wants_stream {
+                let mut builder = Response::builder().status(status);
+                if let Some(content_type) = content_type {
+                    builder = builder.header(header::CONTENT_TYPE, content_type);
+                }
+                builder
+                    .body(Body::from_stream(response.bytes_stream()))
+                    .unwrap_or_else(|error| {
                         error!(%error, "failed to build proxy response");
                         StatusCode::INTERNAL_SERVER_ERROR.into_response()
                     })
+            } else {
+                match response.bytes().await {
+                    Ok(bytes) => {
+                        let mut builder = Response::builder().status(status);
+                        if let Some(content_type) = content_type {
+                            builder = builder.header(header::CONTENT_TYPE, content_type);
+                        }
+                        builder.body(Body::from(bytes)).unwrap_or_else(|error| {
+                            error!(%error, "failed to build proxy response");
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        })
+                    }
+                    Err(error) => (
+                        StatusCode::BAD_GATEWAY,
+                        Json(ErrorBody {
+                            error: format!("read vLLM response: {error}"),
+                        }),
+                    )
+                        .into_response(),
                 }
-                Err(error) => (
-                    StatusCode::BAD_GATEWAY,
-                    Json(ErrorBody {
-                        error: format!("read vLLM response: {error}"),
-                    }),
-                )
-                    .into_response(),
             }
         }
         Err(error) => (

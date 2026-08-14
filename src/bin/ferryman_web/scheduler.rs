@@ -65,23 +65,39 @@ pub(super) async fn job_worker(state: AppState, mut queue: mpsc::Receiver<Uuid>)
 
     loop {
         while active.len() < MAX_ACTIVE_JOBS {
-            let Some(id) = pending.front().copied() else {
+            // Scan for the first dispatchable job instead of only the queue
+            // head: a 30B job waiting at the head must not starve every 7B
+            // job behind it (and vice versa) while the active preset differs.
+            let mut next = None;
+            let mut stale = Vec::new();
+            for (index, id) in pending.iter().enumerate() {
+                match queued_job_schedule(&state, *id).await {
+                    None => stale.push(index),
+                    Some((preset, output)) => {
+                        if can_dispatch_job(
+                            active_preset,
+                            active_outputs.values(),
+                            preset,
+                            output.as_ref(),
+                        ) {
+                            next = Some((index, preset, output));
+                            break;
+                        }
+                    }
+                }
+            }
+            // Drop entries that left the queue while waiting (cancelled,
+            // deleted) — newest first so earlier indexes stay valid.
+            for &index in stale.iter().rev() {
+                pending.remove(index);
+            }
+            let Some((index, preset, output)) = next else {
                 break;
             };
-            let Some((preset, output)) = queued_job_schedule(&state, id).await else {
-                pending.pop_front();
+            let Some(id) = pending.remove(index) else {
                 continue;
             };
-            if !can_dispatch_job(
-                active_preset,
-                active_outputs.values(),
-                preset,
-                output.as_ref(),
-            ) {
-                break;
-            }
 
-            pending.pop_front();
             active_preset = Some(preset);
             let job_state = state.clone();
             let task = active.spawn(async move {

@@ -867,6 +867,52 @@ pub(super) async fn retry_job(
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")),
     };
 
+    // A previous attempt may have already saved its result into the user's
+    // storage. When that saved copy is byte-identical to this job's own last
+    // output it is our artifact and must be cleared too — otherwise the rerun
+    // fails at save time with "output file already exists" and retrying could
+    // never succeed. A file that differs (or predates the job) is left
+    // untouched and reported as a conflict instead.
+    if let Some(target) = entry.save_to.as_ref().filter(|_| entry.save_root.is_some()) {
+        match tokio::fs::symlink_metadata(target).await {
+            Ok(metadata) => {
+                let is_our_artifact = metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && crate::runner::files_are_identical(&entry.output, target)
+                        .await
+                        .unwrap_or(false);
+                if !is_our_artifact {
+                    entry.record.status = JobStatus::Failed;
+                    entry.record.error = Some(
+                        "save target already exists with different content; \
+                         delete it or create the job with overwrite enabled"
+                            .to_string(),
+                    );
+                    entry.record.updated_at = now_epoch_seconds();
+                    if let Err(store_error) = state.store.update(entry).await {
+                        error!(%id, %store_error, "restore failed job after retry conflict");
+                    }
+                    return json_error(
+                        StatusCode::CONFLICT,
+                        "save target already exists with different content; \
+                         delete it or create the job with overwrite enabled",
+                    );
+                }
+                if let Err(error) = tokio::fs::remove_file(target).await {
+                    entry.record.status = JobStatus::Failed;
+                    entry.record.error = Some(format!("clear saved result before retry: {error}"));
+                    entry.record.updated_at = now_epoch_seconds();
+                    if let Err(store_error) = state.store.update(entry).await {
+                        error!(%id, %store_error, "restore failed job after retry cleanup error");
+                    }
+                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        }
+    }
+
     match tokio::fs::remove_file(&entry.output).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -993,7 +1039,7 @@ pub(super) async fn delete_job(
 mod tests {
     use super::*;
     use crate::job_store::JobStore;
-    use crate::Config;
+    use crate::{Config, JobPersister};
     use axum::extract::{FromRequest, Request};
     use std::env;
     use std::sync::Arc;
@@ -1049,9 +1095,11 @@ mod tests {
 
     async fn test_app_state(base: &FsPath) -> AppState {
         let (queue, _receiver) = mpsc::channel(1);
+        let store = JobStore::open(base.join("jobs.sqlite3")).await.unwrap();
         AppState {
             active_jobs: Arc::new(RwLock::new(HashMap::new())),
-            store: JobStore::open(base.join("jobs.sqlite3")).await.unwrap(),
+            persister: JobPersister::spawn(store.clone()),
+            store,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             queue,
             request_limiters: Arc::new(HashMap::new()),

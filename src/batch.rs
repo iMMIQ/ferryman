@@ -41,6 +41,13 @@ pub struct BatchOpts {
     pub context: usize,
     /// Global segment cap across the whole batch (`None` = unlimited).
     pub limit: Option<usize>,
+    /// Estimated prompt-size ceiling per batch request, in characters
+    /// (CJK ≈ 1 char per token, so chars over-estimate latin text — the safe
+    /// direction). Sized from the preset's context window so a batch that
+    /// obviously cannot fit is split client-side, instead of paying a doomed
+    /// request that 400s before `translate_split` recovers by halving.
+    /// `0` disables the pre-split (count-only batching).
+    pub prompt_char_budget: usize,
 }
 
 pub struct BatchSummary {
@@ -265,7 +272,13 @@ impl BatchState {
                 context: self.opts.context,
             },
         };
-        let units = build_units(fidx, &segments, strategy, &mut self.budget);
+        let units = build_units(
+            fidx,
+            &segments,
+            strategy,
+            &mut self.budget,
+            self.opts.prompt_char_budget,
+        );
         Ok(OpenFile {
             doc,
             out_path: resolve_output(
@@ -405,6 +418,7 @@ fn build_units(
     segments: &[Segment],
     strategy: Strategy,
     budget: &mut Option<usize>,
+    prompt_char_budget: usize,
 ) -> Vec<Unit> {
     /// How many of `want` segments the budget still allows, decrementing it.
     fn allow(budget: &mut Option<usize>, want: usize) -> usize {
@@ -446,21 +460,58 @@ fn build_units(
                 }
                 let end = i + n;
                 let ctx_start = i.saturating_sub(context);
-                units.push(Unit::Batch {
-                    file,
-                    ids: segments[i..end].iter().map(|s| s.id).collect(),
-                    cues: segments[i..end].iter().map(|s| s.text.clone()).collect(),
-                    context: segments[ctx_start..i]
-                        .iter()
-                        .map(|s| s.text.clone())
-                        .collect(),
-                });
-                i = end;
+                // Split the count-sized batch further by estimated prompt size
+                // so a batch that clearly cannot fit the model's context
+                // window never leaves the client (see `BatchOpts::prompt_char_budget`).
+                // A single cue longer than the whole budget still goes out
+                // alone — the translate layer's overflow recovery owns it.
+                if prompt_char_budget > 0 {
+                    let ctx_chars: usize =
+                        segments[ctx_start..i].iter().map(|s| s.text.len()).sum();
+                    let mut chars = BATCH_PROMPT_OVERHEAD_CHARS + ctx_chars;
+                    let mut sub_end = i;
+                    while sub_end < end {
+                        chars += segments[sub_end].text.len() + 16; // the <cN></cN> wrapper
+                        if sub_end > i && chars > prompt_char_budget {
+                            break;
+                        }
+                        sub_end += 1;
+                    }
+                    units.push(Unit::Batch {
+                        file,
+                        ids: segments[i..sub_end].iter().map(|s| s.id).collect(),
+                        cues: segments[i..sub_end]
+                            .iter()
+                            .map(|s| s.text.clone())
+                            .collect(),
+                        context: segments[ctx_start..i]
+                            .iter()
+                            .map(|s| s.text.clone())
+                            .collect(),
+                    });
+                    i = sub_end;
+                } else {
+                    units.push(Unit::Batch {
+                        file,
+                        ids: segments[i..end].iter().map(|s| s.id).collect(),
+                        cues: segments[i..end].iter().map(|s| s.text.clone()).collect(),
+                        context: segments[ctx_start..i]
+                            .iter()
+                            .map(|s| s.text.clone())
+                            .collect(),
+                    });
+                    i = end;
+                }
             }
         }
     }
     units
 }
+
+/// Rough size of the batch prompt template + per-batch slack, subtracted up
+/// front when estimating whether a batch fits the context window. A little
+/// generous on purpose — underestimating the template is what 400s requests.
+const BATCH_PROMPT_OVERHEAD_CHARS: usize = 512;
 
 // ── input discovery + output paths ──────────────────────────────────────────
 
@@ -560,7 +611,7 @@ mod tests {
     #[test]
     fn independent_emits_one_single_per_segment() {
         let segs = vec![seg(0, "a"), seg(1, "b"), seg(2, "c")];
-        let units = build_units(7, &segs, Strategy::Independent, &mut None);
+        let units = build_units(7, &segs, Strategy::Independent, &mut None, 0);
         assert_eq!(units.len(), 3);
         assert!(units
             .iter()
@@ -585,6 +636,7 @@ mod tests {
                 context: 1,
             },
             &mut None,
+            0,
         );
         assert_eq!(units.len(), 3);
         // batch 0 (starts at i=0): cues a,b; context = segs[0..0] = none.
@@ -627,6 +679,7 @@ mod tests {
                 context: 5,
             },
             &mut Some(3),
+            0,
         );
         assert_eq!(units.len(), 1);
         match &units[0] {
@@ -638,8 +691,68 @@ mod tests {
     #[test]
     fn limit_caps_total_across_independent() {
         let segs: Vec<_> = (0..5).map(|i| seg(i, "x")).collect();
-        let units = build_units(0, &segs, Strategy::Independent, &mut Some(2));
+        let units = build_units(0, &segs, Strategy::Independent, &mut Some(2), 0);
         assert_eq!(units.len(), 2);
+    }
+
+    #[test]
+    fn prompt_budget_splits_batches_client_side() {
+        // 6 cues × 500 chars: with a budget admitting ~2 cues per request, one
+        // count-sized batch of 6 becomes three batches of 2 — no doomed 400
+        // probing needed before translate_split would halve its way down.
+        let segs: Vec<_> = (0..6).map(|i| seg(i, &"x".repeat(500))).collect();
+        let units = build_units(
+            0,
+            &segs,
+            Strategy::Batched {
+                batch_size: 6,
+                context: 0,
+            },
+            &mut None,
+            512 + 16 + 2 * 516, // template + two cues
+        );
+        let sizes: Vec<usize> = units
+            .iter()
+            .map(|unit| match unit {
+                Unit::Batch { cues, .. } => cues.len(),
+                Unit::Single { .. } => 0,
+            })
+            .collect();
+        assert_eq!(sizes, vec![2, 2, 2]);
+        // IDs stay in order across the split batches.
+        let ids: Vec<SegmentId> = units
+            .iter()
+            .flat_map(|unit| match unit {
+                Unit::Batch { ids, .. } => ids.clone(),
+                Unit::Single { .. } => vec![],
+            })
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn oversize_single_cue_still_emits_alone_under_budget() {
+        // A cue longer than the whole budget goes out as its own batch rather
+        // than being dropped — the translate layer's overflow recovery owns it.
+        let segs = vec![seg(0, &"x".repeat(5_000)), seg(1, "short")];
+        let units = build_units(
+            0,
+            &segs,
+            Strategy::Batched {
+                batch_size: 2,
+                context: 0,
+            },
+            &mut None,
+            1_000,
+        );
+        let sizes: Vec<usize> = units
+            .iter()
+            .map(|unit| match unit {
+                Unit::Batch { cues, .. } => cues.len(),
+                Unit::Single { .. } => 0,
+            })
+            .collect();
+        assert_eq!(sizes, vec![1, 1]);
     }
 
     #[test]
@@ -652,9 +765,10 @@ mod tests {
                 context: 5,
             },
             &mut None,
+            0,
         );
         assert!(units.is_empty());
-        let units = build_units(0, &[], Strategy::Independent, &mut None);
+        let units = build_units(0, &[], Strategy::Independent, &mut None, 0);
         assert!(units.is_empty());
     }
 
@@ -664,8 +778,8 @@ mod tests {
         // file 0 consumes all 3, file 1 gets nothing.
         let segs: Vec<_> = (0..5).map(|i| seg(i, "x")).collect();
         let mut budget = Some(3);
-        let u1 = build_units(0, &segs, Strategy::Independent, &mut budget);
-        let u2 = build_units(1, &segs, Strategy::Independent, &mut budget);
+        let u1 = build_units(0, &segs, Strategy::Independent, &mut budget, 0);
+        let u2 = build_units(1, &segs, Strategy::Independent, &mut budget, 0);
         assert_eq!(u1.len(), 3);
         assert_eq!(u2.len(), 0);
         assert_eq!(budget, Some(0));

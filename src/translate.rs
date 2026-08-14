@@ -101,13 +101,20 @@ async fn translate_single(
     let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
 
     let mut last_err = String::new();
+    let mut retry_after = None;
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            backoff(attempt).await;
+            backoff(attempt, retry_after).await;
         }
         match post_chat_once(client, &url, &body).await {
             ChatAttempt::Success(content) => return Ok(content.trim().to_string()),
-            ChatAttempt::Transient(err) => last_err = err,
+            ChatAttempt::Transient {
+                error,
+                retry_after: server,
+            } => {
+                last_err = error;
+                retry_after = server;
+            }
             ChatAttempt::Fatal { error, overflow } => {
                 if overflow
                     && depth < SINGLE_MAX_SPLIT_DEPTH
@@ -308,18 +315,50 @@ struct SliceOutcome {
 
 /// Did a fatal 4xx come from the prompt not fitting the model's context window?
 /// vLLM's body reads "This model's maximum context length is N tokens … reduce
-/// the length of the input prompt". Such a batch is recoverable by splitting;
-/// other 4xx (bad model id, malformed request) are not.
+/// the length of the input prompt"; other compatible servers say "context
+/// window" or "token limit". Such a batch is recoverable by splitting; other
+/// 4xx (bad model id, malformed request) are not. Matched case-insensitively
+/// against a small pattern set rather than one exact phrasing, so a server
+/// wording change doesn't silently turn a recoverable overflow into a
+/// permanent failure.
 fn is_context_overflow(err: &str) -> bool {
-    err.contains("context length") || err.contains("input prompt")
+    const PATTERNS: &[&str] = &[
+        "context length",
+        "input prompt",
+        "context window",
+        "token limit",
+        "maximum context",
+    ];
+    let lower = err.to_ascii_lowercase();
+    PATTERNS.iter().any(|pattern| lower.contains(pattern))
 }
 
 /// Retry budget shared by the Single and Batch paths (4 attempts total).
 const MAX_ATTEMPTS: u32 = 4;
 
-/// Exponential backoff between attempts: 1s, 2s, 4s (for attempts 1..3).
-async fn backoff(attempt: u32) {
-    tokio::time::sleep(Duration::from_millis(500u64 * 2u64.pow(attempt))).await;
+/// Ceiling for any single backoff (including a server-supplied `Retry-After`)
+/// so a bogus header can't stall a worker slot for minutes.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Exponential backoff between attempts — base 1s, 2s, 4s (attempts 1..3) —
+/// with ±50% jitter so concurrent workers don't retry in lockstep and hammer
+/// a recovering server in one wave. A server-supplied `Retry-After` (parsed
+/// from a 429/503) replaces the base when it asks for more.
+async fn backoff(attempt: u32, retry_after: Option<Duration>) {
+    let base = Duration::from_millis(500u64 * 2u64.pow(attempt));
+    let delay = match retry_after {
+        Some(server) if server > base => server,
+        _ => base,
+    }
+    .min(MAX_BACKOFF);
+    // Cheap jitter without a rand dependency: scale the delay by a factor
+    // derived from the clock's sub-second nanos (0.5..1.5).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.subsec_nanos())
+        .unwrap_or(0);
+    let factor = 0.5 + (nanos % 1_000) as f64 / 1_000.0;
+    tokio::time::sleep(delay.mul_f64(factor)).await;
 }
 
 /// One POST to `/v1/chat/completions`, classified. This is the single shared
@@ -328,8 +367,12 @@ async fn backoff(attempt: u32) {
 enum ChatAttempt {
     /// 2xx with the assistant message content parsed out.
     Success(String),
-    /// Worth retrying: network error, 5xx, 429, or an unparseable body.
-    Transient(String),
+    /// Worth retrying: network error, 5xx, 429, or an unparseable body. Carries
+    /// a server-supplied `Retry-After` (seconds) when the response had one.
+    Transient {
+        error: String,
+        retry_after: Option<Duration>,
+    },
     /// Other 4xx — permanent for this body (bad model id, malformed request,
     /// or a context-length overflow, flagged for the caller's split logic).
     Fatal { error: String, overflow: bool },
@@ -339,6 +382,18 @@ async fn post_chat_once(client: &reqwest::Client, url: &str, body: &ChatReq<'_>)
     match client.post(url).json(body).send().await {
         Ok(resp) => {
             let status = resp.status();
+            // `Retry-After` only means something on a retryable response; read
+            // it before `text()` consumes the response.
+            let retry_after =
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                    resp.headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                        .map(Duration::from_secs)
+                } else {
+                    None
+                };
             let txt = resp.text().await.unwrap_or_default();
             if !status.is_success() {
                 let message = format!("HTTP {}: {}", status, truncate(&txt, 300));
@@ -352,19 +407,29 @@ async fn post_chat_once(client: &reqwest::Client, url: &str, body: &ChatReq<'_>)
                         error: message,
                     };
                 }
-                return ChatAttempt::Transient(message);
+                return ChatAttempt::Transient {
+                    error: message,
+                    retry_after,
+                };
             }
             match serde_json::from_str::<ChatResp>(&txt) {
                 Ok(parsed) => match parsed.choices.into_iter().next() {
                     Some(choice) => ChatAttempt::Success(choice.message.content),
-                    None => ChatAttempt::Transient("empty choices".into()),
+                    None => ChatAttempt::Transient {
+                        error: "empty choices".into(),
+                        retry_after: None,
+                    },
                 },
-                Err(e) => {
-                    ChatAttempt::Transient(format!("parse json: {} | {}", e, truncate(&txt, 200)))
-                }
+                Err(e) => ChatAttempt::Transient {
+                    error: format!("parse json: {} | {}", e, truncate(&txt, 200)),
+                    retry_after: None,
+                },
             }
         }
-        Err(e) => ChatAttempt::Transient(format!("request: {}", e)),
+        Err(e) => ChatAttempt::Transient {
+            error: format!("request: {}", e),
+            retry_after: None,
+        },
     }
 }
 
@@ -412,11 +477,12 @@ async fn translate_one_batch(
     let mut best: Vec<Option<String>> = (0..cues.len()).map(|_| None).collect();
     let mut best_count = 0;
     let mut last_err = String::new();
+    let mut retry_after = None;
     let mut overflow = false;
 
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            backoff(attempt).await;
+            backoff(attempt, retry_after).await;
         }
         match post_chat_once(client, &url, &body).await {
             ChatAttempt::Success(content) => {
@@ -430,7 +496,13 @@ async fn translate_one_batch(
                     break; // perfect — stop retrying
                 }
             }
-            ChatAttempt::Transient(err) => last_err = err,
+            ChatAttempt::Transient {
+                error,
+                retry_after: server,
+            } => {
+                last_err = error;
+                retry_after = server;
+            }
             ChatAttempt::Fatal {
                 error,
                 overflow: is_overflow,

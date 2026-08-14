@@ -158,7 +158,7 @@ impl Engine {
             Unit::Single { id, text, .. } => {
                 let key = cache.as_ref().map(|c| c.key(model, target, &text));
                 if let (Some(c), Some(k)) = (cache.as_ref(), key.as_deref()) {
-                    if let Some(v) = c.get(k) {
+                    if let Some(v) = c.get(k).await {
                         return UnitDone {
                             file,
                             attempted: 1,
@@ -173,7 +173,7 @@ impl Engine {
                         // right after (Ctrl-C between completion and drain),
                         // the next run finds the cache populated.
                         if let (Some(c), Some(k)) = (cache.as_ref(), key.as_deref()) {
-                            c.put(k, &tr);
+                            c.put(k, &tr).await;
                         }
                         UnitDone {
                             file,
@@ -218,13 +218,14 @@ impl Engine {
                     .collect();
 
                 // All-cached fast path: skip the HTTP round-trip entirely.
-                let mut results: Vec<Option<String>> = keys
-                    .iter()
-                    .map(|k| {
-                        k.as_deref()
-                            .and_then(|kk| cache.as_ref().and_then(|c| c.get(kk)))
-                    })
-                    .collect();
+                let mut results: Vec<Option<String>> = Vec::with_capacity(n);
+                for k in &keys {
+                    let hit = match (cache.as_ref(), k.as_deref()) {
+                        (Some(c), Some(kk)) => c.get(kk).await,
+                        _ => None,
+                    };
+                    results.push(hit);
+                }
                 if results.iter().all(|v| v.is_some()) {
                     let pairs = ids
                         .into_iter()
@@ -251,7 +252,7 @@ impl Engine {
                 for (slot, &idx) in miss_idx.iter().enumerate() {
                     if let Some(tr) = &trs[slot] {
                         if let (Some(c), Some(k)) = (cache.as_ref(), keys[idx].as_deref()) {
-                            c.put(k, tr);
+                            c.put(k, tr).await;
                         }
                         results[idx] = Some(tr.clone());
                     }
@@ -353,7 +354,7 @@ mod tests {
         // Prime the cache for two of the three cues.
         for text in ["one", "two"] {
             let key = cache.key("model", "target", text);
-            cache.put(&key, &format!("cached-{text}"));
+            cache.put(&key, &format!("cached-{text}")).await;
         }
 
         let engine = Engine::new(

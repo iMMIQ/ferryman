@@ -78,6 +78,17 @@ impl Preset {
     pub fn api_model(self) -> &'static str {
         self.as_str()
     }
+
+    /// Estimated per-request prompt ceiling (in characters) for client-side
+    /// batch pre-splitting: roughly half the context window, because the
+    /// translation output needs about as much room as the input again.
+    /// CJK counts ≈1 token per char, so chars over-estimate latin text — the
+    /// safe direction. Floored so even a small window still admits a cue.
+    pub fn prompt_char_budget(self) -> usize {
+        (self.config().max_model_len as usize / 2)
+            .saturating_sub(256)
+            .max(512)
+    }
 }
 
 impl fmt::Display for Preset {

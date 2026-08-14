@@ -62,9 +62,11 @@ impl Cache {
         h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
     }
 
-    /// Returns the cached translation for `key`, or `None` on miss / read error.
-    pub fn get(&self, key: &str) -> Option<String> {
-        fs::read_to_string(self.path_of(key)).ok()
+    /// Returns the cached translation for `key`, or `None` on miss / read
+    /// error. Async (`tokio::fs`): a 10k-block book issues ~20k of these per
+    /// run, and the sync version blocked the async workers between HTTP polls.
+    pub async fn get(&self, key: &str) -> Option<String> {
+        tokio::fs::read_to_string(self.path_of(key)).await.ok()
     }
 
     /// Write `val` under `key`, best-effort. Atomic via tmp-file + rename within
@@ -73,18 +75,22 @@ impl Cache {
     /// never bubbled — a failed write just means a re-translate later. No
     /// `fsync`: the goal is surviving Ctrl-C (page cache survives process
     /// exit), not power loss, and fsync per block would dominate a large book.
-    pub fn put(&self, key: &str, val: &str) {
+    pub async fn put(&self, key: &str, val: &str) {
         let final_path = self.path_of(key);
         let shard = final_path.parent().unwrap_or_else(|| Path::new("."));
-        if let Err(e) = fs::create_dir_all(shard) {
+        if let Err(e) = tokio::fs::create_dir_all(shard).await {
             eprintln!("warn: cache mkdir {:?} failed: {}", shard, e);
             return;
         }
         let ctr = self.counter.fetch_add(1, Ordering::Relaxed);
         let tmp = shard.join(format!(".{}.{}.tmp", key, ctr));
-        if let Err(e) = fs::write(&tmp, val).and_then(|_| fs::rename(&tmp, &final_path)) {
+        let outcome = match tokio::fs::write(&tmp, val).await {
+            Ok(()) => tokio::fs::rename(&tmp, &final_path).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = outcome {
             eprintln!("warn: cache write {:?} failed: {}", final_path, e);
-            let _ = fs::remove_file(&tmp);
+            let _ = tokio::fs::remove_file(&tmp).await;
         }
     }
 

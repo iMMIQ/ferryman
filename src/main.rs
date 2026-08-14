@@ -351,6 +351,7 @@ async fn main() -> Result<()> {
         batch_size: settings.batch_size,
         context: settings.context_segments,
         limit: cli.limit,
+        prompt_char_budget: cli.preset.prompt_char_budget(),
     };
     let summary = run_batch(&engine, inputs, opts).await;
 

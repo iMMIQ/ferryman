@@ -134,6 +134,42 @@ lzc-cli project lint .
 lzc-cli project build .
 ```
 
+### Standalone Docker deployment (single machine)
+
+On a single machine without Lazycat — a Jetson board or any Linux host with an
+NVIDIA GPU — `docker-compose.standalone.yml` runs both processes with plain
+Docker. Everything builds from source inside Docker, so no cross toolchain or
+host Rust install is needed:
+
+```bash
+cp .env.example .env   # then set FERRYMAN_AGENT_TOKEN (openssl rand -hex 32)
+docker compose -f docker-compose.standalone.yml up -d --build
+```
+
+The web UI listens on `http://<host>:$FERRYMAN_WEB_PORT` (default 8080). The
+job database, both libraries, model weights and vLLM caches live in host
+directories configured in `.env`; `init-dirs` creates the
+`local-development-user/` library subtree on first start. Models are
+downloaded through the web model manager, or detected automatically when
+`$FERRYMAN_MODELS_DIR` already contains `Hy-MT2-7B-FP8/` or
+`Hy-MT2-30B-A3B-FP8/`.
+
+The stack runs in **single-user mode**: every visitor shares the
+`local-development-user` identity, so keep the port on a trusted network. For
+multiple users, front the web service with an authenticating reverse proxy
+that injects a per-user `safe_uid` header, and create
+`<documents>/<uid>/` and `<remotefs>/<uid>/` directories for each user.
+
+Non-Jetson hosts: set `VLLM_BASE_IMAGE` to a vLLM image matching the host
+CUDA stack and `FERRYMAN_VLLM_LD_PRELOAD=` (empty) in `.env`. The agent sizes
+every launch from the GPU that is actually present — it probes total/free
+memory through the image's torch, sums the model's safetensors weights, and
+derives `--gpu-memory-utilization` and the KV cache size from them (on the
+reference 64 GiB Orin this reproduces the tuned 0.30/0.55 + 8/3 GiB values;
+a preset that cannot fit is rejected with the numbers instead of failing
+inside vLLM). `--kv-cache-memory-bytes` is passed only when the chosen vLLM
+build accepts it; `FERRYMAN_VLLM_KV_CACHE_FLAG=0/1` overrides that probe.
+
 ### Shared core boundary
 
 The CLI and Web adapter intentionally stop at the same library boundary:

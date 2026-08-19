@@ -1,0 +1,40 @@
+# Standalone ferryman-agent image for the single-machine Docker deployment.
+# VLLM_BASE_IMAGE swaps the vLLM runtime. The default is the Jetson AGX Orin
+# build the presets were tuned for (aarch64 + CUDA 12.6); x86 hosts need a
+# matching vLLM image plus FERRYMAN_VLLM_LD_PRELOAD= (see README).
+# syntax=docker/dockerfile:1
+
+ARG VLLM_BASE_IMAGE=docker.io/catdogai/lzc-aipod-vllm:agxorin-cu126-src-18f658bb3185-20260703
+
+# The alpine/musl builder produces a static binary independent of the runtime
+# image's glibc, so any vLLM base image works regardless of its distro.
+FROM lukemathwalker/cargo-chef:latest-rust-1-alpine AS chef
+WORKDIR /app
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY . .
+# Build both binaries here; the stages are identical to Dockerfile.web so
+# dependencies are compiled once and shared through the build cache.
+RUN cargo build --release --bin ferryman-web --bin ferryman-agent \
+    && strip target/release/ferryman-web target/release/ferryman-agent
+
+FROM ${VLLM_BASE_IMAGE} AS runtime
+COPY --from=builder /app/target/release/ferryman-agent /usr/local/bin/ferryman-agent
+# LD_PRELOAD is cleared for the agent process itself; the controller re-applies
+# it (or FERRYMAN_VLLM_LD_PRELOAD) to the vLLM child it spawns.
+ENV FERRYMAN_AGENT_LISTEN=0.0.0.0:8090 \
+    FERRYMAN_MODEL_ROOT=/models \
+    FERRYMAN_IDLE_TIMEOUT_SECONDS=600 \
+    RUST_LOG=info \
+    LD_PRELOAD= \
+    VLLM_CONFIGURE_LOGGING=0 \
+    VLLM_DO_NOT_TRACK=1 \
+    VLLM_NO_USAGE_STATS=1
+EXPOSE 8090
+ENTRYPOINT ["/usr/local/bin/ferryman-agent"]

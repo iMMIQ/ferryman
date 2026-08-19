@@ -28,5 +28,12 @@ source fallback and SHA-256 validation when the provider publishes hashes.
 
 Only the Rust controller remains resident. It starts one `vllm serve` child at
 a time and unloads it after the final lease expires plus the idle timeout.
-The controller fixes the FP8 KV cache at 8 GiB for 7B and 3 GiB for 30B so
-Jetson UMA and zram activity cannot change cache capacity between launches.
+The controller sizes the vLLM launch from the GPU memory that is actually
+present (total/free via the image's torch, weights via the safetensors shard
+sizes). On the reference 64 GiB AGX Orin this keeps the tuned values verbatim —
+FP8 KV cache fixed at 8 GiB for 7B and 3 GiB for 30B, so Jetson UMA and zram
+activity cannot change cache capacity between launches. On other GPUs the
+utilization is raised or the KV cache is shrunk to fit, and a preset that
+cannot fit at all is rejected with the numbers instead of failing inside
+vLLM. `--kv-cache-memory-bytes` is omitted automatically when the vLLM build
+does not accept the flag.

@@ -6,3 +6,11 @@
 /.lzc-cli-cache/
 **/__pycache__/
 **/*.rs.bk
+
+# Standalone Docker deployment (docker-compose.standalone.yml)
+/.env
+/data/
+/documents/
+/remotefs/
+/models/
+/agent-cache/

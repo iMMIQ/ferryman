@@ -4,7 +4,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use ferryman::preset::Preset;
+use ferryman::preset::{Preset, PresetConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::env;
@@ -20,6 +20,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+#[path = "ferryman_agent/gpu_profile.rs"]
+mod gpu_profile;
 #[path = "ferryman_agent/model_manager.rs"]
 mod model_manager;
 
@@ -141,6 +143,22 @@ enum RuntimeCommand {
     },
 }
 
+/// GPU memory probe state; `Unavailable` keeps the fixed preset values.
+#[derive(Clone, Copy)]
+enum GpuProbe {
+    Pending,
+    Known(gpu_profile::GpuMemory),
+    Unavailable,
+}
+
+/// Probe state for vLLM `--kv-cache-memory-bytes` support; the reference
+/// Jetson build accepts the flag, other builds may not.
+#[derive(Clone, Copy)]
+enum KvFlagProbe {
+    Pending,
+    Known(bool),
+}
+
 struct RuntimeManager {
     commands: mpsc::Sender<RuntimeCommand>,
     receiver: mpsc::Receiver<RuntimeCommand>,
@@ -157,6 +175,9 @@ struct RuntimeManager {
     idle_timeout: Duration,
     start_timeout: Duration,
     vllm_bin: String,
+    vllm_ld_preload: Option<String>,
+    gpu_probe: GpuProbe,
+    kv_flag_probe: KvFlagProbe,
     model_root: String,
     vllm_endpoint: String,
     client: reqwest::Client,
@@ -197,6 +218,7 @@ impl Controller {
         idle_timeout: Duration,
         start_timeout: Duration,
         vllm_bin: String,
+        vllm_ld_preload: Option<String>,
         model_root: String,
         vllm_endpoint: String,
         client: reqwest::Client,
@@ -235,6 +257,9 @@ impl Controller {
             idle_timeout,
             start_timeout,
             vllm_bin,
+            vllm_ld_preload,
+            gpu_probe: GpuProbe::Pending,
+            kv_flag_probe: KvFlagProbe::Pending,
             model_root,
             vllm_endpoint,
             client,
@@ -391,6 +416,72 @@ impl RuntimeManager {
         Ok(self.publish())
     }
 
+    /// Marks the runtime Failed with `message` mirrored into the startup log,
+    /// and returns the message for the command's error response.
+    fn fail_start(&mut self, preset: Preset, message: String) -> String {
+        self.phase = RuntimePhase::Failed;
+        self.preset = Some(preset);
+        self.startup_stage = Some(StartupStage::Failed);
+        self.startup_progress = 0;
+        self.last_error = Some(message.clone());
+        self.recent_logs.clear();
+        self.recent_logs.push_back(message.clone());
+        self.publish();
+        message
+    }
+
+    /// Sizes the vLLM launch from the GPU that is actually present. Probes are
+    /// cached for the agent's lifetime; when the hardware cannot be probed the
+    /// fixed preset values stay in effect.
+    async fn size_launch(
+        &mut self,
+        model_path: &str,
+        cfg: &PresetConfig,
+    ) -> Result<gpu_profile::LaunchProfile, String> {
+        if matches!(self.gpu_probe, GpuProbe::Pending) {
+            self.gpu_probe = match gpu_profile::detect_gpu_memory().await {
+                Some(memory) => GpuProbe::Known(memory),
+                None => {
+                    warn!("GPU memory probe unavailable; fixed preset values stay in effect");
+                    GpuProbe::Unavailable
+                }
+            };
+        }
+        let kv_flag_supported = match env::var("FERRYMAN_VLLM_KV_CACHE_FLAG").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => match self.kv_flag_probe {
+                KvFlagProbe::Known(value) => value,
+                KvFlagProbe::Pending => {
+                    let value = gpu_profile::detect_kv_flag_supported(&self.vllm_bin)
+                        .await
+                        .unwrap_or(true);
+                    self.kv_flag_probe = KvFlagProbe::Known(value);
+                    value
+                }
+            },
+        };
+        match (self.gpu_probe, gpu_profile::weights_bytes(FsPath::new(model_path)).await) {
+            (GpuProbe::Known(memory), Some(weights)) => {
+                let launch =
+                    gpu_profile::derive_launch_profile(cfg, weights, &memory, kv_flag_supported)?;
+                info!(
+                    utilization = launch.gpu_memory_utilization,
+                    kv_cache_bytes = ?launch.kv_cache_memory_bytes,
+                    weights_bytes = weights,
+                    total_bytes = memory.total,
+                    free_bytes = memory.free,
+                    "sized vLLM launch from GPU memory"
+                );
+                Ok(launch)
+            }
+            _ => Ok(gpu_profile::LaunchProfile {
+                gpu_memory_utilization: cfg.gpu_memory_utilization,
+                kv_cache_memory_bytes: kv_flag_supported.then_some(cfg.kv_cache_memory_bytes),
+            }),
+        }
+    }
+
     async fn start_child(&mut self, preset: Preset) -> Result<(), String> {
         let cfg = preset.config();
         let model_path = format!(
@@ -399,17 +490,14 @@ impl RuntimeManager {
             cfg.model_dir_name
         );
         if !FsPath::new(&model_path).exists() {
-            self.phase = RuntimePhase::Failed;
-            self.preset = Some(preset);
-            self.startup_stage = Some(StartupStage::Failed);
-            self.startup_progress = 0;
-            self.last_error = Some(format!("model directory not found: {model_path}"));
-            self.recent_logs.clear();
-            self.recent_logs
-                .push_back(self.last_error.clone().unwrap_or_default());
-            self.publish();
-            return Err(self.last_error.clone().unwrap_or_default());
+            let message = format!("model directory not found: {model_path}");
+            return Err(self.fail_start(preset, message));
         }
+
+        let launch = self
+            .size_launch(&model_path, &cfg)
+            .await
+            .map_err(|message| self.fail_start(preset, message))?;
 
         let mut command = Command::new(&self.vllm_bin);
         command
@@ -421,12 +509,12 @@ impl RuntimeManager {
             .args(["--kv-cache-dtype", cfg.kv_cache_dtype])
             .args([
                 "--gpu-memory-utilization",
-                &cfg.gpu_memory_utilization.to_string(),
-            ])
-            .args([
-                "--kv-cache-memory-bytes",
-                &cfg.kv_cache_memory_bytes.to_string(),
-            ])
+                &launch.gpu_memory_utilization.to_string(),
+            ]);
+        if let Some(kv_bytes) = launch.kv_cache_memory_bytes {
+            command.args(["--kv-cache-memory-bytes", &kv_bytes.to_string()]);
+        }
+        command
             .args(["--max-model-len", &cfg.max_model_len.to_string()])
             .arg("--enable-prefix-caching")
             .stdout(Stdio::piped())
@@ -438,20 +526,19 @@ impl RuntimeManager {
         if cfg.enforce_eager {
             command.arg("--enforce-eager");
         }
+        // The Jetson image resolves the NVIDIA aarch64 libcuda only through an
+        // explicit preload; FERRYMAN_VLLM_LD_PRELOAD overrides it, and an empty
+        // value clears it for non-Jetson base images.
         command.env(
             "LD_PRELOAD",
-            "/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1",
+            self.vllm_ld_preload
+                .as_deref()
+                .unwrap_or("/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1"),
         );
         command.process_group(0);
 
         let mut child = command.spawn().map_err(|error| {
-            let message = format!("start vLLM: {error}");
-            self.phase = RuntimePhase::Failed;
-            self.preset = Some(preset);
-            self.startup_stage = Some(StartupStage::Failed);
-            self.last_error = Some(message.clone());
-            self.publish();
-            message
+            self.fail_start(preset, format!("start vLLM: {error}"))
         })?;
         let pid = child.id().unwrap_or_default();
         if let Some(stdout) = child.stdout.take() {
@@ -1180,6 +1267,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(600)
         .max(30);
     let vllm_bin = env::var("FERRYMAN_VLLM_BIN").unwrap_or_else(|_| "vllm".into());
+    let vllm_ld_preload = env::var("FERRYMAN_VLLM_LD_PRELOAD").ok();
     let model_root = env::var("FERRYMAN_MODEL_ROOT").unwrap_or_else(|_| "/models".into());
     let cache_root = env::var("FERRYMAN_CACHE_ROOT").unwrap_or_else(|_| "/root/.cache".into());
     let vllm_endpoint =
@@ -1191,6 +1279,7 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(idle_timeout),
         Duration::from_secs(start_timeout),
         vllm_bin,
+        vllm_ld_preload,
         model_root.clone(),
         vllm_endpoint.clone(),
         client.clone(),

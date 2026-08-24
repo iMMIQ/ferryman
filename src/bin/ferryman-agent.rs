@@ -461,7 +461,10 @@ impl RuntimeManager {
                 }
             },
         };
-        match (self.gpu_probe, gpu_profile::weights_bytes(FsPath::new(model_path)).await) {
+        match (
+            self.gpu_probe,
+            gpu_profile::weights_bytes(FsPath::new(model_path)).await,
+        ) {
             (GpuProbe::Known(memory), Some(weights)) => {
                 let launch =
                     gpu_profile::derive_launch_profile(cfg, weights, &memory, kv_flag_supported)?;
@@ -537,9 +540,9 @@ impl RuntimeManager {
         );
         command.process_group(0);
 
-        let mut child = command.spawn().map_err(|error| {
-            self.fail_start(preset, format!("start vLLM: {error}"))
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| self.fail_start(preset, format!("start vLLM: {error}")))?;
         let pid = child.id().unwrap_or_default();
         if let Some(stdout) = child.stdout.take() {
             tokio::spawn(pipe_logs(stdout, pid, "stdout", self.commands.clone()));

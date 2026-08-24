@@ -71,20 +71,25 @@ pub fn derive_launch_profile(
     let total = gpu.total as f64;
 
     if needed as f64 <= cfg.gpu_memory_utilization as f64 * total {
-        return Ok(profile(cfg.gpu_memory_utilization as f64, kv_default, kv_flag_supported));
+        return Ok(profile(
+            cfg.gpu_memory_utilization as f64,
+            kv_default,
+            kv_flag_supported,
+        ));
     }
 
     let ceiling = MAX_UTILIZATION.min(gpu.free as f64 / total);
     if needed as f64 <= ceiling * total {
         let ratio = needed as f64 / total;
-        return Ok(profile(quantize_up(ratio).min(ceiling), kv_default, kv_flag_supported));
+        return Ok(profile(
+            quantize_up(ratio).min(ceiling),
+            kv_default,
+            kv_flag_supported,
+        ));
     }
 
     let budget = (total * ceiling) as u64;
-    let kv = budget
-        .saturating_sub(weights_bytes + LAUNCH_OVERHEAD_BYTES)
-        / MIB_256
-        * MIB_256;
+    let kv = budget.saturating_sub(weights_bytes + LAUNCH_OVERHEAD_BYTES) / MIB_256 * MIB_256;
     if kv < MIN_VIABLE_KV_BYTES {
         return Err(format!(
             "GPU has {:.1} GiB total ({:.1} GiB free); {} needs {:.1} GiB of weights plus KV cache and launch overhead",
@@ -146,7 +151,7 @@ pub async fn detect_kv_flag_supported(vllm_bin: &str) -> Option<bool> {
         return Some(true);
     }
     let grouped = vllm_help(vllm_bin, "--help=CacheConfig").await;
-    Some(grouped.map_or(true, |help| help.contains(KV_FLAG)))
+    Some(grouped.is_none_or(|help| help.contains(KV_FLAG)))
 }
 
 /// Sum of the `*.safetensors` shards in a downloaded model directory; these
@@ -157,7 +162,11 @@ pub async fn weights_bytes(model_path: &Path) -> Option<u64> {
     let mut total = 0u64;
     let mut found = false;
     while let Some(entry) = entries.next_entry().await.ok()? {
-        if entry.file_name().to_string_lossy().ends_with(".safetensors") {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".safetensors")
+        {
             total += entry.metadata().await.ok()?.len();
             found = true;
         }
@@ -232,7 +241,7 @@ mod tests {
         let shrunk = derive_launch_profile(&seven, seven.download_bytes, &card, true).unwrap();
         assert_eq!(shrunk.gpu_memory_utilization, 0.90);
         let kv = shrunk.kv_cache_memory_bytes.unwrap();
-        assert!(kv >= 4 * GIB && kv < 8 * GIB);
+        assert!((4 * GIB..8 * GIB).contains(&kv));
         assert_eq!(kv % MIB_256, 0);
 
         // Busy small card: the ceiling follows free memory.
@@ -244,17 +253,14 @@ mod tests {
 
         // Too busy to host the weights at all: rejected like a tiny GPU.
         let hostile = gpu(16 * GIB, 9 * GIB);
-        assert!(
-            derive_launch_profile(&seven, seven.download_bytes, &hostile, true).is_err()
-        );
+        assert!(derive_launch_profile(&seven, seven.download_bytes, &hostile, true).is_err());
     }
 
     #[test]
     fn tiny_gpu_rejects_with_context() {
         let tiny = gpu(8 * GIB, 8 * GIB);
         let seven = Preset::SevenBFp8.config();
-        let message = derive_launch_profile(&seven, seven.download_bytes, &tiny, true)
-            .unwrap_err();
+        let message = derive_launch_profile(&seven, seven.download_bytes, &tiny, true).unwrap_err();
         assert!(message.contains("Hy-MT2-7B-FP8"), "{message}");
         assert!(message.contains("GiB"), "{message}");
     }

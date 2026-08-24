@@ -14,3 +14,7 @@
 /remotefs/
 /models/
 /agent-cache/
+
+# Local two-process dev run (README "Web app and Lazycat deployment")
+/ferryman-documents/
+/ferryman-remotefs/

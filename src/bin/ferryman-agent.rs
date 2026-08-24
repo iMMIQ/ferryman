@@ -966,20 +966,18 @@ async fn healthz() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
 }
 
-async fn runtime_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<RuntimeStatus>, Response> {
-    authorize(&headers, &state.token).map_err(|_| unauthorized_response())?;
-    Ok(Json(state.controller.snapshot()))
+async fn runtime_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize(&headers, &state.token).is_err() {
+        return unauthorized_response();
+    }
+    Json(state.controller.snapshot()).into_response()
 }
 
-async fn model_catalog(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<model_manager::ModelCatalog>, Response> {
-    authorize(&headers, &state.token).map_err(|_| unauthorized_response())?;
-    Ok(Json(state.models.catalog().await))
+async fn model_catalog(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize(&headers, &state.token).is_err() {
+        return unauthorized_response();
+    }
+    Json(state.models.catalog().await).into_response()
 }
 
 async fn start_model_download(
@@ -1062,12 +1060,11 @@ async fn cancel_source_benchmark(State(state): State<AppState>, headers: HeaderM
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn storage_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<model_manager::StorageStatus>, Response> {
-    authorize(&headers, &state.token).map_err(|_| unauthorized_response())?;
-    Ok(Json(state.models.storage_status().await))
+async fn storage_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorize(&headers, &state.token).is_err() {
+        return unauthorized_response();
+    }
+    Json(state.models.storage_status().await).into_response()
 }
 
 async fn clear_runtime_cache(State(state): State<AppState>, headers: HeaderMap) -> Response {

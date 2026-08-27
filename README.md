@@ -103,7 +103,7 @@ cargo run --bin ferryman-web
 The Web UI is then available at `http://127.0.0.1:8080`.
 
 For AI Pod deployment, the release build packages the native ARM64 controller
-binary directly inside `ai-pod-service` and reuses the official vLLM image:
+binary in a separate resource-only LPK and reuses the official vLLM image:
 
 ```bash
 # On an ARM64 development host, install the MicroServer Web cross compiler once:
@@ -125,13 +125,17 @@ selected AI Pod, not on the MicroServer. Rebuildable vLLM/JIT caches live under
 `LZC_AGENT_CACHE_DIR`. Upgrading the app or restarting the AI Pod preserves the
 models; switching to another AI Pod requires that pod to download its own copy.
 
-The `FERRYMAN_AGENT_TOKEN` in `lzc-manifest.yml` and
-`ai-pod-service/docker-compose.yml` must always contain the same production
-value. Then lint and build the LPK V2 package:
+Lazycat deployments generate a device-specific `FERRYMAN_AGENT_TOKEN` in the
+Web application's persistent private data on first startup. The Web service
+pairs that token with the AI Pod, where only its SHA-256 hash is persisted under
+`${LZC_AGENT_DATA_DIR}/auth`. No production bearer token is stored in the
+repository or either LPK. The token file is mode `0600`. Then lint and build the
+Web and AI Pod resource packages:
 
 ```bash
 lzc-cli project lint .
-lzc-cli project build .
+lzc-cli project release .
+lzc-cli project release -f lzc-build.aipod.yml
 ```
 
 ### Standalone Docker deployment (single machine)

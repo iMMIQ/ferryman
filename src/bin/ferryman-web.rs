@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -80,6 +81,7 @@ struct Config {
     remote_fs_dir: PathBuf,
     agent_url: String,
     agent_token: String,
+    agent_pairing: bool,
     allow_local_user: bool,
     client: reqwest::Client,
 }
@@ -566,15 +568,33 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "http://127.0.0.1:8090".into())
         .trim_end_matches('/')
         .to_string();
-    let agent_token = env::var("FERRYMAN_AGENT_TOKEN")
-        .map_err(|_| anyhow::anyhow!("FERRYMAN_AGENT_TOKEN must be set"))?;
+    let configured_agent_token = env::var("FERRYMAN_AGENT_TOKEN").ok();
+    tokio::fs::create_dir_all(&data_dir).await?;
+    let agent_token = if let Some(token) = configured_agent_token {
+        token
+    } else {
+        let token_path = data_dir.join("agent-token");
+        let token = match tokio::fs::read_to_string(&token_path).await {
+            Ok(token) => token.trim().to_string(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let token = uuid::Uuid::new_v4().simple().to_string();
+                tokio::fs::write(&token_path, format!("{token}\n")).await?;
+                token
+            }
+            Err(error) => return Err(error.into()),
+        };
+        tokio::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).await?;
+        token
+    };
     if agent_token.len() < 16 {
         anyhow::bail!("FERRYMAN_AGENT_TOKEN must be at least 16 characters");
     }
+    let agent_pairing = env::var("FERRYMAN_AGENT_PAIRING")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let allow_local_user = env::var("FERRYMAN_ALLOW_LOCAL_USER")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    tokio::fs::create_dir_all(&data_dir).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -582,6 +602,24 @@ async fn main() -> Result<()> {
         Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECONDS),
         Some(&agent_token),
     )?;
+    let runtime_config = Arc::new(Config {
+        data_dir: data_dir.clone(),
+        user_documents_dir,
+        remote_fs_dir,
+        agent_url,
+        agent_token,
+        agent_pairing,
+        allow_local_user,
+        client,
+    });
+    if runtime_config.agent_pairing {
+        let pairing_config = runtime_config.clone();
+        tokio::spawn(async move {
+            if let Err(error) = agent_proxy::pair_agent_with_retry(&pairing_config).await {
+                warn!(%error, "could not pair with AI Pod agent during startup");
+            }
+        });
+    }
     let store = JobStore::open(data_dir.join("jobs.sqlite3"))
         .await
         .context("open job database")?;
@@ -619,15 +657,7 @@ async fn main() -> Result<()> {
             ),
         ])),
         translation_client,
-        config: Arc::new(Config {
-            data_dir,
-            user_documents_dir,
-            remote_fs_dir,
-            agent_url,
-            agent_token,
-            allow_local_user,
-            client,
-        }),
+        config: runtime_config,
     };
     tokio::spawn(scheduler::job_worker(state.clone(), receiver));
     for id in pending {
@@ -759,6 +789,7 @@ mod tests {
                 remote_fs_dir: base.join("remote-fs"),
                 agent_url: String::new(),
                 agent_token: String::new(),
+                agent_pairing: false,
                 allow_local_user: true,
                 client: reqwest::Client::new(),
             }),
@@ -966,6 +997,7 @@ mod tests {
             remote_fs_dir: PathBuf::from("remote-fs"),
             agent_url: String::new(),
             agent_token: String::new(),
+            agent_pairing: false,
             allow_local_user: true,
             client: reqwest::Client::new(),
         };
@@ -1003,6 +1035,7 @@ mod tests {
             remote_fs_dir: remote_fs,
             agent_url: String::new(),
             agent_token: String::new(),
+            agent_pairing: false,
             allow_local_user: false,
             client: reqwest::Client::new(),
         };

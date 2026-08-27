@@ -6,16 +6,17 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use ferryman::preset::{Preset, PresetConfig};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::path::Path as FsPath;
+use std::path::{Path as FsPath, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, RwLock};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -32,8 +33,158 @@ struct AppState {
     controller: Controller,
     models: ModelManager,
     client: reqwest::Client,
-    token: Arc<str>,
+    auth: AgentAuth,
     vllm_endpoint: Arc<str>,
+}
+
+#[derive(Clone)]
+struct AgentAuth {
+    token_hash: Arc<RwLock<Option<[u8; 32]>>>,
+    state_file: Option<Arc<PathBuf>>,
+    challenge: Arc<RwLock<Option<(String, Instant)>>>,
+}
+
+impl AgentAuth {
+    async fn load(
+        configured_token: Option<String>,
+        state_file: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        let token_hash = if let Some(token) = configured_token {
+            validate_token(&token)?;
+            Some(hash_token(&token))
+        } else if let Some(path) = state_file.as_ref() {
+            match tokio::fs::read_to_string(path).await {
+                Ok(value) => Some(parse_token_hash(value.trim())?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            anyhow::bail!(
+                "set FERRYMAN_AGENT_TOKEN or FERRYMAN_AUTH_STATE_FILE for one-time pairing"
+            );
+        };
+        Ok(Self {
+            token_hash: Arc::new(RwLock::new(token_hash)),
+            state_file: state_file.map(Arc::new),
+            challenge: Arc::new(RwLock::new(None)),
+        })
+    }
+
+    async fn authorize(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
+        let supplied = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+        let expected = self.token_hash.read().await;
+        match expected.as_ref() {
+            Some(expected) if constant_time_eq(&hash_token(supplied), expected) => Ok(()),
+            _ => Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+
+    async fn issue_challenge(&self) -> anyhow::Result<String> {
+        if self.token_hash.read().await.is_some() {
+            anyhow::bail!("agent is already paired");
+        }
+        let nonce = uuid::Uuid::new_v4().to_string();
+        *self.challenge.write().await = Some((nonce.clone(), Instant::now()));
+        Ok(nonce)
+    }
+
+    async fn pair(&self, request: PairRequest) -> anyhow::Result<bool> {
+        validate_token(&request.token)?;
+        let supplied_hash = hash_token(&request.token);
+        let mut expected = self.token_hash.write().await;
+        if let Some(current) = expected.as_ref() {
+            return Ok(constant_time_eq(&supplied_hash, current));
+        }
+        let challenge = self.challenge.write().await.take();
+        let Some((nonce, issued_at)) = challenge else {
+            anyhow::bail!("pairing challenge missing");
+        };
+        if issued_at.elapsed() > Duration::from_secs(60) || nonce != request.nonce {
+            anyhow::bail!("pairing challenge expired");
+        }
+        if request.proof != hmac_token(&request.token, &nonce) {
+            anyhow::bail!("invalid pairing proof");
+        }
+        let state_file = self
+            .state_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("agent pairing is disabled"))?;
+        persist_token_hash(state_file, &supplied_hash).await?;
+        *expected = Some(supplied_hash);
+        Ok(true)
+    }
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+fn validate_token(token: &str) -> anyhow::Result<()> {
+    if token.len() < 16 {
+        anyhow::bail!("FERRYMAN_AGENT_TOKEN must be at least 16 characters");
+    }
+    Ok(())
+}
+
+fn hash_token(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |diff, (left, right)| diff | (left ^ right))
+        == 0
+}
+
+fn format_token_hash(hash: &[u8; 32]) -> String {
+    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_token_hash(value: &str) -> anyhow::Result<[u8; 32]> {
+    if value.len() != 64 {
+        anyhow::bail!("invalid agent auth state");
+    }
+    let mut hash = [0u8; 32];
+    for (index, byte) in hash.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| anyhow::anyhow!("invalid agent auth state"))?;
+    }
+    Ok(hash)
+}
+
+fn hmac_token(token: &str, nonce: &str) -> String {
+    let mut key = [0u8; 64];
+    key[..32].copy_from_slice(&hash_token(token));
+    let mut inner = Sha256::new();
+    for byte in &key {
+        inner.update([byte ^ 0x36]);
+    }
+    inner.update(nonce.as_bytes());
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    for byte in &key {
+        outer.update([byte ^ 0x5c]);
+    }
+    outer.update(inner);
+    let digest = outer.finalize();
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&digest);
+    format_token_hash(&result)
+}
+
+async fn persist_token_hash(path: &FsPath, hash: &[u8; 32]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("FERRYMAN_AUTH_STATE_FILE needs a parent directory"))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    tokio::fs::write(&temporary, format_token_hash(hash)).await?;
+    tokio::fs::rename(&temporary, path).await?;
+    Ok(())
 }
 
 struct ActiveRequestGuard {
@@ -940,18 +1091,6 @@ fn extract_percent(line: &str) -> Option<u8> {
     digits.parse::<u8>().ok().map(|value| value.min(100))
 }
 
-fn authorize(headers: &HeaderMap, expected: &str) -> Result<(), StatusCode> {
-    let supplied = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    if supplied == Some(expected) {
-        Ok(())
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
-}
-
 fn unauthorized_response() -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -966,15 +1105,41 @@ async fn healthz() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
 }
 
+#[derive(Serialize)]
+struct PairChallenge {
+    nonce: String,
+}
+
+#[derive(Deserialize)]
+struct PairRequest {
+    nonce: String,
+    token: String,
+    proof: String,
+}
+
+async fn pair_challenge(State(state): State<AppState>) -> Response {
+    match state.auth.issue_challenge().await {
+        Ok(nonce) => Json(PairChallenge { nonce }).into_response(),
+        Err(_) => StatusCode::CONFLICT.into_response(),
+    }
+}
+
+async fn pair_agent(State(state): State<AppState>, Json(request): Json<PairRequest>) -> Response {
+    match state.auth.pair(request).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) | Err(_) => unauthorized_response(),
+    }
+}
+
 async fn runtime_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if authorize(&headers, &state.token).is_err() {
+    if state.auth.authorize(&headers).await.is_err() {
         return unauthorized_response();
     }
     Json(state.controller.snapshot()).into_response()
 }
 
 async fn model_catalog(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if authorize(&headers, &state.token).is_err() {
+    if state.auth.authorize(&headers).await.is_err() {
         return unauthorized_response();
     }
     Json(state.models.catalog().await).into_response()
@@ -986,7 +1151,7 @@ async fn start_model_download(
     Path(preset): Path<Preset>,
     Json(request): Json<DownloadRequest>,
 ) -> Response {
-    if authorize(&headers, &state.token).is_err() {
+    if state.auth.authorize(&headers).await.is_err() {
         return unauthorized_response();
     }
     match state.models.start_download(preset, request.source).await {
@@ -1000,7 +1165,7 @@ async fn pause_model_download(
     headers: HeaderMap,
     Path(preset): Path<Preset>,
 ) -> Response {
-    if authorize(&headers, &state.token).is_err() {
+    if state.auth.authorize(&headers).await.is_err() {
         return unauthorized_response();
     }
     match state.models.pause_download(preset).await {
@@ -1014,7 +1179,7 @@ async fn delete_model(
     headers: HeaderMap,
     Path(preset): Path<Preset>,
 ) -> Response {
-    if authorize(&headers, &state.token).is_err() {
+    if state.auth.authorize(&headers).await.is_err() {
         return unauthorized_response();
     }
     let runtime = state.controller.snapshot();
@@ -1043,7 +1208,7 @@ async fn start_source_benchmark(
     headers: HeaderMap,
     Json(request): Json<BenchmarkRequest>,
 ) -> Response {
-    if authorize(&headers, &state.token).is_err() {
+    if state.auth.authorize(&headers).await.is_err() {
         return unauthorized_response();
     }
     match state.models.start_benchmark(request.preset).await {
@@ -1053,7 +1218,7 @@ async fn start_source_benchmark(
 }
 
 async fn cancel_source_benchmark(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if authorize(&headers, &state.token).is_err() {
+    if state.auth.authorize(&headers).await.is_err() {
         return unauthorized_response();
     }
     state.models.cancel_benchmark().await;
@@ -1061,14 +1226,14 @@ async fn cancel_source_benchmark(State(state): State<AppState>, headers: HeaderM
 }
 
 async fn storage_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if authorize(&headers, &state.token).is_err() {
+    if state.auth.authorize(&headers).await.is_err() {
         return unauthorized_response();
     }
     Json(state.models.storage_status().await).into_response()
 }
 
 async fn clear_runtime_cache(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if authorize(&headers, &state.token).is_err() {
+    if state.auth.authorize(&headers).await.is_err() {
         return unauthorized_response();
     }
     if state.controller.snapshot().state != RuntimePhase::Stopped {
@@ -1093,7 +1258,7 @@ async fn acquire_runtime(
     headers: HeaderMap,
     Json(request): Json<AcquireRequest>,
 ) -> Response {
-    if authorize(&headers, &state.token).is_err() {
+    if state.auth.authorize(&headers).await.is_err() {
         return unauthorized_response();
     }
     let model = state.models.status(request.preset).await;
@@ -1120,7 +1285,7 @@ async fn release_runtime(
     headers: HeaderMap,
     Path(lease_id): Path<String>,
 ) -> Response {
-    if authorize(&headers, &state.token).is_err() {
+    if state.auth.authorize(&headers).await.is_err() {
         return unauthorized_response();
     }
     match state.controller.release(lease_id).await {
@@ -1134,7 +1299,7 @@ async fn stop_runtime(
     headers: HeaderMap,
     Json(request): Json<StopRequest>,
 ) -> Response {
-    if authorize(&headers, &state.token).is_err() {
+    if state.auth.authorize(&headers).await.is_err() {
         return unauthorized_response();
     }
     match state.controller.stop(request.force).await {
@@ -1144,7 +1309,7 @@ async fn stop_runtime(
 }
 
 async fn proxy_chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if authorize(&headers, &state.token).is_err() {
+    if state.auth.authorize(&headers).await.is_err() {
         return unauthorized_response();
     }
     if state.controller.snapshot().state != RuntimePhase::Ready {
@@ -1251,11 +1416,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let listen = env::var("FERRYMAN_AGENT_LISTEN").unwrap_or_else(|_| "0.0.0.0:8090".into());
-    let token = env::var("FERRYMAN_AGENT_TOKEN")
-        .map_err(|_| anyhow::anyhow!("FERRYMAN_AGENT_TOKEN must be set"))?;
-    if token.len() < 16 {
-        anyhow::bail!("FERRYMAN_AGENT_TOKEN must be at least 16 characters");
-    }
+    let configured_token = env::var("FERRYMAN_AGENT_TOKEN").ok();
+    let auth_state_file = env::var("FERRYMAN_AUTH_STATE_FILE").ok().map(PathBuf::from);
+    let auth = AgentAuth::load(configured_token, auth_state_file).await?;
     let idle_timeout = env::var("FERRYMAN_IDLE_TIMEOUT_SECONDS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -1291,11 +1454,13 @@ async fn main() -> anyhow::Result<()> {
         controller: controller.clone(),
         models,
         client,
-        token: Arc::from(token),
+        auth,
         vllm_endpoint: Arc::from(vllm_endpoint),
     };
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/pair/challenge", get(pair_challenge))
+        .route("/pair", post(pair_agent))
         .route("/runtime", get(runtime_status))
         .route("/runtime/acquire", post(acquire_runtime))
         .route("/runtime/leases/{lease_id}", delete(release_runtime))
@@ -1347,6 +1512,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
 
     #[test]
     fn parses_weight_loading_progress() {
@@ -1379,5 +1545,42 @@ mod tests {
     #[test]
     fn strips_ansi_and_control_characters() {
         assert_eq!(sanitize_log_line("\u{1b}[32mready\u{1b}[0m\u{7}"), "ready");
+    }
+
+    #[tokio::test]
+    async fn pairing_persists_only_the_token_hash() {
+        let root = env::temp_dir().join(format!("ferryman-agent-auth-{}", uuid::Uuid::new_v4()));
+        let state_file = root.join("token.sha256");
+        let auth = AgentAuth::load(None, Some(state_file.clone()))
+            .await
+            .unwrap();
+        let mut invalid = HeaderMap::new();
+        invalid.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer different-test-token-1234"),
+        );
+
+        let nonce = auth.issue_challenge().await.unwrap();
+        let valid_request = PairRequest {
+            nonce: nonce.clone(),
+            token: "pairing-test-token-1234".to_string(),
+            proof: hmac_token("pairing-test-token-1234", &nonce),
+        };
+        let mut valid = HeaderMap::new();
+        valid.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer pairing-test-token-1234"),
+        );
+        assert!(auth.authorize(&valid).await.is_err());
+        assert!(auth.pair(valid_request).await.unwrap());
+        assert!(auth.authorize(&valid).await.is_ok());
+        assert!(auth.authorize(&invalid).await.is_err());
+
+        let persisted = tokio::fs::read_to_string(&state_file).await.unwrap();
+        assert_eq!(persisted.len(), 64);
+        assert!(!persisted.contains("pairing-test-token"));
+        let reloaded = AgentAuth::load(None, Some(state_file)).await.unwrap();
+        assert!(reloaded.authorize(&valid).await.is_ok());
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

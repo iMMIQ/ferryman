@@ -1110,6 +1110,7 @@ mod tests {
                 remote_fs_dir: base.join("remote-fs"),
                 agent_url: String::new(),
                 agent_token: String::new(),
+                agent_pairing: false,
                 allow_local_user: true,
                 client: reqwest::Client::new(),
             }),

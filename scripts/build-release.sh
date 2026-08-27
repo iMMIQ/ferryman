@@ -13,12 +13,12 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
     cargo build --release --target x86_64-unknown-linux-gnu --bin ferryman-web
 cargo build --release --bin ferryman-agent
 
-mkdir -p build/web-libs
+mkdir -p build/web-libs ai-pod-service/cloud.lazycat.aipod.ferryman/agxorin
 cp target/x86_64-unknown-linux-gnu/release/ferryman-web build/ferryman-web
 cp target/release/ferryman-agent build/ferryman-agent
 x86_64-linux-gnu-strip build/ferryman-web
 strip build/ferryman-agent
-cp build/ferryman-agent ai-pod-service/ferryman-agent
+cp build/ferryman-agent ai-pod-service/cloud.lazycat.aipod.ferryman/agxorin/ferryman-agent
 cp /etc/ssl/certs/ca-certificates.crt build/ca-certificates.crt
 
 for library in \

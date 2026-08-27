@@ -1,8 +1,8 @@
 [package]
 name = "ferryman"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
-description = "Ferryman — translate documents via a vLLM-served model into bilingual output (EPUB now; txt/subtitles planned)"
+description = "Translate EPUB, DOCX, text, Markdown and subtitles through an OpenAI-compatible model"
 license = "LGPL-3.0-or-later"
 repository = "https://github.com/iMMIQ/ferryman"
 

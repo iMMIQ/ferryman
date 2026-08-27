@@ -1,5 +1,6 @@
 /target
 /build
+ai-pod-service/**/ferryman-agent
 /dist/*.lpk
 /ai-pod-service/ferryman-agent
 /.lzc-cli-build*/

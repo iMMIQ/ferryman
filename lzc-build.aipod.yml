@@ -1,0 +1,11 @@
+manifest: ./aipod-resource-only.yml
+buildscript: sh ./scripts/build-agent-release.sh
+pkgout: ./dist
+icon: ./icon.png
+package_override:
+  package: cloud.lazycat.aipod.ferryman
+  name: Ferryman AI Pod Agent
+  description: Ferryman document translation model service for Lazycat AI Pod
+resource_exports:
+  - kind: aipod
+    source: ./ai-pod-service/cloud.lazycat.aipod.ferryman

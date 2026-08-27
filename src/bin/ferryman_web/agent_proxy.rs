@@ -12,6 +12,80 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+async fn pair_agent_once(config: &Config) -> Result<()> {
+    let challenge: serde_json::Value = config
+        .client
+        .get(format!("{}/pair/challenge", config.agent_url))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let nonce = challenge
+        .get("nonce")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("agent pairing challenge missing nonce"))?;
+    let proof = hmac_token(&config.agent_token, nonce);
+    let response = config
+        .client
+        .post(format!("{}/pair", config.agent_url))
+        .json(&serde_json::json!({"nonce": nonce, "token": config.agent_token, "proof": proof}))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("agent pairing failed ({})", response.status());
+    }
+    Ok(())
+}
+
+fn hmac_token(token: &str, nonce: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut key = [0u8; 64];
+    key[..32].copy_from_slice(&Sha256::digest(token.as_bytes()));
+    let mut inner = Sha256::new();
+    for byte in &key {
+        inner.update([byte ^ 0x36]);
+    }
+    inner.update(nonce.as_bytes());
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    for byte in &key {
+        outer.update([byte ^ 0x5c]);
+    }
+    outer.update(inner);
+    outer
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) async fn pair_agent_with_retry(config: &Config) -> Result<()> {
+    let mut last_error = None;
+    for _ in 0..120 {
+        match pair_agent_once(config).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("agent pairing timed out")))
+}
+
+async fn send_agent(
+    config: &Config,
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response> {
+    let retry = request
+        .try_clone()
+        .ok_or_else(|| anyhow::anyhow!("agent request cannot be retried"))?;
+    let response = request.send().await?;
+    if response.status() == StatusCode::UNAUTHORIZED && config.agent_pairing {
+        pair_agent_once(config).await?;
+        return Ok(retry.send().await?);
+    }
+    Ok(response)
+}
+
 #[derive(Deserialize)]
 pub(super) struct RuntimeStartRequest {
     preset: Preset,
@@ -44,7 +118,7 @@ async fn agent_json(
     if let Some(body) = body {
         request = request.json(&body);
     }
-    let response = request.send().await?;
+    let response = send_agent(config, request).await?;
     let status = response.status();
     let value = response.json().await.unwrap_or_else(
         |error| serde_json::json!({"error": format!("invalid agent response: {error}")}),
@@ -225,13 +299,12 @@ pub(crate) async fn acquire_agent(config: &Config, preset: Preset, lease_id: &st
         lease_id: lease_id.to_string(),
         ttl_seconds: 120,
     };
-    let response = config
+    let request = config
         .client
         .post(format!("{}/runtime/acquire", config.agent_url))
         .bearer_auth(&config.agent_token)
-        .json(&request)
-        .send()
-        .await?;
+        .json(&request);
+    let response = send_agent(config, request).await?;
     if !response.status().is_success() {
         anyhow::bail!("agent acquire failed: {}", response.text().await?);
     }
@@ -250,14 +323,12 @@ async fn try_acquire_agent(config: &Config, preset: Preset, lease_id: &str) -> A
         lease_id: lease_id.to_string(),
         ttl_seconds: 120,
     };
-    let response = match config
+    let request = config
         .client
         .post(format!("{}/runtime/acquire", config.agent_url))
         .bearer_auth(&config.agent_token)
-        .json(&request)
-        .send()
-        .await
-    {
+        .json(&request);
+    let response = match send_agent(config, request).await {
         Ok(response) => response,
         Err(error) => return AgentAcquireAttempt::Retry(error.to_string()),
     };
@@ -307,13 +378,11 @@ pub(crate) async fn acquire_agent_with_retry(
 }
 
 pub(crate) async fn release_agent(config: &Config, lease_id: &str) {
-    if let Err(error) = config
+    let request = config
         .client
         .delete(format!("{}/runtime/leases/{lease_id}", config.agent_url))
-        .bearer_auth(&config.agent_token)
-        .send()
-        .await
-    {
+        .bearer_auth(&config.agent_token);
+    if let Err(error) = send_agent(config, request).await {
         warn!(%error, %lease_id, "release model lease");
     }
 }
@@ -333,11 +402,10 @@ pub(crate) async fn wait_for_agent(
         }
         let response = match tokio::select! {
             _ = cancel.cancelled() => anyhow::bail!("job cancelled"),
-            response = config
+            response = send_agent(config, config
                 .client
                 .get(format!("{}/runtime", config.agent_url))
-                .bearer_auth(&config.agent_token)
-                .send() => response,
+                .bearer_auth(&config.agent_token)) => response,
         } {
             Ok(response) => response,
             Err(error) => {
@@ -431,6 +499,7 @@ mod tests {
             remote_fs_dir: PathBuf::new(),
             agent_url: format!("http://{address}"),
             agent_token: "test-agent-token".to_string(),
+            agent_pairing: false,
             allow_local_user: true,
             client: reqwest::Client::new(),
         };
@@ -455,6 +524,7 @@ mod tests {
             remote_fs_dir: PathBuf::new(),
             agent_url: "http://127.0.0.1:9".to_string(),
             agent_token: "test-agent-token".to_string(),
+            agent_pairing: false,
             allow_local_user: true,
             client: reqwest::Client::new(),
         };

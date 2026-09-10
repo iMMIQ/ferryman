@@ -32,3 +32,21 @@ for library in \
 do
     cp "/usr/x86_64-linux-gnu/lib/$library" "build/web-libs/$library"
 done
+
+# CJK font for PDF output — the scratch web image has none of its own. The
+# PDF backend loads it from /app/fonts (see src/format/pdf.rs).
+mkdir -p build/fonts
+for font in \
+    /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc \
+    /usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc \
+    /usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc \
+    /usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc
+do
+    if [ -f "$font" ]; then
+        cp "$font" build/fonts/NotoSansCJK-Regular.ttc
+        break
+    fi
+done
+if [ ! -f build/fonts/NotoSansCJK-Regular.ttc ]; then
+    echo "warning: no CJK font found; PDF jobs will fail at runtime (install fonts-noto-cjk)" >&2
+fi

@@ -527,7 +527,7 @@ function updateFile(file) {
   const replace = document.querySelector('input[name="mode"][value="replace"]');
   if (!file) {
     els.fileLabel.textContent = "选择文档";
-    els.fileMeta.textContent = "EPUB、DOCX、字幕、TXT、Markdown";
+    els.fileMeta.textContent = "EPUB、DOCX、PDF、字幕、TXT、Markdown";
     replace.disabled = false;
     return;
   }

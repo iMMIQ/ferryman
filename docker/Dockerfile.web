@@ -23,8 +23,10 @@ RUN cargo build --release --bin ferryman-web --bin ferryman-agent \
     && strip target/release/ferryman-web target/release/ferryman-agent
 
 FROM debian:bookworm-slim AS runtime
+# fonts-noto-cjk: the PDF backend renders translated PDFs and needs a CJK
+# font at /usr/share/fonts/opentype/noto/ (or FERRYMAN_PDF_FONT).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/ferryman-web /usr/local/bin/ferryman-web
 COPY web /app/web

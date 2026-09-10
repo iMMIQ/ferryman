@@ -1,10 +1,10 @@
 # Ferryman
 
-> **Ferryman** — a multi-format translation tool (epub / txt / subtitles / …).
+> **Ferryman** — a multi-format translation tool (epub / pdf / txt / subtitles / …).
 > *"渡船工": ferries content across the river between languages and formats.*
 >
-> **Status:** EPUB, DOCX, plain text, Markdown, SRT, VTT, ASS/SSA and LRC ship
-> today. Ferryman can run as a CLI or as a Lazycat MicroServer + AI Pod Web app.
+> **Status:** EPUB, DOCX, PDF, plain text, Markdown, SRT, VTT, ASS/SSA and LRC
+> ship today. Ferryman can run as a CLI or as a Lazycat MicroServer + AI Pod Web app.
 
 Produce a **bilingual (original + Chinese) EPUB** from any EPUB book by translating
 its content through a vLLM-served model. The original formatting is preserved
@@ -37,6 +37,37 @@ when finished (no need to run the server separately).
 4. Replaces each placeholder with `<p class="hy-zh">…</p>` (or `<li>`/`<dt>`/`<dd>`
    to stay list-valid), HTML-escaped, and strips any leftover placeholders.
 5. Re-zips, with `mimetype` stored uncompressed as the first entry (EPUB-valid).
+
+### PDF (extract → translate → edit the original in place)
+
+PDF pages place glyph runs at coordinates, so Ferryman first *reconstructs
+paragraphs from geometry*: a custom `pdf-extract` output device keeps every
+character's position, characters group into visual lines (same baseline,
+forward direction) and lines into paragraphs — previous line ran full width,
+same leading, flush left margin, dehyphenated — exactly like a docx
+paragraph. A sentence wrapped over three lines is one segment, and
+paragraphs even continue across page breaks. Table-of-contents entries
+(dot-leader or right-aligned-number fills detected geometrically), page
+numbers and other letterless lines pass through untouched; ligatures (ﬁ/ﬂ…)
+are normalized before translation; some producers' broken `/W` glyph-width
+arrays are repaired so line geometry survives extraction.
+
+The output *is* the original file, edited with `lopdf` — figures, diagrams
+and vector art intact, nothing re-typeset:
+
+- **bilingual** (default): a translation page of the same size is inserted
+  after every original page, each paragraph's Chinese drawn at the mirrored
+  position in gray (shrunk to fit its slot); original pages are untouched.
+- **replace**: each paragraph is covered by a background-colored rect on its
+  own page and the translation drawn in the same box.
+
+Rendering needs one CJK-capable OpenType font on disk: `FERRYMAN_PDF_FONT`
+overrides discovery, otherwise the first of Noto Sans CJK / WenQuanYi /
+Droid Sans Fallback in the usual distro locations (the Lazycat image bundles
+it at `/app/fonts`; the standalone image installs `fonts-noto-cjk`). The
+font is embedded as a CID/Type0 font with a generated ToUnicode map, so the
+translated text stays selectable and searchable. Scanned PDFs without a text
+layer and encrypted PDFs fail with a clear error.
 
 ## Build
 

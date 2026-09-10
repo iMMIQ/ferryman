@@ -475,7 +475,7 @@ async fn claim_queued_job(state: &AppState, id: Uuid) -> Option<JobEntry> {
 async fn config() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "presets": ["7b-fp8", "30b-fp8"],
-        "formats": ["epub", "docx", "srt", "vtt", "ass", "ssa", "lrc", "txt", "md"],
+        "formats": ["epub", "docx", "pdf", "srt", "vtt", "ass", "ssa", "lrc", "txt", "md"],
         "storages": ["documents", "remote_fs"],
         "max_upload_bytes": MAX_UPLOAD_BYTES,
         "translation_defaults": TranslationSettings::default(),

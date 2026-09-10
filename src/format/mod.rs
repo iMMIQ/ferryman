@@ -1,6 +1,6 @@
 //! Format-agnostic document abstraction.
 //!
-//! Each input format (EPUB, DOCX, SRT, VTT, txt) implements
+//! Each input format (EPUB, DOCX, PDF, SRT, VTT, txt) implements
 //! [`Document`]: it parses the file into translatable [`Segment`]s (plain
 //! text) and knows how to write translations back. The translation engine
 //! ([`crate::engine`]) is format-agnostic — each format merely hints at a
@@ -11,6 +11,7 @@
 use crate::format::docx::DocxDoc;
 use crate::format::epub::EpubDoc;
 use crate::format::md::MdDoc;
+use crate::format::pdf::PdfDoc;
 use crate::format::subtitle::ass::Ass;
 use crate::format::subtitle::lrc::Lrc;
 use crate::format::subtitle::srt::Srt;
@@ -23,6 +24,7 @@ use std::path::Path;
 pub mod docx;
 pub mod epub;
 pub mod md;
+pub mod pdf;
 pub mod subtitle;
 pub mod txt;
 
@@ -149,6 +151,7 @@ pub enum Format {
     Txt,
     Md,
     Docx,
+    Pdf,
 }
 
 impl Format {
@@ -168,8 +171,9 @@ impl Format {
             Some("txt") => Ok(Format::Txt),
             Some("md") | Some("markdown") => Ok(Format::Md),
             Some("docx") => Ok(Format::Docx),
+            Some("pdf") => Ok(Format::Pdf),
             other => Err(anyhow!(
-                "unsupported input format {:?} ({}); supported: epub, docx, srt, vtt, ass, lrc, txt, md",
+                "unsupported input format {:?} ({}); supported: epub, docx, pdf, srt, vtt, ass, lrc, txt, md",
                 other.unwrap_or("(none)"),
                 path.display()
             )),
@@ -194,6 +198,7 @@ pub fn open(path: &Path, hint: Option<Format>) -> Result<Box<dyn Document + Send
         Format::Txt => Ok(Box::new(TxtDoc::open(path)?)),
         Format::Md => Ok(Box::new(MdDoc::open(path)?)),
         Format::Docx => Ok(Box::new(DocxDoc::open(path)?)),
+        Format::Pdf => Ok(Box::new(PdfDoc::open(path)?)),
     }
 }
 
@@ -260,6 +265,14 @@ mod tests {
         assert_eq!(
             Format::from_path(Path::new("REPORT.DOCX")).unwrap(),
             Format::Docx
+        );
+        assert_eq!(
+            Format::from_path(Path::new("book.pdf")).unwrap(),
+            Format::Pdf
+        );
+        assert_eq!(
+            Format::from_path(Path::new("Paper.PDF")).unwrap(),
+            Format::Pdf
         );
     }
 }

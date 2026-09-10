@@ -1,6 +1,6 @@
 //! ferryman — translate documents into bilingual (original + translation)
-//! output via a vLLM-served model. EPUB, DOCX, SRT, VTT, ASS, LRC, TXT and MD
-//! ship today — plug a new format into `src/format/` and it just works.
+//! output via a vLLM-served model. EPUB, DOCX, PDF, SRT, VTT, ASS, LRC, TXT
+//! and MD ship today — plug a new format into `src/format/` and it just works.
 //!
 //! The original formatting is preserved byte-for-byte (via lol_html for EPUB;
 //! surgical paragraph splice for DOCX; cue timing/structure is preserved
@@ -29,12 +29,12 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(
     name = "ferryman",
-    about = "Translate a document into a bilingual side-by-side output via vLLM (EPUB, DOCX, SRT, VTT, ASS, LRC, TXT, MD)"
+    about = "Translate a document into a bilingual side-by-side output via vLLM (EPUB, DOCX, PDF, SRT, VTT, ASS, LRC, TXT, MD)"
 )]
 struct Cli {
     /// Input file or directory. A file is translated directly (format
     /// auto-detected from the extension). A directory is walked recursively and
-    /// every supported file (epub, docx, srt, vtt, ass, lrc, txt, md) is
+    /// every supported file (epub, docx, pdf, srt, vtt, ass, lrc, txt, md) is
     /// translated; unsupported files and ferryman's own suffixed outputs are
     /// skipped. Files are opened lazily and written as they finish, so memory
     /// stays bounded by the concurrency window — for a very large EPUB/DOCX
@@ -73,7 +73,7 @@ struct Cli {
     limit: Option<usize>,
 
     /// Segments per translation request when a format batches (subtitles, txt,
-    /// md). Batching keeps cross-segment context and orders the result strictly
+    /// md, pdf). Batching keeps cross-segment context and orders the result strictly
     /// one-to-one; the model returns one translation per segment, no merge/split.
     /// (default: 25)
     #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]

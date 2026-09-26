@@ -6,7 +6,7 @@ COPY build/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY runtime/nsswitch.conf /etc/nsswitch.conf
 COPY build/ferryman-web /usr/local/bin/ferryman-web
 COPY build/fonts /app/fonts
-COPY web ./web
+COPY dist/web ./web
 ENV FERRYMAN_WEB_LISTEN=0.0.0.0:8080 \
     FERRYMAN_WEB_DIR=/app/web \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \

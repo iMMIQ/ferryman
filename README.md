@@ -99,21 +99,41 @@ successful translations; truncation triggers bounded splitting/retranslation.
 
 ### Browser UI regression tests
 
-The frontend is plain HTML/CSS/JavaScript; Node is needed only for browser tests.
-The tests serve the real assets locally and mock API responses, so no model or
-GPU is required.
+The frontend uses Vue 3, TypeScript, Vite and Reka UI. Node 22.12+ is needed
+for development/builds; production still serves static files from Rust without
+a Node process. `npm run build` type-checks the frontend and writes fingerprinted
+assets to `dist/web` (the default `FERRYMAN_WEB_DIR`).
+
+Browser regression tests serve the production assets and mock API responses.
+A separate smoke test starts the real Rust server against temporary storage and
+checks config, directory selection, preview and job lifecycle contracts without a GPU.
+Its temporary job waits for an unavailable agent, then is cancelled and deleted through the UI.
 
 ```bash
 npm ci
+npm run dev # Vite dev server; /api proxies to Rust on 127.0.0.1:8080
+# In another terminal, or stop the dev server before running tests:
 npx playwright install --with-deps chromium
-npm test
+npm run test:unit
+npm test # type-check, production build, browser regression tests
+cargo build --locked --bin ferryman-web
+npm run test:smoke
 # Optional screenshot artifacts:
 UI_SCREENSHOT_DIR=/tmp/ferryman-ui npm test
 ```
 
-The suite covers mobile navigation, keyboard focus across polling, partial
-results, connection recovery, multi-file upload/cancellation, overwrite preview
-and model management. CI runs it alongside the Rust tests.
+The suite covers mobile navigation, keyboard focus across polling/dialogs,
+partial results, connection recovery, multi-file upload/cancellation, overwrite
+preview, request races and per-job mutation locks. CI also runs strict frontend
+formatting, request-layer tests, the real-server smoke test and Rust tests.
+
+Frontend code is split by domain under `web/src`: `useJobs`, `useSubmission`,
+`useFolder`, and `useRuntime` own state; components render that state. Desktop
+tables and mobile cards share actions and progress components. `lib/api.ts`
+centralizes timeouts/errors and cancellable query scopes; polling pauses when
+the page is hidden. Mutations are not automatically retried. UI tokens live in
+`tokens.css`, with shared buttons, notices, dialogs and empty states under
+`components/ui`. Run `npm run format` after editing frontend sources.
 
 ## Web app and Lazycat deployment
 
@@ -180,7 +200,8 @@ FERRYMAN_MODEL_ROOT="$HOME/model" \
 FERRYMAN_AGENT_LISTEN=127.0.0.1:8090 \
 cargo run --bin ferryman-agent
 
-mkdir -p ./ferryman-documents ./ferryman-remotefs
+npm ci && npm run build
+mkdir -p ./ferryman-documents/local-development-user ./ferryman-remotefs/local-development-user
 FERRYMAN_AGENT_URL=http://127.0.0.1:8090 \
 FERRYMAN_USER_DOCUMENTS_DIR=./ferryman-documents \
 FERRYMAN_REMOTE_FS_DIR=./ferryman-remotefs \

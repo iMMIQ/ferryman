@@ -563,7 +563,8 @@ async fn main() -> Result<()> {
     let remote_fs_dir = PathBuf::from(
         env::var("FERRYMAN_REMOTE_FS_DIR").unwrap_or_else(|_| "./ferryman-remotefs".into()),
     );
-    let web_dir = PathBuf::from(env::var("FERRYMAN_WEB_DIR").unwrap_or_else(|_| "./web".into()));
+    let web_dir =
+        PathBuf::from(env::var("FERRYMAN_WEB_DIR").unwrap_or_else(|_| "./dist/web".into()));
     let agent_url = env::var("FERRYMAN_AGENT_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8090".into())
         .trim_end_matches('/')
@@ -745,14 +746,6 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn web_assets_use_the_package_version_as_the_cache_key() {
-        let index = include_str!("../../web/index.html");
-        let version = env!("CARGO_PKG_VERSION");
-        assert!(index.contains(&format!("/app.js?v={version}")));
-        assert!(index.contains(&format!("/styles.css?v={version}")));
-    }
 
     #[test]
     fn job_records_receive_optional_field_defaults() {

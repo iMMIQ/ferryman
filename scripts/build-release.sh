@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+# Produce fingerprinted static assets for the scratch web image.
+npm ci
+npm run build
+
 if ! command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
     echo "missing x86_64-linux-gnu-gcc (install gcc-x86-64-linux-gnu)" >&2
     exit 1

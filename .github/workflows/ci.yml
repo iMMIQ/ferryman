@@ -48,4 +48,10 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx playwright install --with-deps chromium
+      - run: npm run format:check
+      - run: npm run test:unit
       - run: npm test
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --bin ferryman-web
+      - run: npm run test:smoke

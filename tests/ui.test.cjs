@@ -104,7 +104,13 @@ async function withPage(
         data = { jobs: [{ id: "created" }], skipped_incompatible: 1 };
       else if (u.pathname === "/api/jobs") {
         if (state.delayUpload) await new Promise((r) => setTimeout(r, 700));
-        data = { id: "uploaded" };
+        data = {
+          ...defaultJobs()[0],
+          id: `uploaded-${state.posts.length}`,
+          filename: "新上传文档.txt",
+          status: "queued",
+        };
+        state.jobs.unshift(data);
       } else if (u.pathname.endsWith("/retry")) {
         if (state.delayMutation) await new Promise((r) => setTimeout(r, 800));
         const j = state.jobs.find((j) => u.pathname.includes(j.id));
@@ -118,9 +124,11 @@ async function withPage(
           ["queued", "translating"].includes(j.status),
         ),
       };
-    else if (u.pathname === "/api/jobs")
-      data = { jobs: state.jobs, total: state.jobs.length, next_cursor: null };
-    else if (u.pathname === "/api/runtime")
+    else if (u.pathname === "/api/jobs") {
+      const phase = u.searchParams.get("phase");
+      const jobs = state.jobs.filter((job) => !phase || job.status === phase);
+      data = { jobs, total: jobs.length, next_cursor: null };
+    } else if (u.pathname === "/api/runtime")
       data = {
         state: "ready",
         preset: "7b-fp8",
@@ -188,6 +196,7 @@ test("partial status, stable keyboard focus, details and retry", async ({
   page,
 }) =>
   withPage(page, async (page, state) => {
+    await page.locator('button[data-workspace="jobs"]').click();
     await page.locator('tr[data-id="two"] .status-chip').waitFor();
     await expect(page.locator('tr[data-id="two"] .status-chip')).toHaveText(
       "部分完成",
@@ -219,12 +228,16 @@ test("partial status, stable keyboard focus, details and retry", async ({
     );
     await shot(page, "desktop-workspace");
     await page.setViewportSize({ width: 1366, height: 768 });
+    await page.locator('button[data-workspace="create"]').click();
+    await page.locator("#submit-job").scrollIntoViewIfNeeded();
     const submitRect = await page.locator("#submit-job").boundingBox();
     assert(
       submitRect.y + submitRect.height <= 768,
       "desktop submit stays reachable",
     );
     await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.locator('button[data-workspace="jobs"]').click();
+    await page.locator('button[data-workspace="jobs"]').click();
     await page.locator('tr[data-id="two"] .file-title').click();
     await expect(page.locator("#job-detail-content")).toContainText(
       /季度财务分析报告与附录.docx/,
@@ -238,6 +251,7 @@ test("offline errors persist without false empty history or model failure", asyn
   page,
 }) =>
   withPage(page, async (page, state) => {
+    await page.locator('button[data-workspace="jobs"]').click();
     await page.locator('tr[data-id="one"]').waitFor();
     state.offline = true;
     await page.locator("#refresh-jobs").click();
@@ -318,6 +332,10 @@ test("multi-file validation and upload preview submit each selected file", async
     );
     assert.equal(state.posts.filter((p) => p.path === "/api/jobs").length, 2);
     await expect(page.locator("#upload-list li")).toHaveCount(0);
+    await expect(page.locator(".submission-success")).toContainText(
+      "已加入 2 个任务",
+    );
+    await expect(page.locator("tr.new-job")).toHaveCount(2);
   }));
 
 test("cancel upload retains unsubmitted files and shows persistent feedback", async ({
@@ -584,6 +602,7 @@ test("job mutations share pending state between table and details", async ({
 }) =>
   withPage(page, async (page, state) => {
     state.delayMutation = true;
+    await page.locator('button[data-workspace="jobs"]').click();
     const row = page.locator('tr[data-id="two"]');
     await row.locator('[data-action="retry"]').click();
     await row.locator(".file-title").click();
@@ -635,6 +654,7 @@ test("job action failures stay local and preserve the list", async ({ page }) =>
         json: { error: "任务正在停止，请稍后重试" },
       }),
     );
+    await page.locator('button[data-workspace="jobs"]').click();
     const row = page.locator('tr[data-id="two"]');
     await row.locator('[data-action="retry"]').click();
     await row.locator(".notice").waitFor();
@@ -673,9 +693,61 @@ test("runtime mutation invalidates an older poll and refreshes the final state",
     await page.locator("#manage-models").click();
     await page.locator("#stop-runtime").click();
     await page.waitForFunction(
-      () => document.querySelector("#runtime-label").textContent === "已卸载",
+      () => document.querySelector("#runtime-label").textContent === "待机",
     );
     await expect.poll(() => oldResponded).toBe(true);
-    await expect(page.locator("#runtime-label")).toHaveText("已卸载");
+    await expect(page.locator("#runtime-label")).toHaveText("待机");
     await expect(page.locator("#stop-runtime")).toBeDisabled();
+  }));
+
+test("design layouts preserve drafts and separate recent tasks from filters", async ({
+  page,
+}) =>
+  withPage(page, async (page) => {
+    await page.locator("#file-input").setInputFiles([
+      {
+        name: "Designing Interfaces.epub",
+        mimeType: "application/epub+zip",
+        buffer: Buffer.from("book"),
+      },
+      {
+        name: "产品研究与设计说明.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("notes"),
+      },
+    ]);
+    await page.locator("#target-language").fill("日语");
+    await page.locator("#translation-preset").selectOption("30b-fp8");
+    await expect(page.locator(".model-availability")).toContainText("未下载");
+    await shot(page, "desktop-create");
+    await page.locator('button[data-workspace="jobs"]').click();
+    await page.locator('[data-job-phase="failed"]').click();
+    await expect(page.locator("#jobs-body tr")).toHaveCount(1);
+    await page.locator('button[data-workspace="create"]').click();
+    await expect(page.locator("#upload-list li")).toHaveCount(2);
+    await expect(page.locator("#target-language")).toHaveValue("日语");
+    await expect(page.locator("#translation-preset")).toHaveValue("30b-fp8");
+    await expect(page.locator(".compact .job-card")).toHaveCount(3);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.locator('button[data-workspace="models"]').click();
+    await expect(
+      page.getByRole("dialog", { name: "模型管理", exact: true }),
+    ).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.locator('button[data-workspace="models"]')).toBeFocused();
+    await expect(page.locator("#upload-list li")).toHaveCount(2);
+    const submit = await page.locator("#submit-job").boundingBox();
+    const nav = await page.locator(".workspace-tabs").boundingBox();
+    assert(submit.y + submit.height <= nav.y);
+    await shot(page, "mobile-selected");
+    await page.setViewportSize({ width: 390, height: 420 });
+    await page.locator("#target-language").scrollIntoViewIfNeeded();
+    await page.locator("#target-language").fill("英语");
+    await expect(page.locator("#target-language")).toHaveValue("英语");
+    await page.setViewportSize({ width: 900, height: 900 });
+    assert.equal(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+      900,
+    );
+    await shot(page, "tablet-create");
   }));

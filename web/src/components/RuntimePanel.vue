@@ -101,83 +101,69 @@ async function confirm() {
   if (await props.store.mutate(action.key, action.path, { method: "DELETE" }))
     confirmation.value = null;
 }
+defineExpose({ manage });
 </script>
 <template>
-  <header class="app-header">
-    <div class="brand-block">
-      <span class="brand-mark" aria-hidden="true">F</span>
-      <div>
-        <h1>Ferryman</h1>
-        <p>文档翻译工作台</p>
-      </div>
-    </div>
-    <div class="runtime-summary">
+  <div class="runtime-overview">
+    <div class="runtime-summary" aria-label="模型运行状态">
       <span
         class="status-dot"
         :class="s.connected ? s.runtime.state : 'neutral'"
-      ></span>
-      <div>
-        <small>算力舱</small
-        ><strong id="runtime-label">{{
-          !s.loaded
-            ? "连接中"
-            : s.connected
-              ? runtimeNames[s.runtime.state] || s.runtime.state
-              : "连接中断"
-        }}</strong>
-      </div>
+      ></span
+      ><span>{{
+        s.runtime.preset ? modelNames[s.runtime.preset] : "算力舱"
+      }}</span
+      ><strong id="runtime-label">{{
+        !s.loaded
+          ? "连接中"
+          : s.connected
+            ? runtimeNames[s.runtime.state] || s.runtime.state
+            : "连接中断"
+      }}</strong>
     </div>
-  </header>
-  <section class="runtime-band" aria-label="模型运行状态">
-    <div>
-      <span class="eyebrow">当前模型</span
-      ><strong>{{
-        s.runtime.preset ? modelNames[s.runtime.preset] : "未加载"
+    <AppButton id="manage-models" variant="ghost" @click="manage"
+      >管理模型</AppButton
+    >
+  </div>
+  <div class="runtime-feedback">
+    <AppNotice id="connection-error" :message="connectionError"
+      ><AppButton id="retry-connection" @click="store.refresh"
+        >重新连接</AppButton
+      ></AppNotice
+    >
+    <section
+      v-if="s.connected && ['starting', 'failed'].includes(s.runtime.state)"
+      id="runtime-startup"
+      class="runtime-startup"
+    >
+      <strong>{{
+        stages[s.runtime.startup_stage || s.runtime.state] || "模型启动"
       }}</strong
-      ><span class="helper-text">{{
-        s.connected
-          ? s.runtime.last_error ||
-            `${s.runtime.active_requests || 0} 个活动请求 · ${s.runtime.leases || 0} 个占用任务`
-          : "等待状态同步"
-      }}</span>
-    </div>
-    <AppButton id="manage-models" @click="manage">模型管理</AppButton>
-  </section>
-  <AppNotice id="connection-error" :message="connectionError"
-    ><AppButton id="retry-connection" @click="store.refresh"
-      >重新连接</AppButton
-    ></AppNotice
-  >
-  <section
-    v-if="s.connected && ['starting', 'failed'].includes(s.runtime.state)"
-    id="runtime-startup"
-    class="runtime-startup"
-  >
-    <strong>{{
-      stages[s.runtime.startup_stage || s.runtime.state] || "模型启动"
-    }}</strong
-    ><progress
-      :value="s.runtime.startup_progress || 0"
-      max="100"
-      aria-label="模型启动进度"
-    />
-    <p class="helper-text">
-      已用 {{ Math.round(s.runtime.startup_elapsed_seconds || 0) }} 秒 ·
-      {{
-        s.runtime.estimated_remaining_seconds != null
-          ? `预计还需 ${Math.round(s.runtime.estimated_remaining_seconds)} 秒`
-          : "正在估算剩余时间"
-      }}
-    </p>
-    <details>
-      <summary>启动日志 · {{ s.runtime.recent_logs?.length || 0 }} 行</summary>
-      <pre>{{
-        s.runtime.recent_logs?.join("\n") ||
-        s.runtime.last_error ||
-        "等待 vLLM 输出…"
-      }}</pre>
-    </details>
-  </section>
+      ><progress
+        :value="s.runtime.startup_progress || 0"
+        max="100"
+        aria-label="模型启动进度"
+      />
+      <p class="helper-text">
+        已用 {{ Math.round(s.runtime.startup_elapsed_seconds || 0) }} 秒 ·
+        {{
+          s.runtime.estimated_remaining_seconds != null
+            ? `预计还需 ${Math.round(s.runtime.estimated_remaining_seconds)} 秒`
+            : "完成后自动继续翻译"
+        }}
+      </p>
+      <details>
+        <summary>
+          启动日志 · {{ s.runtime.recent_logs?.length || 0 }} 行
+        </summary>
+        <pre>{{
+          s.runtime.recent_logs?.join("\n") ||
+          s.runtime.last_error ||
+          "等待 vLLM 输出…"
+        }}</pre>
+      </details>
+    </section>
+  </div>
   <AppDialog
     id="model-dialog"
     v-model:open="open"

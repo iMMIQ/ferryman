@@ -3,6 +3,7 @@ import { ref, computed, watch } from "vue";
 import type { RuntimeStore } from "../composables/useRuntime";
 import { useSubmission } from "../composables/useSubmission";
 import { bytes, pathLabel, outputName, modelStates } from "../lib/format";
+import AppIcon from "./ui/AppIcon.vue";
 import AppButton from "./ui/AppButton.vue";
 import AppNotice from "./ui/AppNotice.vue";
 import AppDialog from "./ui/AppDialog.vue";
@@ -10,7 +11,7 @@ import SegmentedControl from "./ui/SegmentedControl.vue";
 import FolderPicker from "./FolderPicker.vue";
 const props = defineProps<{
   runtime: RuntimeStore;
-  completed: () => Promise<void>;
+  completed: (ids: string[], message: string) => Promise<void>;
 }>();
 const submission = useSubmission(async (preset) => {
   const model = props.runtime.state.catalog.models.find(
@@ -68,199 +69,229 @@ defineExpose({ chooseFile });
 </script>
 <template>
   <aside class="submit-panel">
-    <span class="eyebrow">新任务</span>
-    <h2>创建翻译</h2>
     <form
       id="job-form"
       :aria-busy="locked"
       @submit.prevent="submission.preview"
     >
       <fieldset class="draft-fields" :disabled="locked">
-        <SegmentedControl
-          v-model="s.sourceMode"
-          name="source"
-          label="翻译来源"
-          :options="[
-            { value: 'upload', label: '上传文件' },
-            { value: 'mounted', label: '文稿与网盘' },
-          ]"
-        />
-        <div v-show="s.sourceMode === 'upload'">
-          <label
-            id="drop-zone"
-            class="drop-zone"
-            :class="{ dragging }"
-            @dragover.prevent="dragging = !locked"
-            @dragleave.prevent="dragging = false"
-            @drop.prevent="drop"
-            ><input
-              id="file-input"
-              ref="fileInput"
-              type="file"
-              multiple
-              accept=".epub,.docx,.pdf,.srt,.vtt,.ass,.ssa,.lrc,.txt,.md,.markdown"
-              @change="filesChanged"
-            /><span aria-hidden="true" class="upload-icon">↑</span
-            ><strong>选择或拖入文档</strong
-            ><span>EPUB、DOCX、PDF、字幕、TXT、Markdown</span></label
-          >
-          <p id="upload-hint" class="helper-text">
-            支持多文件 · 单文件最大 {{ bytes(s.maxBytes) }}
-          </p>
-          <ul id="upload-list" class="upload-list" aria-label="待上传文件">
-            <li
-              v-for="(file, index) in s.files"
-              :key="`${file.name}:${file.size}:${file.lastModified}`"
+        <section class="source-section">
+          <h2 class="form-section-title"><span>1</span> 选择文件</h2>
+          <SegmentedControl
+            v-model="s.sourceMode"
+            name="source"
+            label="翻译来源"
+            :options="[
+              { value: 'upload', label: '上传文件' },
+              { value: 'mounted', label: '文稿与网盘' },
+            ]"
+          />
+          <div v-show="s.sourceMode === 'upload'">
+            <label
+              id="drop-zone"
+              class="drop-zone"
+              :class="{ dragging, populated: s.files.length > 0 }"
+              @dragover.prevent="dragging = !locked"
+              @dragleave.prevent="dragging = false"
+              @drop.prevent="drop"
+              ><input
+                id="file-input"
+                ref="fileInput"
+                type="file"
+                multiple
+                accept=".epub,.docx,.pdf,.srt,.vtt,.ass,.ssa,.lrc,.txt,.md,.markdown"
+                @change="filesChanged"
+              /><span aria-hidden="true" class="upload-icon">↑</span
+              ><strong>拖入文件，或点击选择</strong
+              ><span>EPUB、DOCX、PDF、字幕、TXT、Markdown</span></label
             >
-              <span
-                >{{ file.name }}<small>{{ bytes(file.size) }}</small></span
+            <p id="upload-hint" class="helper-text">
+              支持多文件 · 单文件最大 {{ bytes(s.maxBytes) }}
+            </p>
+            <ul id="upload-list" class="upload-list" aria-label="待上传文件">
+              <li
+                v-for="(file, index) in s.files"
+                :key="`${file.name}:${file.size}:${file.lastModified}`"
+              >
+                <span
+                  class="file-type"
+                  :data-type="file.name.split('.').at(-1)?.toLowerCase()"
+                  aria-hidden="true"
+                  ><AppIcon name="file" /><small>{{
+                    file.name.split(".").at(-1)?.slice(0, 4).toUpperCase()
+                  }}</small></span
+                >
+                <span class="upload-filename"
+                  >{{ file.name }}<small>{{ bytes(file.size) }}</small></span
+                ><AppButton
+                  variant="ghost"
+                  :data-remove-file="index"
+                  :aria-label="`移除 ${file.name}`"
+                  @click="s.files.splice(index, 1)"
+                  >×</AppButton
+                >
+              </li>
+            </ul>
+            <AppNotice id="upload-validation" :message="s.validation" />
+          </div>
+          <AppButton
+            v-if="s.sourceMode === 'mounted'"
+            id="source-directory"
+            class="path-picker"
+            @click="pick('source')"
+            ><span
+              >来源文件与目录<strong>{{
+                s.sources.length
+                  ? `已选 ${s.sources.length} 项`
+                  : "选择文件或目录"
+              }}</strong></span
+            ><span aria-hidden="true">›</span></AppButton
+          >
+        </section>
+        <section class="translation-section">
+          <h2 class="form-section-title"><span>2</span> 翻译设置</h2>
+          <div class="translation-grid">
+            <div>
+              <label class="field-label" for="target-language">目标语言</label
+              ><input
+                id="target-language"
+                v-model="s.target"
+                name="target"
+                list="target-languages"
+                maxlength="64"
+                required
+                autocomplete="off"
+              /><datalist id="target-languages">
+                <option
+                  v-for="language in [
+                    '中文',
+                    'English',
+                    '日本語',
+                    '한국어',
+                    'Français',
+                    'Deutsch',
+                    'Español',
+                  ]"
+                  :key="language"
+                  :value="language"
+                />
+              </datalist>
+            </div>
+            <div>
+              <label for="translation-preset" class="field-label"
+                >翻译模型</label
+              >
+              <select id="translation-preset" v-model="s.preset">
+                <option value="7b-fp8">Hy-MT2 7B · 默认</option>
+                <option value="30b-fp8">Hy-MT2 30B · 更大模型</option>
+              </select>
+            </div>
+          </div>
+          <p class="helper-text model-availability">
+            {{
+              !runtime.state.connected
+                ? "算力舱未连接，表单会保留。"
+                : !runtime.state.catalogConnected
+                  ? "模型状态待同步。"
+                  : selectedModel
+                    ? `${modelStates[selectedModel.state]} · 提交后按需准备，无需手动启动。`
+                    : "模型未下载，提交时将自动准备。"
+            }}
+          </p>
+          <SegmentedControl
+            v-model="s.mode"
+            name="mode"
+            class="output-options"
+            label="输出方式"
+            :options="[
+              {
+                value: 'bilingual',
+                label: '双语对照',
+                description: '保留原文，逐段对照',
+              },
+              {
+                value: 'replace',
+                label: '仅译文',
+                description: '专注译后阅读',
+                disabled: hasDocx,
+              },
+            ]"
+          />
+          <p v-if="hasDocx" id="mode-hint" class="helper-text">
+            DOCX 仅支持双语对照，已为你选择兼容的输出方式。
+          </p>
+
+          <SegmentedControl
+            v-if="s.sourceMode === 'mounted'"
+            v-model="s.strategy"
+            name="save_strategy"
+            label="保存方式"
+            :options="[
+              { value: 'sibling_suffix', label: '保存副本' },
+              { value: 'sibling_overwrite', label: '覆盖原文件' },
+              { value: 'directory', label: '统一目录' },
+            ]"
+          />
+          <div v-if="s.sourceMode === 'upload' || s.strategy === 'directory'">
+            <span class="field-label">保存位置</span>
+            <div class="path-group">
+              <AppButton
+                id="save-directory"
+                class="path-picker"
+                @click="pick('save')"
+                ><span
+                  >{{ s.save ? "保存到" : "任务内保存"
+                  }}<strong>{{
+                    s.save
+                      ? pathLabel(s.save.storage, s.save.path)
+                      : "完成后下载"
+                  }}</strong></span
+                ><span aria-hidden="true">›</span></AppButton
               ><AppButton
-                variant="ghost"
-                :data-remove-file="index"
-                :aria-label="`移除 ${file.name}`"
-                @click="s.files.splice(index, 1)"
+                v-if="s.save"
+                id="clear-save-directory"
+                aria-label="清除保存位置"
+                @click="s.save = null"
                 >×</AppButton
               >
-            </li>
-          </ul>
-          <AppNotice id="upload-validation" :message="s.validation" />
-        </div>
-        <AppButton
-          v-if="s.sourceMode === 'mounted'"
-          id="source-directory"
-          class="path-picker"
-          @click="pick('source')"
-          ><span
-            >来源文件与目录<strong>{{
-              s.sources.length
-                ? `已选 ${s.sources.length} 项`
-                : "选择文件或目录"
-            }}</strong></span
-          ><span aria-hidden="true">›</span></AppButton
-        >
-        <label class="field-label" for="target-language">目标语言</label
-        ><input
-          id="target-language"
-          v-model="s.target"
-          name="target"
-          list="target-languages"
-          maxlength="64"
-          required
-          autocomplete="off"
-        /><datalist id="target-languages">
-          <option
-            v-for="language in [
-              '中文',
-              'English',
-              '日本語',
-              '한국어',
-              'Français',
-              'Deutsch',
-              'Español',
-            ]"
-            :key="language"
-            :value="language"
-          />
-        </datalist>
-        <SegmentedControl
-          v-model="s.mode"
-          name="mode"
-          label="输出方式"
-          :options="[
-            { value: 'bilingual', label: '双语对照' },
-            { value: 'replace', label: '仅译文', disabled: hasDocx },
-          ]"
-        />
-        <p v-if="hasDocx" id="mode-hint" class="helper-text">
-          DOCX 仅支持双语对照，已为你选择兼容的输出方式。
-        </p>
-        <details class="settings">
-          <summary>
-            翻译模型
-            <span>{{
-              s.preset === "7b-fp8" ? "7B · 默认" : "30B · 更大模型"
-            }}</span>
-          </summary>
-          <SegmentedControl
-            v-model="s.preset"
-            name="preset"
-            label="翻译模型"
-            :options="[
-              { value: '7b-fp8', label: '7B（默认）' },
-              { value: '30b-fp8', label: '30B（更大模型）' },
-            ]"
-          />
-          <p class="helper-text">
-            {{
-              selectedModel ? modelStates[selectedModel.state] : "状态待同步"
-            }}。提交后自动准备模型，无需手动启动。
-          </p>
-        </details>
-        <details class="settings">
-          <summary>高级设置</summary>
-          <div class="tuning-grid">
-            <label
-              >每批段数<input
-                v-model.number="s.batch"
-                name="batch_size"
-                type="number"
-                min="1"
-                max="100"
-                step="1"
-                required /></label
-            ><label
-              >上下文段数<input
-                v-model.number="s.context"
-                name="context_segments"
-                type="number"
-                min="0"
-                max="50"
-                step="1"
-                required
-            /></label>
+            </div>
           </div>
-          <label class="check-setting"
-            ><input
-              id="cache-enabled"
-              v-model="s.cache"
-              type="checkbox"
-            />使用翻译缓存</label
-          >
-        </details>
-        <SegmentedControl
-          v-if="s.sourceMode === 'mounted'"
-          v-model="s.strategy"
-          name="save_strategy"
-          label="保存方式"
-          :options="[
-            { value: 'sibling_suffix', label: '保存副本' },
-            { value: 'sibling_overwrite', label: '覆盖原文件' },
-            { value: 'directory', label: '统一目录' },
-          ]"
-        />
-        <div v-if="s.sourceMode === 'upload' || s.strategy === 'directory'">
-          <span class="field-label">保存位置</span>
-          <div class="path-group">
-            <AppButton
-              id="save-directory"
-              class="path-picker"
-              @click="pick('save')"
-              ><span
-                >{{ s.save ? "保存到" : "任务内保存"
-                }}<strong>{{
-                  s.save ? pathLabel(s.save.storage, s.save.path) : "完成后下载"
-                }}</strong></span
-              ><span aria-hidden="true">›</span></AppButton
-            ><AppButton
-              v-if="s.save"
-              id="clear-save-directory"
-              aria-label="清除保存位置"
-              @click="s.save = null"
-              >×</AppButton
+          <p id="save-hint" class="helper-text">{{ saveHint }}</p>
+          <details class="settings">
+            <summary>
+              高级设置
+              <span>批量 {{ s.batch }} 段 · 上下文 {{ s.context }} 段</span>
+            </summary>
+            <div class="tuning-grid">
+              <label
+                >每批段数<input
+                  v-model.number="s.batch"
+                  name="batch_size"
+                  type="number"
+                  min="1"
+                  max="100"
+                  step="1"
+                  required /></label
+              ><label
+                >上下文段数<input
+                  v-model.number="s.context"
+                  name="context_segments"
+                  type="number"
+                  min="0"
+                  max="50"
+                  step="1"
+                  required
+              /></label>
+            </div>
+            <label class="check-setting"
+              ><input
+                id="cache-enabled"
+                v-model="s.cache"
+                type="checkbox"
+              />使用翻译缓存</label
             >
-          </div>
-        </div>
-        <p id="save-hint" class="helper-text">{{ saveHint }}</p>
+          </details>
+        </section>
       </fieldset>
       <AppNotice id="submission-error" :message="s.error" />
       <AppNotice id="submission-result" :message="s.result" tone="info" />
@@ -288,8 +319,30 @@ defineExpose({ chooseFile });
         >
       </div>
       <div class="submit-bar">
-        <span class="helper-text">提交前可预览文件与保存位置</span
-        ><AppButton
+        <div class="submit-summary">
+          <strong
+            >{{
+              s.sourceMode === "upload"
+                ? `${s.files.length} 个文件`
+                : `已选 ${s.sources.length} 项`
+            }}
+            · {{ s.target || "选择语言" }} ·
+            {{ s.mode === "bilingual" ? "双语对照" : "仅译文" }}</strong
+          ><span
+            class="helper-text"
+            :class="{
+              'job-warning':
+                s.sourceMode === 'mounted' &&
+                s.strategy === 'sibling_overwrite',
+            }"
+            >{{
+              s.sourceMode === "mounted" && s.strategy === "sibling_overwrite"
+                ? "将覆盖原文件 · 提交前须确认"
+                : "原文件不会被修改 · 提交前可预览"
+            }}</span
+          >
+        </div>
+        <AppButton
           id="submit-job"
           type="submit"
           variant="primary"
@@ -299,7 +352,7 @@ defineExpose({ chooseFile });
               ? "正在预览…"
               : s.stage === "submitting"
                 ? "正在提交…"
-                : "＋ 预览并提交"
+                : "开始翻译"
           }}</AppButton
         ><AppButton
           v-if="s.stage === 'previewing'"

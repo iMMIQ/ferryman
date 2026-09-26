@@ -113,6 +113,7 @@ test("built frontend uses real Rust config, storage, preview and job lifecycle A
     const created = await createdResponse.json();
     assert.equal(created.jobs.length, 1);
     await page.keyboard.press("Escape");
+    await page.locator('button[data-workspace="jobs"]').click();
     await page.locator("#refresh-jobs").click();
     await page
       .locator(`tr[data-id="${created.jobs[0].id}"] .file-title`)

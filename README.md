@@ -97,6 +97,24 @@ running parser finishes in the background while retaining its concurrency
 slot. Empty or explicitly truncated model responses are never cached as
 successful translations; truncation triggers bounded splitting/retranslation.
 
+### Browser UI regression tests
+
+The frontend is plain HTML/CSS/JavaScript; Node is needed only for browser tests.
+The tests serve the real assets locally and mock API responses, so no model or
+GPU is required.
+
+```bash
+npm ci
+npx playwright install --with-deps chromium
+npm test
+# Optional screenshot artifacts:
+UI_SCREENSHOT_DIR=/tmp/ferryman-ui npm test
+```
+
+The suite covers mobile navigation, keyboard focus across polling, partial
+results, connection recovery, multi-file upload/cancellation, overwrite preview
+and model management. CI runs it alongside the Rust tests.
+
 ## Web app and Lazycat deployment
 
 Ferryman's Web deployment has two processes:
@@ -130,6 +148,23 @@ batch size, context window and translation-cache controls; the target language i
 free-form with common languages offered as suggestions. Cancelling a running job
 keeps any partial document available for download without overwriting a mounted
 source.
+On mobile, **New translation / Tasks** tabs keep the queue accessible and the
+submit action stays visible at the bottom. Uploads accept multiple files, show
+progress, and retain unsubmitted files after cancellation or errors. Every
+submission has a preview; mounted-directory previews list output paths and
+skip reasons, and overwriting requires an explicit acknowledgement. Previews
+are advisory: submission rechecks the files and destination.
+
+A job with untranslated segments is shown as **Partially completed**, with
+separate translated/total counts and a retry action. Failed and cancelled jobs
+can also resume. Each new Web job stores its successful translations in a
+private `checkpoint` directory, independent of the optional shared cache;
+retrying reuses these entries. Jobs created before this update may need to
+retranslate if their old shared cache is unavailable. Retrying keeps saved
+results until a replacement is ready and refuses to overwrite user edits made
+since the previous attempt. Task details expose full paths, errors and partial
+result downloads; connection errors do not clear previously loaded history.
+
 The LPK requests `document.read/write` and `media.read/write`, and enables the
 corresponding `/lzcapp/run/mnt/home` and `/lzcapp/media/RemoteFS` mounts. Both
 mounts contain one directory per MicroServer UID; the backend confines every

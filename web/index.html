@@ -8,7 +8,7 @@
     <title>Ferryman</title>
     <link rel="stylesheet" href="/styles.css?v=0.3.1" />
   </head>
-  <body>
+  <body data-workspace="create">
     <header class="app-header">
       <div class="brand-block">
         <div class="brand-mark" aria-hidden="true">F</div>
@@ -32,21 +32,16 @@
         <strong id="runtime-model">未加载</strong>
         <span id="runtime-meta" class="muted">等待状态同步</span>
       </div>
-      <div class="runtime-actions">
-        <div class="segmented compact" role="group" aria-label="待启动模型">
-          <button class="segment active" data-runtime-preset="7b-fp8" type="button" aria-pressed="true">7B FP8</button>
-          <button class="segment" data-runtime-preset="30b-fp8" type="button" aria-pressed="false">30B FP8</button>
-        </div>
-        <button id="manage-models" class="button secondary" type="button">模型管理</button>
-        <button id="start-runtime" class="button secondary" type="button">
-          <span aria-hidden="true">▶</span><span class="button-label">启动</span>
-        </button>
-        <button id="stop-runtime" class="icon-button" type="button" title="卸载当前模型" aria-label="卸载当前模型">
-          <span aria-hidden="true">■</span>
-        </button>
-      </div>
+      <button id="manage-models" class="button secondary" type="button">模型管理</button>
     </section>
 
+    <div id="connection-error" class="notice error-notice" role="status" hidden>
+      <span id="connection-error-text"></span><button id="retry-connection" class="button secondary" type="button">重新连接</button>
+    </div>
+    <nav class="workspace-tabs" aria-label="工作区">
+      <button type="button" data-workspace="create" aria-pressed="true">新建翻译</button>
+      <button type="button" data-workspace="jobs" aria-pressed="false">任务 <span id="active-job-count">0</span></button>
+    </nav>
     <section id="runtime-startup" class="runtime-startup" aria-live="polite" hidden>
       <div class="startup-overview">
         <div class="startup-heading">
@@ -72,7 +67,7 @@
           <span id="startup-remaining">正在估算剩余时间</span>
         </div>
       </div>
-      <details id="startup-log-details" class="startup-logs" open>
+      <details id="startup-log-details" class="startup-logs">
         <summary>启动日志 <span id="startup-log-count">0 行</span></summary>
         <pre id="startup-log-output">等待 vLLM 输出...</pre>
       </details>
@@ -103,11 +98,15 @@
           </fieldset>
 
           <label id="drop-zone" class="drop-zone" for="file-input">
-            <input id="file-input" name="file" type="file" accept=".epub,.docx,.pdf,.srt,.vtt,.ass,.ssa,.lrc,.txt,.md,.markdown" required />
+            <input id="file-input" name="file" type="file" multiple accept=".epub,.docx,.pdf,.srt,.vtt,.ass,.ssa,.lrc,.txt,.md,.markdown" />
             <span class="upload-icon" aria-hidden="true">↑</span>
-            <strong id="file-label">选择文档</strong>
+            <strong id="file-label">选择或拖入文档</strong>
             <span id="file-meta">EPUB、DOCX、PDF、字幕、TXT、Markdown</span>
           </label>
+
+          <p id="upload-hint" class="helper-text">支持多文件 · 单文件最大 512 MiB</p>
+          <ul id="upload-list" class="upload-list" aria-label="待上传文件"></ul>
+          <div id="upload-validation" class="notice error-notice" role="status" hidden></div>
 
           <button id="source-directory" class="path-picker" type="button" hidden>
             <span class="path-picker-icon" aria-hidden="true">▤</span>
@@ -118,19 +117,6 @@
             <span class="path-picker-arrow" aria-hidden="true">›</span>
           </button>
 
-          <fieldset>
-            <legend>翻译模型</legend>
-            <div class="segmented full">
-              <label class="segment active">
-                <input type="radio" name="preset" value="7b-fp8" checked />
-                <span>7B FP8</span>
-              </label>
-              <label class="segment">
-                <input type="radio" name="preset" value="30b-fp8" />
-                <span>30B FP8</span>
-              </label>
-            </div>
-          </fieldset>
 
           <label class="field-label" for="target-language">目标语言</label>
           <input id="target-language" class="form-input" name="target" list="target-languages" value="中文" maxlength="64" required autocomplete="off" />
@@ -158,6 +144,25 @@
             </div>
           </fieldset>
 
+          <p id="mode-hint" class="helper-text" hidden>DOCX 仅支持双语对照，已为你选择兼容的输出方式。</p>
+          <details class="model-settings">
+            <summary>翻译模型 <span id="model-choice-summary">7B · 默认</span></summary>
+          <fieldset>
+            <legend>翻译模型</legend>
+            <div class="segmented full">
+              <label class="segment active">
+                <input type="radio" name="preset" value="7b-fp8" checked />
+                <span>7B（默认）</span>
+              </label>
+              <label class="segment">
+                <input type="radio" name="preset" value="30b-fp8" />
+                <span>30B（更大模型）</span>
+              </label>
+            </div>
+          </fieldset>
+
+            <p id="model-choice-info" class="helper-text">提交后自动准备模型，无需手动启动。</p>
+          </details>
           <details class="advanced-settings">
             <summary>高级设置</summary>
             <div class="tuning-grid">
@@ -181,7 +186,7 @@
             <div class="segmented full">
               <label class="segment active">
                 <input type="radio" name="save_strategy" value="sibling_suffix" checked />
-                <span>同级后缀</span>
+                <span>保存副本</span>
               </label>
               <label class="segment">
                 <input type="radio" name="save_strategy" value="sibling_overwrite" />
@@ -209,9 +214,19 @@
             </div>
           </div>
 
-          <button id="submit-job" class="button primary full-width" type="submit">
-            <span aria-hidden="true">＋</span><span id="submit-job-label">加入翻译队列</span>
-          </button>
+          <p id="save-hint" class="helper-text">输出示例：book.bilingual.epub · 完成后可下载</p>
+          <div id="submission-error" class="notice error-notice" role="alert" hidden></div>
+          <div id="upload-progress" class="upload-progress" hidden>
+            <label for="upload-meter" id="upload-progress-label">正在上传</label>
+            <progress id="upload-meter" max="100" value="0"></progress>
+            <button id="cancel-upload" class="button secondary" type="button">取消上传</button>
+          </div>
+          <div class="submit-bar">
+            <span class="submit-help">提交前可预览文件与保存位置</span>
+            <button id="submit-job" class="button primary full-width" type="submit">
+              <span aria-hidden="true">＋</span><span id="submit-job-label">预览并提交</span>
+            </button>
+          </div>
         </form>
       </aside>
 
@@ -221,7 +236,7 @@
             <span class="eyebrow">任务队列</span>
             <div class="heading-title-row">
               <h2>翻译记录</h2>
-              <span id="jobs-count" class="jobs-count">0 项</span>
+              <span id="jobs-count" class="jobs-count">—</span>
             </div>
           </div>
           <div class="jobs-heading-actions">
@@ -230,6 +245,8 @@
               <button class="segment" data-job-phase="queued" type="button" aria-pressed="false">排队中</button>
               <button class="segment" data-job-phase="in_progress" type="button" aria-pressed="false">进行中</button>
               <button class="segment" data-job-phase="completed" type="button" aria-pressed="false">已完成</button>
+              <button class="segment" data-job-phase="partial" type="button" aria-pressed="false">部分完成</button>
+              <button class="segment" data-job-phase="cancelled" type="button" aria-pressed="false">已取消</button>
               <button class="segment" data-job-phase="failed" type="button" aria-pressed="false">失败</button>
             </div>
             <button id="refresh-jobs" class="icon-button" type="button" title="刷新任务" aria-label="刷新任务">
@@ -238,6 +255,10 @@
           </div>
         </div>
 
+        <div id="jobs-error" class="notice error-notice" role="status" hidden>
+          <span id="jobs-error-text"></span><button id="retry-jobs" class="button secondary" type="button">重试</button>
+        </div>
+        <p id="jobs-updated" class="helper-text" aria-live="off">正在加载任务…</p>
         <div class="table-shell">
           <table>
             <thead>
@@ -252,11 +273,12 @@
             <tbody id="jobs-body"></tbody>
           </table>
           <div id="empty-state" class="empty-state">
-            <strong>还没有翻译任务</strong>
+            <strong>正在加载任务…</strong>
             <span>创建任务后，翻译进度会显示在这里</span>
+            <button id="empty-create" class="button primary" type="button" hidden>选择文档开始翻译</button>
           </div>
         </div>
-        <nav class="jobs-pagination" aria-label="翻译记录分页">
+        <nav class="jobs-pagination" hidden aria-label="翻译记录分页">
           <button id="jobs-previous" class="button secondary" type="button" disabled>上一页</button>
           <span id="jobs-page-label">第 1 页</span>
           <button id="jobs-next" class="button secondary" type="button" disabled>下一页</button>
@@ -321,6 +343,22 @@
           <button id="close-model-dialog" class="icon-button" type="button" aria-label="关闭模型管理">×</button>
         </header>
 
+        <section class="model-dialog-section manual-runtime">
+          <h3>手动管理运行模型</h3>
+          <p class="helper-text">翻译任务会自动准备模型。仅在需要预热或释放资源时手动操作。</p>
+      <div class="runtime-actions">
+        <div class="segmented compact" role="group" aria-label="待启动模型">
+          <button class="segment active" data-runtime-preset="7b-fp8" type="button" aria-pressed="true">7B FP8</button>
+          <button class="segment" data-runtime-preset="30b-fp8" type="button" aria-pressed="false">30B FP8</button>
+        </div>
+        <button id="start-runtime" class="button secondary" type="button">
+          <span aria-hidden="true">▶</span><span class="button-label">启动</span>
+        </button>
+        <button id="stop-runtime" class="button secondary" type="button" title="卸载当前模型" aria-label="卸载当前模型">
+          <span>卸载模型</span>
+        </button>
+      </div>
+        </section>
         <section class="model-dialog-section" aria-labelledby="installed-models-title">
           <div class="model-section-heading">
             <div>
@@ -364,6 +402,21 @@
           <button id="done-model-dialog" class="button primary" type="button">完成</button>
         </footer>
       </div>
+    </dialog>
+
+    <dialog id="job-detail-dialog" class="detail-dialog" aria-labelledby="job-detail-title">
+      <header><h2 id="job-detail-title">任务详情</h2><button type="button" class="icon-button" data-close-dialog="job-detail-dialog" aria-label="关闭任务详情">×</button></header>
+      <div id="job-detail-content"></div>
+      <div id="job-detail-error" class="notice error-notice" role="alert" hidden></div>
+      <footer id="job-detail-actions"></footer>
+    </dialog>
+    <dialog id="submission-dialog" class="detail-dialog" aria-labelledby="submission-title">
+      <header><h2 id="submission-title">确认翻译任务</h2><button type="button" class="icon-button" data-close-dialog="submission-dialog" aria-label="关闭提交预览">×</button></header>
+      <p id="submission-summary"></p>
+      <p class="helper-text">未支持的格式与已生成的译文不加入任务。实际提交时会重新检查文件和保存位置。</p>
+      <div id="submission-files" class="preview-files"></div>
+      <label id="overwrite-confirmation" class="check-setting" hidden><input id="confirm-overwrite" type="checkbox" />我确认覆盖以上文件，原内容将被替换</label>
+      <footer><button type="button" class="button secondary" data-close-dialog="submission-dialog">返回修改</button><button id="confirm-submit" type="button" class="button primary">确认加入队列</button></footer>
     </dialog>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>

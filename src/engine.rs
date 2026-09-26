@@ -50,6 +50,7 @@ pub struct Engine {
     target: String,
     concurrency: usize,
     cache: Option<Cache>,
+    checkpoint: Option<Cache>,
     request_limiter: Option<Arc<Semaphore>>,
 }
 
@@ -117,7 +118,36 @@ impl Engine {
             target,
             concurrency,
             cache,
+            checkpoint: None,
             request_limiter: None,
+        }
+    }
+
+    /// Job-local progress survives retries even when shared caching is off.
+    pub fn with_checkpoint(mut self, checkpoint: Option<Cache>) -> Self {
+        self.checkpoint = checkpoint;
+        self
+    }
+
+    async fn cached(&self, key: &str) -> Option<String> {
+        if let Some(checkpoint) = &self.checkpoint {
+            if let Some(value) = checkpoint.get(key).await {
+                return Some(value);
+            }
+        }
+        let value = self.cache.as_ref()?.get(key).await?;
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint.put(key, &value).await;
+        }
+        Some(value)
+    }
+
+    async fn remember(&self, key: &str, value: &str) {
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint.put(key, value).await;
+        }
+        if let Some(cache) = &self.cache {
+            cache.put(key, value).await;
         }
     }
 
@@ -156,7 +186,7 @@ impl Engine {
         let endpoint = &self.endpoint;
         let model = &self.model;
         let target = &self.target;
-        let cache = &self.cache;
+        let cache = self.cache.as_ref().or(self.checkpoint.as_ref());
         let file = unit.file();
 
         match unit {
@@ -166,8 +196,8 @@ impl Engine {
                 let key = cache
                     .as_ref()
                     .map(|c| c.key(model, target, &text, &cache_scope(endpoint, &[], &[], None)));
-                if let (Some(c), Some(k)) = (cache.as_ref(), key.as_deref()) {
-                    if let Some(v) = c.get(k).await {
+                if let (Some(_), Some(k)) = (cache.as_ref(), key.as_deref()) {
+                    if let Some(v) = self.cached(k).await {
                         return UnitDone {
                             file,
                             attempted: 1,
@@ -181,8 +211,8 @@ impl Engine {
                         // Put before returning: even if the future is dropped
                         // right after (Ctrl-C between completion and drain),
                         // the next run finds the cache populated.
-                        if let (Some(c), Some(k)) = (cache.as_ref(), key.as_deref()) {
-                            c.put(k, &tr).await;
+                        if let (Some(_), Some(k)) = (cache.as_ref(), key.as_deref()) {
+                            self.remember(k, &tr).await;
                         }
                         UnitDone {
                             file,
@@ -240,7 +270,7 @@ impl Engine {
                 let mut results: Vec<Option<String>> = Vec::with_capacity(n);
                 for k in &keys {
                     let hit = match (cache.as_ref(), k.as_deref()) {
-                        (Some(c), Some(kk)) => c.get(kk).await,
+                        (Some(_), Some(kk)) => self.cached(kk).await,
                         _ => None,
                     };
                     results.push(hit);
@@ -270,8 +300,8 @@ impl Engine {
                 .await;
                 for (slot, &idx) in miss_idx.iter().enumerate() {
                     if let Some(tr) = &trs[slot] {
-                        if let (Some(c), Some(k)) = (cache.as_ref(), keys[idx].as_deref()) {
-                            c.put(k, tr).await;
+                        if let (Some(_), Some(k)) = (cache.as_ref(), keys[idx].as_deref()) {
+                            self.remember(k, tr).await;
                         }
                         results[idx] = Some(tr.clone());
                     }
@@ -406,8 +436,9 @@ mod tests {
             "model".to_string(),
             "target".to_string(),
             4,
-            Some(cache),
-        );
+            None,
+        )
+        .with_checkpoint(Some(cache));
         let done = engine
             .exec_unit(Unit::Batch {
                 file: 0,
@@ -440,6 +471,16 @@ mod tests {
                 "cached cues stay home"
             );
         }
+        // Reopen only the job checkpoint: shared caching stays disabled.
+        let engine = Engine::new(
+            reqwest::Client::new(),
+            format!("http://{addr}"),
+            "model".into(),
+            "target".into(),
+            4,
+            None,
+        )
+        .with_checkpoint(Cache::open(Some(cache_dir.clone())));
         // Same full request resumes entirely from cache; a different context
         // must send all cues again instead of reusing the old meaning.
         for (context, expected_calls) in [(vec![], 1), (vec!["different narrative".into()], 2)] {

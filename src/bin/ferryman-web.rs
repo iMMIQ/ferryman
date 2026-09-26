@@ -700,6 +700,10 @@ async fn main() -> Result<()> {
         )
         .route("/api/jobs/directory", post(jobs_api::create_directory_jobs))
         .route("/api/jobs/selection", post(jobs_api::create_directory_jobs))
+        .route(
+            "/api/jobs/selection/preview",
+            post(jobs_api::preview_directory_jobs),
+        )
         .route("/api/jobs/{id}/cancel", post(jobs_api::cancel_job))
         .route("/api/jobs/{id}/retry", post(jobs_api::retry_job))
         .route("/api/jobs/{id}/result", get(jobs_api::download_result))

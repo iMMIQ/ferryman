@@ -1,0 +1,6 @@
+{
+  "name": "ferryman-ui-tests",
+  "private": true,
+  "scripts": { "test": "node --test tests/ui.test.cjs" },
+  "devDependencies": { "playwright": "1.63.0" }
+}

@@ -75,7 +75,40 @@ const els = {
 let runtimePreset = "7b-fp8";
 let toastTimer;
 let runtimePollTimer;
-let runtimeState = "stopped";
+let runtimeState = "unknown";
+let runtimeConnected = false;
+let runtimePresetActive = null;
+let catalogConnected = false;
+let jobsLoaded = false;
+let jobsLastUpdated = null;
+let jobsError = "";
+let jobListRequest = 0;
+let selectedFiles = [];
+let uploadRequest = null;
+let uploadCancelled = false;
+let submissionBusy = false;
+let preparedSubmission = null;
+let maxUploadBytes = 512 * 1024 * 1024;
+let detailJobId = null;
+const $ = (id) => document.getElementById(id);
+const supportedExtensions = new Set(["epub", "docx", "pdf", "srt", "vtt", "ass", "ssa", "lrc", "txt", "md", "markdown"]);
+
+function notice(id, message) {
+  $(id).hidden = !message;
+  $(id).textContent = message || "";
+}
+
+function switchWorkspace(view) {
+  document.body.dataset.workspace = view;
+  document.querySelectorAll("[data-workspace]").forEach((button) => {
+    if (button.tagName === "BUTTON") button.setAttribute("aria-pressed", String(button.dataset.workspace === view));
+  });
+}
+
+document.querySelectorAll("button[data-workspace]").forEach((button) => button.addEventListener("click", () => {
+  switchWorkspace(button.dataset.workspace);
+}));
+document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => $(button.dataset.closeDialog).close()));
 let modelCatalog = { models: [], available_bytes: 0, benchmark: { state: "idle", results: [] } };
 let modelsByPreset = new Map();
 let modelStorage = null;
@@ -212,6 +245,8 @@ function phaseForJob(job) {
   if (job.status === "queued") return "queued";
   if (["starting_model", "translating", "writing"].includes(job.status)) return "in_progress";
   if (job.status === "failed") return "failed";
+  if (job.status === "cancelled") return "cancelled";
+  if (job.status === "completed" && job.failed_segments > 0) return "partial";
   return "completed";
 }
 
@@ -219,92 +254,108 @@ function jobMatchesPhase(job) {
   return jobPhase === "all" || phaseForJob(job) === jobPhase;
 }
 
+function isPartial(job) {
+  return Boolean((job.status === "completed" && job.failed_segments > 0)
+    || (job.status !== "completed" && job.result_available));
+}
+
+function jobStatusLabel(job) {
+  return job.status === "completed" && job.failed_segments > 0 ? "部分完成" : statusNames[job.status] || job.status;
+}
+
+function canRetry(job) {
+  return ["failed", "cancelled"].includes(job.status) || (job.status === "completed" && job.failed_segments > 0);
+}
+
+function renderJobsState() {
+  if (!jobsLoaded) els.jobsCount.textContent = "—";
+  $("jobs-error").hidden = !jobsError;
+  $("jobs-error-text").textContent = jobsError ? `任务更新失败：${jobsError}${jobsLoaded ? "。当前显示上次成功加载的记录。" : "。暂时无法获取记录。"}` : "";
+  $("jobs-updated").textContent = jobsLastUpdated ? `最近更新 ${jobsLastUpdated.toLocaleTimeString("zh-CN")}` : (jobsError ? "尚未加载任务" : "正在加载任务…");
+  els.empty.hidden = currentJobs.length > 0 || !!jobsError;
+  els.empty.querySelector("strong").textContent = !jobsLoaded ? "正在加载任务…" : jobPhase === "all" ? "还没有翻译任务" : "当前筛选下没有任务";
+  els.empty.querySelector("span").textContent = jobPhase === "all" ? "选择文档，提交后会自动准备模型并开始翻译" : "试试其他状态，或创建新的翻译任务";
+  $("empty-create").hidden = !jobsLoaded || jobPhase !== "all";
+  document.querySelector(".jobs-pagination").hidden = !jobsLoaded || (jobPageIndex === 0 && !nextJobCursor);
+}
+
 function renderJobs(jobs) {
-  els.empty.hidden = jobs.length > 0;
-  els.empty.querySelector("strong").textContent = jobPhase === "all"
-    ? "还没有翻译任务"
-    : "当前筛选下没有任务";
-  els.jobsCount.textContent = `${totalJobs} 项`;
+  const previousFocus = document.activeElement;
+  const focusRow = previousFocus?.closest("tr[data-id]");
+  const rows = new Map([...els.jobsBody.children].map((row) => [row.dataset.id, row]));
+  jobs.forEach((job, index) => {
+    let row = rows.get(job.id);
+    if (!row) {
+      row = document.createElement("tr");
+      row.dataset.id = job.id;
+      row.innerHTML = `<td><div class="file-cell"><button class="file-title" data-action="details"></button><span class="file-meta"></span><span class="file-diagnostic"></span></div></td>
+        <td><span class="model-chip"></span></td><td><span class="status-chip"></span></td>
+        <td><div class="progress-wrap"><div class="progress-track"><div class="progress-fill"></div></div><span class="progress-label"></span></div></td>
+        <td><div class="row-actions"><button class="row-action download-action" data-action="download">下载</button><button class="row-action" data-action="retry">重试</button><button class="row-action" data-action="cancel">取消</button><button class="row-action" data-action="details" aria-label="更多操作及任务详情">更多</button></div></td>`;
+      row.querySelectorAll("[data-action]").forEach((button) => { button.dataset.id = job.id; });
+    }
+    rows.delete(job.id);
+    const set = (selector, text) => { const node = row.querySelector(selector); if (node.textContent !== text) node.textContent = text; return node; };
+    set(".file-title", job.filename).title = job.filename;
+    const route = job.source_path ? displayStoragePath(job.source_storage || "documents", job.source_path) : `上传 · ${formatTime(job.created_at)}`;
+    set(".file-meta", `${job.target} · ${job.mode === "replace" ? "仅译文" : "双语对照"} · ${route}`).title = route;
+    const diagnostic = set(".file-diagnostic", job.error || (job.failed_segments > 0 ? `${job.failed_segments} 段未翻译，可补译` : ""));
+    diagnostic.className = `file-diagnostic ${job.error ? "job-error" : "job-warning"}`;
+    diagnostic.hidden = !diagnostic.textContent;
+    set(".model-chip", job.preset === "30b-fp8" ? "30B" : "7B");
+    set(".status-chip", jobStatusLabel(job)).className = `status-chip ${phaseForJob(job) === "partial" ? "partial" : job.status}`;
+    const percent = job.total > 0 ? Math.min(100, Math.round((job.translated / job.total) * 100)) : 0;
+    const fill = row.querySelector(".progress-fill");
+    fill.style.width = `${percent}%`;
+    fill.classList.toggle("partial", isPartial(job));
+    set(".progress-label", job.total > 0 ? `已译 ${job.translated}/${job.total}` : job.status === "queued" ? "等待调度" : "准备中");
+    row.querySelector(".progress-wrap").title = `已处理 ${job.completed}/${job.total || "未知"} 段；已译 ${job.translated} 段`;
+    const download = row.querySelector('[data-action="download"]');
+    download.hidden = !(job.status === "completed" || job.result_available);
+    download.textContent = isPartial(job) ? "下载部分" : "下载";
+    download.setAttribute("aria-label", isPartial(job) ? "下载部分结果" : "下载结果");
+    const retry = row.querySelector('[data-action="retry"]');
+    retry.hidden = !canRetry(job);
+    retry.textContent = job.status === "completed" ? "补译" : job.status === "cancelled" ? "继续" : "重试";
+    row.querySelector('[data-action="cancel"]').hidden = ["completed", "failed", "cancelled"].includes(job.status);
+    if (els.jobsBody.children[index] !== row) els.jobsBody.insertBefore(row, els.jobsBody.children[index] || null);
+  });
+  rows.forEach((row) => row.remove());
+  if (focusRow && (!previousFocus.isConnected || previousFocus.hidden)) {
+    const next = els.jobsBody.querySelector(".file-title") || els.refresh;
+    next.focus({ preventScroll: true });
+  } else if (focusRow && previousFocus.isConnected && document.activeElement !== previousFocus) {
+    previousFocus.focus({ preventScroll: true });
+  }
+  els.jobsCount.textContent = jobsLoaded ? `${totalJobs} 项` : "";
   els.jobsPageLabel.textContent = `第 ${jobPageIndex + 1} 页`;
   els.jobsPrevious.disabled = jobPageIndex === 0;
   els.jobsNext.disabled = !nextJobCursor;
-  els.jobsBody.innerHTML = jobs
-    .map((job) => {
-      const percent = job.total > 0 ? Math.min(100, Math.round((job.completed / job.total) * 100)) : 0;
-      const terminal = ["completed", "failed", "cancelled"].includes(job.status);
-      const downloadable = job.status === "completed" || job.result_available;
-      const partial = job.status !== "completed" && job.result_available;
-      const actions = [];
-      if (downloadable) {
-        actions.push(`<button class="row-action" data-action="download" data-id="${job.id}" title="${partial ? "下载部分结果" : "下载结果"}" aria-label="${partial ? "下载部分结果" : "下载结果"}">↓</button>`);
-      }
-      if (job.status === "failed") {
-        actions.push(`<button class="row-action" data-action="retry" data-id="${job.id}" title="重试任务" aria-label="重试任务">↻</button>`);
-      }
-      if (terminal) {
-        actions.push(`<button class="row-action danger" data-action="delete" data-id="${job.id}" title="删除记录" aria-label="删除记录">×</button>`);
-      } else {
-        actions.push(`<button class="row-action danger" data-action="cancel" data-id="${job.id}" title="取消任务" aria-label="取消任务">×</button>`);
-      }
-      const route = job.source_path
-        ? `${displayStoragePath(job.source_storage || "documents", job.source_path)}${job.save_path ? ` → ${displayStoragePath(job.save_storage || "documents", job.save_path)}` : ""}`
-        : job.save_path
-          ? `上传 → ${displayStoragePath(job.save_storage || "documents", job.save_path)}`
-          : formatTime(job.created_at);
-      const diagnostics = job.error
-        ? `<span class="job-error" title="${escapeAttribute(job.error)}">${escapeHtml(job.error)}</span>`
-        : job.failed_segments > 0
-          ? `<span class="job-warning">${job.failed_segments} 段未翻译</span>`
-          : "";
-      const progressLabel = job.status === "completed"
-        ? (job.failed_segments > 0 ? `${job.translated}/${job.total}` : "完成")
-        : partial
-          ? "部分结果"
-          : `${job.completed}/${job.total || "-"}`;
-      return `
-        <tr>
-          <td>
-            <div class="file-cell">
-              <strong>${escapeHtml(job.filename)}</strong>
-              <span title="${escapeAttribute(route)}">${escapeHtml(job.target)} · ${job.mode === "replace" ? "仅译文" : "双语对照"} · ${escapeHtml(route)}</span>
-              ${diagnostics}
-            </div>
-          </td>
-          <td><span class="model-chip">${job.preset === "30b-fp8" ? "30B" : "7B"}</span></td>
-          <td><span class="status-chip ${job.status}">${statusNames[job.status] || job.status}</span></td>
-          <td>
-            <div class="progress-wrap">
-              <div class="progress-track"><div class="progress-fill" style="width:${job.status === "completed" ? 100 : percent}%"></div></div>
-              <span class="progress-label">${progressLabel}</span>
-            </div>
-          </td>
-          <td><div class="row-actions">${actions.join("")}</div></td>
-        </tr>`;
-    })
-    .join("");
+  renderJobsState();
+  if (detailJobId && $("job-detail-dialog").open) updateJobDetail();
 }
 
-async function refreshJobs(silent = true) {
+async function refreshJobs() {
+  const request = ++jobListRequest;
   try {
-    const cursor = jobPageCursors[jobPageIndex];
     const query = new URLSearchParams();
-    if (cursor) query.set("cursor", cursor);
+    if (jobPageCursors[jobPageIndex]) query.set("cursor", jobPageCursors[jobPageIndex]);
     if (jobPhase !== "all") query.set("phase", jobPhase);
-    const queryString = query.toString();
-    const suffix = queryString ? `?${queryString}` : "";
-    const page = await api(`/api/jobs${suffix}`);
+    const page = await api(`/api/jobs?${query}`);
+    if (request !== jobListRequest) return;
     currentJobs = page.jobs || [];
     nextJobCursor = page.next_cursor || null;
     totalJobs = Number(page.total) || 0;
+    jobsLoaded = true; jobsError = ""; jobsLastUpdated = new Date();
     if (jobPageIndex > 0 && currentJobs.length === 0) {
-      jobPageCursors.pop();
-      jobPageIndex -= 1;
-      await refreshJobs(silent);
-      return;
+      jobPageCursors.pop(); jobPageIndex -= 1;
+      return refreshJobs();
     }
     renderJobs(currentJobs);
   } catch (error) {
-    if (!silent) showToast(error.message);
+    if (request !== jobListRequest) return;
+    jobsError = error.message;
+    renderJobsState();
   }
 }
 
@@ -314,22 +365,19 @@ async function refreshActiveJobs() {
     const activeJobs = response.jobs || [];
     const activeById = new Map(activeJobs.map((job) => [job.id, job]));
     const disappeared = [...knownActiveJobs.keys()].some((id) => !activeById.has(id));
-    const changedPhase = activeJobs.some((job) => {
-      const previous = knownActiveJobs.get(job.id);
-      return previous && phaseForJob(previous) !== phaseForJob(job);
-    });
-    const appearedOnFirstPage = jobPageIndex === 0
-      && activeJobs.some((job) => jobMatchesPhase(job)
-        && !currentJobs.some((current) => current.id === job.id));
+    const changedPhase = activeJobs.some((job) => knownActiveJobs.has(job.id) && phaseForJob(knownActiveJobs.get(job.id)) !== phaseForJob(job));
+    const appeared = jobPageIndex === 0 && activeJobs.some((job) => jobMatchesPhase(job) && !currentJobs.some((current) => current.id === job.id));
     knownActiveJobs = activeById;
-    if (disappeared || changedPhase || appearedOnFirstPage) {
-      await refreshJobs();
-    } else {
+    $("active-job-count").textContent = activeJobs.length;
+    if (jobsError || !jobsLoaded || disappeared || changedPhase || appeared) await refreshJobs();
+    else {
       currentJobs = currentJobs.map((job) => activeById.get(job.id) || job);
+      jobsLastUpdated = new Date();
       renderJobs(currentJobs);
     }
-  } catch (_) {
-    // Runtime status already surfaces connectivity failures; keep history usable.
+  } catch (error) {
+    jobsError = error.message;
+    renderJobsState();
   } finally {
     clearTimeout(jobsPollTimer);
     jobsPollTimer = setTimeout(refreshActiveJobs, 2500);
@@ -367,19 +415,18 @@ function modelProgress(model) {
 
 function updateRuntimeControls() {
   const model = selectedModel();
-  const label = els.startRuntime.querySelector(".button-label");
   const preparing = model && ["benchmarking", "downloading", "verifying"].includes(model.state);
-  if (!model || model.state === "absent") label.textContent = "下载";
-  else if (model.state === "paused") label.textContent = "继续";
-  else if (model.state === "failed") label.textContent = "重试";
-  else if (preparing) label.textContent = `${modelProgress(model)}%`;
-  else label.textContent = "启动";
-  els.startRuntime.disabled = preparing || ["starting", "stopping"].includes(runtimeState);
-  const submitPreset = document.querySelector('input[name="preset"]:checked')?.value || runtimePreset;
-  const submitModel = modelsByPreset.get(submitPreset);
-  els.submitLabel.textContent = submitModel?.state === "ready"
-    ? "加入翻译队列"
-    : `下载 ${submitPreset === "30b-fp8" ? "30B" : "7B"} 模型并加入队列`;
+  const runningSelected = runtimeState === "ready" && runtimePresetActive === runtimePreset;
+  els.startRuntime.querySelector(".button-label").textContent = !runtimeConnected || !catalogConnected ? "等待连接"
+    : runningSelected ? "运行中" : !model || model.state === "absent" ? "下载模型"
+    : model.state === "paused" ? "继续下载" : model.state === "failed" ? "重试" : preparing ? `${modelProgress(model)}%` : "启动模型";
+  els.startRuntime.disabled = !runtimeConnected || !catalogConnected || runningSelected || preparing || ["starting", "stopping"].includes(runtimeState);
+  els.stopRuntime.disabled = !runtimeConnected || ["stopped", "stopping", "unknown"].includes(runtimeState);
+  els.submitLabel.textContent = submissionBusy ? "正在处理…" : "预览并提交";
+  const preset = document.querySelector('input[name="preset"]:checked')?.value || runtimePreset;
+  const chosen = modelsByPreset.get(preset);
+  $("model-choice-summary").textContent = preset === "7b-fp8" ? "7B · 默认" : "30B · 更大模型";
+  $("model-choice-info").textContent = `${chosen ? `${modelStateNames[chosen.state] || chosen.state}${chosen.state === "absent" ? ` · 下载约 ${formatBytes(chosen.expected_bytes)}` : ""}。` : "模型状态待同步。"}提交后自动准备模型，无需手动启动。`;
 }
 
 function renderBenchmark(benchmark) {
@@ -413,28 +460,28 @@ function renderModelList() {
   } else {
     els.modelStorageSummary.textContent = `可用 ${formatBytes(modelCatalog.available_bytes)}`;
   }
-  els.modelList.innerHTML = models.map((model) => {
+  const rows = new Map([...els.modelList.children].map((row) => [row.dataset.preset, row]));
+  models.forEach((model, index) => {
+    let row = rows.get(model.preset);
+    if (!row) {
+      row = document.createElement("div"); row.className = "model-row"; row.dataset.preset = model.preset;
+      row.innerHTML = `<div class="model-row-main"><div class="model-row-title"><strong></strong><span class="model-state"></span></div><span class="model-meta"></span><div class="model-progress" role="progressbar" aria-label="模型下载进度" aria-valuemin="0" aria-valuemax="100"><div></div></div></div><button class="button secondary" type="button"></button>`;
+    }
+    rows.delete(model.preset);
     const progress = modelProgress(model);
     const active = ["benchmarking", "downloading", "verifying"].includes(model.state);
-    const meta = model.state === "ready"
-      ? formatBytes(model.downloaded_bytes)
-      : model.state === "absent"
-        ? `需要 ${formatBytes(model.expected_bytes)}`
-        : `${formatBytes(model.downloaded_bytes)} / ${formatBytes(model.expected_bytes)}${model.bytes_per_second ? ` · ${formatSpeed(model.bytes_per_second)}` : ""}`;
-    let action = `<button class="button secondary" data-model-action="download" data-preset="${model.preset}" type="button">下载</button>`;
-    if (active) action = `<button class="button secondary" data-model-action="pause" data-preset="${model.preset}" type="button">暂停</button>`;
-    else if (model.state === "paused") action = `<button class="button secondary" data-model-action="download" data-preset="${model.preset}" type="button">继续</button>`;
-    else if (model.state === "failed") action = `<button class="button secondary" data-model-action="download" data-preset="${model.preset}" type="button">重试</button>`;
-    else if (model.state === "ready") action = `<button class="button danger-outline" data-model-action="delete" data-preset="${model.preset}" type="button">删除</button>`;
-    return `<div class="model-row">
-      <div class="model-row-main">
-        <div class="model-row-title"><strong>${modelName(model.preset)}</strong><span class="model-state ${model.state}">${modelStateNames[model.state] || model.state}</span></div>
-        <span>${escapeHtml(model.last_error || meta)}</span>
-        ${active || model.state === "paused" ? `<div class="model-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><div style="width:${progress}%"></div></div>` : ""}
-      </div>
-      ${action}
-    </div>`;
-  }).join("");
+    row.querySelector("strong").textContent = modelName(model.preset);
+    const state = row.querySelector(".model-state"); state.textContent = modelStateNames[model.state] || model.state; state.className = `model-state ${model.state}`;
+    row.querySelector(".model-meta").textContent = model.last_error || (model.state === "ready" ? formatBytes(model.downloaded_bytes) : model.state === "absent" ? `需要 ${formatBytes(model.expected_bytes)}` : `${formatBytes(model.downloaded_bytes)} / ${formatBytes(model.expected_bytes)}${model.bytes_per_second ? ` · ${formatSpeed(model.bytes_per_second)}` : ""}`);
+    const bar = row.querySelector(".model-progress"); bar.hidden = !(active || model.state === "paused"); bar.setAttribute("aria-valuenow", progress); bar.firstElementChild.style.width = `${progress}%`;
+    const button = row.querySelector("button");
+    button.dataset.preset = model.preset;
+    button.dataset.modelAction = active ? "pause" : model.state === "ready" ? "delete" : "download";
+    button.textContent = active ? "暂停" : model.state === "ready" ? "删除" : model.state === "paused" ? "继续" : model.state === "failed" ? "重试" : "下载";
+    button.className = `button ${model.state === "ready" ? "danger-outline" : "secondary"}`;
+    if (els.modelList.children[index] !== row) els.modelList.insertBefore(row, els.modelList.children[index] || null);
+  });
+  rows.forEach((row) => row.remove());
   renderBenchmark(modelCatalog.benchmark);
 }
 
@@ -448,6 +495,7 @@ function renderModelCatalog(catalog) {
 function renderRuntime(runtime) {
   const state = runtime.state || "failed";
   runtimeState = state;
+  runtimePresetActive = runtime.preset || null;
   els.runtimeDot.className = "status-dot";
   if (state === "ready") els.runtimeDot.classList.add("ready");
   else if (["starting", "stopping"].includes(state)) els.runtimeDot.classList.add("busy");
@@ -470,7 +518,7 @@ function renderRuntime(runtime) {
     els.runtimeMeta.textContent = "模型已安装 · 等待启动";
   }
   updateRuntimeControls();
-  els.stopRuntime.disabled = ["stopped", "stopping"].includes(state);
+  els.stopRuntime.disabled = !runtimeConnected || ["stopped", "stopping"].includes(state);
 
   const showStartup = ["starting", "failed"].includes(state)
     && (state === "starting" || runtime.startup_stage || runtime.last_error);
@@ -504,15 +552,21 @@ function renderRuntime(runtime) {
   }
 }
 
-async function refreshRuntime(silent = true) {
-  try {
-    const [runtime, catalog] = await Promise.all([api("/api/runtime"), api("/api/models")]);
-    renderModelCatalog(catalog);
-    renderRuntime(runtime);
-  } catch (error) {
-    renderRuntime({ state: "failed", last_error: "无法连接算力舱 Agent" });
-    if (!silent) showToast(error.message);
+async function refreshRuntime() {
+  const [runtime, catalog] = await Promise.allSettled([api("/api/runtime"), api("/api/models")]);
+  runtimeConnected = runtime.status === "fulfilled";
+  catalogConnected = catalog.status === "fulfilled";
+  if (catalogConnected) renderModelCatalog(catalog.value);
+  if (runtimeConnected) renderRuntime(runtime.value);
+  else {
+    els.runtimeDot.className = "status-dot neutral";
+    els.runtimeLabel.textContent = "连接中断";
+    els.runtimeMeta.textContent = "状态暂不可用，正在重连";
+    els.runtimeStartup.hidden = true;
   }
+  $("connection-error").hidden = runtimeConnected && catalogConnected;
+  $("connection-error-text").textContent = !runtimeConnected ? "无法连接算力舱。任务记录独立保留，恢复连接后可继续。" : "模型目录读取失败，正在重试。运行状态仍可查看。";
+  updateRuntimeControls();
 }
 
 async function pollRuntime() {
@@ -523,23 +577,46 @@ async function pollRuntime() {
   runtimePollTimer = setTimeout(pollRuntime, runtimeState === "starting" || modelBusy ? 1000 : 2500);
 }
 
-function updateFile(file) {
+function outputName(name, mode) {
+  const index = name.lastIndexOf(".");
+  const suffix = mode === "replace" ? "translated" : "bilingual";
+  return index < 0 ? `${name}.${suffix}` : `${name.slice(0, index)}.${suffix}${name.slice(index)}`;
+}
+
+function updateFile() {
+  els.fileLabel.textContent = selectedFiles.length ? `已选 ${selectedFiles.length} 个文件 · 点击继续添加` : "选择或拖入文档";
+  els.fileMeta.textContent = selectedFiles.length ? `共 ${formatBytes(selectedFiles.reduce((sum, file) => sum + file.size, 0))}` : "EPUB、DOCX、PDF、字幕、TXT、Markdown";
+  $("upload-list").innerHTML = selectedFiles.map((file, index) => `<li><span title="${escapeAttribute(file.name)}">${escapeHtml(file.name)}<small>${formatBytes(file.size)}</small></span><button type="button" class="icon-button" data-remove-file="${index}" aria-label="移除 ${escapeAttribute(file.name)}">×</button></li>`).join("");
+  const hasDocx = sourceMode === "upload" && selectedFiles.some((file) => file.name.toLowerCase().endsWith(".docx"));
   const replace = document.querySelector('input[name="mode"][value="replace"]');
-  if (!file) {
-    els.fileLabel.textContent = "选择文档";
-    els.fileMeta.textContent = "EPUB、DOCX、PDF、字幕、TXT、Markdown";
-    replace.disabled = false;
-    return;
-  }
-  els.fileLabel.textContent = file.name;
-  els.fileMeta.textContent = `${(file.size / 1024 / 1024).toFixed(2)} MB`;
-  const isDocx = file.name.toLowerCase().endsWith(".docx");
-  replace.disabled = isDocx;
-  if (isDocx && replace.checked) {
+  replace.disabled = hasDocx;
+  $("mode-hint").hidden = !hasDocx;
+  if (hasDocx && replace.checked) {
     const bilingual = document.querySelector('input[name="mode"][value="bilingual"]');
-    bilingual.checked = true;
-    bilingual.dispatchEvent(new Event("change"));
+    bilingual.checked = true; bilingual.dispatchEvent(new Event("change"));
   }
+  updateSaveHint();
+}
+
+function addFiles(files) {
+  const rejected = [];
+  for (const file of files) {
+    const ext = file.name.split(".").pop().toLowerCase();
+    if (!supportedExtensions.has(ext)) { rejected.push(`${file.name}：不支持的格式`); continue; }
+    if (file.size > maxUploadBytes) { rejected.push(`${file.name}：超过 ${formatBytes(maxUploadBytes)}`); continue; }
+    if (!selectedFiles.some((item) => item.name === file.name && item.size === file.size && item.lastModified === file.lastModified)) selectedFiles.push(file);
+  }
+  notice("upload-validation", rejected.join("；"));
+  els.file.value = "";
+  updateFile();
+}
+
+function updateSaveHint() {
+  const mode = document.querySelector('input[name="mode"]:checked')?.value || "bilingual";
+  const example = outputName(selectedFiles[0]?.name || "book.epub", mode);
+  const strategy = document.querySelector('input[name="save_strategy"]:checked')?.value;
+  $("save-hint").textContent = sourceMode !== "upload" && strategy === "sibling_overwrite" ? "覆盖原文件：提交前将列出受影响文件并要求确认。"
+    : `保存副本，例如 ${example}。${saveDirectory != null ? displayStoragePath(saveStorage, saveDirectory) : sourceMode === "upload" ? "完成后下载" : "与来源文件放在同一目录"}`;
 }
 
 function updatePathControls() {
@@ -567,6 +644,7 @@ function updatePathControls() {
   const saveStrategy = document.querySelector('input[name="save_strategy"]:checked')?.value || "sibling_suffix";
   els.mountedSaveOptions.hidden = !mounted;
   els.saveDirectoryGroup.hidden = mounted && saveStrategy !== "directory";
+  updateSaveHint();
 }
 
 function setSourceMode(mode) {
@@ -574,8 +652,11 @@ function setSourceMode(mode) {
   const directory = mode !== "upload";
   els.dropZone.hidden = directory;
   els.sourceDirectory.hidden = !directory;
-  els.file.required = !directory;
-  els.submitLabel.textContent = directory ? "添加所选任务" : "加入翻译队列";
+  els.file.required = false;
+  $("upload-list").hidden = directory;
+  $("upload-hint").hidden = directory;
+  $("upload-validation").hidden = true;
+  updateFile();
   updatePathControls();
 }
 
@@ -751,7 +832,12 @@ function closeFolderDialog() {
   els.folderDialog.close();
 }
 
-els.file.addEventListener("change", () => updateFile(els.file.files[0]));
+els.file.addEventListener("change", () => addFiles(els.file.files));
+$("upload-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-remove-file]");
+  if (!button || submissionBusy) return;
+  selectedFiles.splice(Number(button.dataset.removeFile), 1); updateFile();
+});
 
 ["dragenter", "dragover"].forEach((event) => {
   els.dropZone.addEventListener(event, (e) => {
@@ -768,12 +854,7 @@ els.file.addEventListener("change", () => updateFile(els.file.files[0]));
 });
 
 els.dropZone.addEventListener("drop", (event) => {
-  const file = event.dataTransfer.files[0];
-  if (!file) return;
-  const transfer = new DataTransfer();
-  transfer.items.add(file);
-  els.file.files = transfer.files;
-  updateFile(file);
+  if (!submissionBusy) addFiles(event.dataTransfer.files);
 });
 
 els.sourceDirectory.addEventListener("click", () => openFolderDialog("source"));
@@ -885,7 +966,7 @@ els.newFolderForm.addEventListener("submit", async (event) => {
   }
 });
 
-function selectPreset(preset) {
+function selectPreset(preset, syncJob = true) {
   runtimePreset = preset;
   document.querySelectorAll("[data-runtime-preset]").forEach((button) => {
     const selected = button.dataset.runtimePreset === preset;
@@ -894,7 +975,7 @@ function selectPreset(preset) {
   });
 
   const jobPreset = document.querySelector(`input[name="preset"][value="${preset}"]`);
-  if (jobPreset && !jobPreset.checked) {
+  if (syncJob && jobPreset && !jobPreset.checked) {
     jobPreset.checked = true;
     jobPreset.closest(".segmented").querySelectorAll(".segment").forEach((segment) => {
       segment.classList.toggle("active", segment.contains(jobPreset));
@@ -940,114 +1021,186 @@ document.querySelectorAll(".segmented input").forEach((input) => {
     if (input.name === "preset") selectPreset(input.value);
     if (input.name === "source") setSourceMode(input.value);
     if (input.name === "save_strategy") updatePathControls();
+    if (input.name === "mode") updateSaveHint();
   });
 });
 
 document.querySelectorAll("[data-runtime-preset]").forEach((button) => {
-  button.addEventListener("click", () => selectPreset(button.dataset.runtimePreset));
+  button.addEventListener("click", () => selectPreset(button.dataset.runtimePreset, false));
 });
+
+function submissionRequest() {
+  const form = new FormData(els.form);
+  return {
+    sources: Object.entries(sourceSelections).flatMap(([storage, selections]) => [...selections.keys()].map((path) => ({storage, path}))),
+    save_strategy: form.get("save_strategy"),
+    ...(saveDirectory != null ? {save_storage: saveStorage, save_path: saveDirectory || "."} : {}),
+    preset: form.get("preset"), target: form.get("target"), mode: form.get("mode"),
+    settings: {batch_size: Number(form.get("batch_size")), context_segments: Number(form.get("context_segments")), cache_enabled: $("cache-enabled").checked},
+  };
+}
 
 els.form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (sourceMode === "upload" && !els.file.files[0]) {
-    showToast("请选择文档");
-    return;
-  }
-  const selectedSourceCount = sourceSelections.documents.size + sourceSelections.remote_fs.size;
-  if (sourceMode !== "upload" && selectedSourceCount === 0) {
-    showToast("请从用户文稿或网盘挂载选择文件或目录");
-    return;
-  }
-  const selectedSaveStrategy = document.querySelector('input[name="save_strategy"]:checked')?.value || "sibling_suffix";
-  if (sourceMode !== "upload" && selectedSaveStrategy === "directory" && saveDirectory == null) {
-    showToast("请选择保存位置");
-    return;
-  }
-  els.submit.disabled = true;
+  if (submissionBusy) return;
+  notice("submission-error", "");
+  const request = submissionRequest();
+  if (sourceMode === "upload" && !selectedFiles.length) { notice("submission-error", "请先选择至少一个文档。"); return; }
+  if (sourceMode !== "upload" && !request.sources.length) { notice("submission-error", "请选择来源文件或目录。"); return; }
+  if (sourceMode !== "upload" && request.save_strategy === "directory" && saveDirectory == null) { notice("submission-error", "请选择保存目录。"); return; }
+  submissionBusy = true; els.submit.disabled = true; updateRuntimeControls();
   try {
-    const form = new FormData(els.form);
-    const preset = form.get("preset");
-    const model = modelsByPreset.get(preset);
-    if (!model || !["ready", "benchmarking", "downloading", "verifying"].includes(model.state)) {
-      await requestModelDownload(preset);
-      showToast("模型开始准备，任务会在模型就绪后自动执行");
-    }
-    const settings = {
-      batch_size: Number(form.get("batch_size")),
-      context_segments: Number(form.get("context_segments")),
-      cache_enabled: document.querySelector("#cache-enabled").checked,
-    };
-    if (sourceMode !== "upload") {
-      const sources = Object.entries(sourceSelections).flatMap(([storage, selections]) =>
-        [...selections.keys()].map((path) => ({ storage, path })));
-      const result = await api("/api/jobs/selection", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sources,
-          save_strategy: selectedSaveStrategy,
-          ...(selectedSaveStrategy === "directory" ? {
-            save_storage: saveStorage,
-            save_path: saveDirectory || ".",
-          } : {}),
-          preset: form.get("preset"),
-          target: form.get("target"),
-          mode: form.get("mode"),
-          settings,
-        }),
-      });
-      const skipped = (result.skipped_existing || 0) + (result.skipped_incompatible || 0);
-      showToast(result.jobs.length
-        ? `已加入 ${result.jobs.length} 个任务${skipped ? `，跳过 ${skipped} 个文件` : ""}`
-        : "没有可加入的文件");
-    } else {
-      form.set("cache_enabled", String(settings.cache_enabled));
+    const files = sourceMode === "upload" ? selectedFiles.slice() : [];
+    let preview;
+    if (sourceMode === "upload") {
+      const existing = new Set();
       if (saveDirectory != null) {
-        form.append("save_storage", saveStorage);
-        form.append("save_path", saveDirectory || ".");
+        const query = new URLSearchParams({storage: saveStorage, path: saveDirectory});
+        const listing = await api(`/api/documents?${query}`);
+        listing.entries.forEach((entry) => existing.add(entry.name));
       }
-      await api("/api/jobs", { method: "POST", body: form });
-      els.file.value = "";
-      updateFile(null);
-      showToast("任务已加入队列");
+      const pendingNames = new Set();
+      const previewFiles = files.map((file) => {
+        const name = outputName(file.name, request.mode);
+        const skip_reason = saveDirectory != null && (existing.has(name) || pendingNames.has(name)) ? "输出文件已存在或同批文件重名，不会覆盖" : null;
+        pendingNames.add(name);
+        return {source_path: file.name, save_path: `${saveDirectory ? `${saveDirectory}/` : ""}${name}`, save_storage: saveStorage, skip_reason};
+      });
+      preview = {files: previewFiles, eligible_count: previewFiles.filter((file) => !file.skip_reason).length};
+    } else preview = await api("/api/jobs/selection/preview", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(request)});
+    preparedSubmission = {request, files: files.filter((_, index) => !preview.files[index].skip_reason), sourceMode};
+    const overwrite = preview.files.filter((file) => file.overwrite && !file.skip_reason).length;
+    $("submission-summary").textContent = `将创建 ${preview.eligible_count} 个任务${preview.files.length > preview.eligible_count ? `，跳过 ${preview.files.length - preview.eligible_count} 个文件` : ""} · ${request.target} · ${request.mode === "replace" ? "仅译文" : "双语对照"}${overwrite ? ` · 覆盖 ${overwrite} 个原文件` : ""}`;
+    $("submission-files").innerHTML = preview.files.map((file) => `<div class="preview-file ${file.skip_reason ? "skipped" : ""}"><strong>${escapeHtml(file.source_storage ? displayStoragePath(file.source_storage, file.source_path) : file.source_path)}</strong><span>${file.skip_reason ? `跳过：${escapeHtml(file.skip_reason)}` : `${file.overwrite ? "覆盖原文件" : "保存副本"} → ${escapeHtml(file.save_storage ? displayStoragePath(file.save_storage, file.save_path) : `完成后下载 / ${file.save_path}`)}`}</span></div>`).join("");
+    $("overwrite-confirmation").hidden = !overwrite;
+    $("confirm-overwrite").checked = false;
+    $("confirm-submit").dataset.eligible = preview.eligible_count;
+    $("confirm-submit").disabled = !preview.eligible_count || overwrite > 0;
+    $("submission-dialog").showModal();
+  } catch (error) { notice("submission-error", `无法预览：${error.message}`); }
+  finally { submissionBusy = false; els.submit.disabled = false; updateRuntimeControls(); }
+});
+
+$("confirm-overwrite").addEventListener("change", () => { $("confirm-submit").disabled = !$("confirm-overwrite").checked || !Number($("confirm-submit").dataset.eligible); });
+
+function uploadFile(file, request, index, count) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest(); uploadRequest = xhr;
+    $("upload-progress-label").textContent = `上传 ${index + 1}/${count}：${file.name}`;
+    $("upload-meter").value = 0;
+    xhr.open("POST", "/api/jobs");
+    xhr.timeout = 30 * 60 * 1000;
+    xhr.upload.onprogress = (event) => {
+      $("upload-progress-label").textContent = `上传 ${index + 1}/${count}：${file.name}${event.lengthComputable ? ` · ${Math.round(event.loaded / event.total * 100)}%` : ""}`;
+      if (event.lengthComputable) $("upload-meter").value = event.loaded / event.total * 100;
+      else $("upload-meter").removeAttribute("value");
+    };
+    xhr.onload = () => {
+      uploadRequest = null;
+      let response; try { response = JSON.parse(xhr.responseText); } catch { response = {}; }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(response);
+      else reject(new Error(response.error || `上传失败 (${xhr.status})`));
+    };
+    xhr.onerror = () => { uploadRequest = null; reject(new Error("上传连接中断，请重试。")); };
+    xhr.ontimeout = () => { uploadRequest = null; reject(new Error("上传超时，请重试。")); };
+    xhr.onabort = () => { uploadRequest = null; reject(new Error("已取消上传；已经加入队列的任务不会取消。")); };
+    const form = new FormData(); form.append("file", file);
+    for (const key of ["preset", "target", "mode", "save_storage", "save_path"]) if (request[key] != null) form.append(key, request[key]);
+    for (const [key, value] of Object.entries(request.settings)) form.append(key, String(value));
+    xhr.send(form);
+  });
+}
+
+$("cancel-upload").addEventListener("click", () => { uploadCancelled = true; uploadRequest?.abort(); });
+$("confirm-submit").addEventListener("click", async () => {
+  if (!preparedSubmission || submissionBusy) return;
+  const submission = preparedSubmission;
+  $("submission-dialog").close();
+  submissionBusy = true; uploadCancelled = false;
+  els.submit.disabled = true; updateRuntimeControls();
+  els.form.querySelectorAll("input, select, button:not(#cancel-upload)").forEach((control) => { control.dataset.wasDisabled = String(control.disabled); control.disabled = true; });
+  let added = 0;
+  try {
+    const model = modelsByPreset.get(submission.request.preset);
+    if (!model || !["ready", "benchmarking", "downloading", "verifying"].includes(model.state)) await requestModelDownload(submission.request.preset);
+    if (submission.sourceMode === "upload") {
+      $("upload-progress").hidden = false;
+      for (const [index, file] of submission.files.entries()) {
+        if (uploadCancelled) throw new Error("已停止后续上传；已经加入队列的任务不会取消。");
+        await uploadFile(file, submission.request, index, submission.files.length);
+        added += 1; selectedFiles = selectedFiles.filter((item) => item !== file); updateFile();
+      }
+    } else {
+      const result = await api("/api/jobs/selection", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(submission.request)});
+      added = result.jobs.length;
+      const skipped = (result.skipped_existing || 0) + (result.skipped_incompatible || 0) + (result.skipped_unsupported || 0) + (result.skipped_generated || 0);
+      if (skipped) notice("submission-error", `已加入 ${added} 个任务；提交时发现 ${skipped} 个文件不兼容、已生成译文或输出已存在，已跳过。`);
     }
-    await showFirstJobPage(false);
-  } catch (error) {
-    showToast(error.message);
-  } finally {
-    els.submit.disabled = false;
+    showToast(`已加入 ${added} 个任务，模型就绪后自动执行`);
+    switchWorkspace("jobs");
+  } catch (error) { notice("submission-error", `${added ? `已加入 ${added} 个任务。` : ""}${error.message} 未提交的文件已保留。`); }
+  finally {
+    submissionBusy = false; $("upload-progress").hidden = true;
+    els.form.querySelectorAll("[data-was-disabled]").forEach((control) => { control.disabled = control.dataset.wasDisabled === "true"; delete control.dataset.wasDisabled; });
+    els.submit.disabled = false; updateFile(); updateRuntimeControls();
+    await showFirstJobPage(); await refreshActiveJobs();
   }
 });
 
-els.jobsBody.addEventListener("click", async (event) => {
+function updateJobDetail() {
+  const job = currentJobs.find((item) => item.id === detailJobId);
+  if (!job) return;
+  const content = $("job-detail-content");
+  const fields = {
+    "文件": job.filename, "状态": jobStatusLabel(job), "翻译": `${job.target} · ${job.mode === "replace" ? "仅译文" : "双语对照"} · ${modelName(job.preset)}`,
+    "进度": `已处理 ${job.completed}/${job.total} 段，已译 ${job.translated} 段，失败 ${job.failed_segments} 段`,
+    "来源": job.source_path ? displayStoragePath(job.source_storage, job.source_path) : "上传文件",
+    "保存": job.save_path ? displayStoragePath(job.save_storage, job.save_path) : "任务内保存，完成后下载",
+    "创建时间": formatTime(job.created_at), "错误": job.error || "无",
+  };
+  if (!content.firstElementChild) {
+    content.innerHTML = `<dl>${Object.keys(fields).map((label) => `<dt>${label}</dt><dd></dd>`).join("")}</dl><p class="helper-text">重试会优先复用本任务已完成的翻译。旧版本任务若缺少翻译记录，可能需要重新翻译。</p>`;
+  }
+  Object.values(fields).forEach((value, index) => {
+    const node = content.querySelectorAll("dd")[index];
+    if (node.textContent !== value) node.textContent = value;
+  });
+  // Keep action nodes stable while progress changes.
+  const actions = $("job-detail-actions");
+  if (actions.dataset.id !== job.id) {
+    actions.dataset.id = job.id;
+    actions.innerHTML = `<button class="button primary" data-action="download">下载结果</button><button class="button secondary" data-action="retry">重试</button><button class="button secondary" data-action="cancel">取消任务</button><button class="button danger-outline" data-action="delete">删除记录</button>`;
+    actions.querySelectorAll("button").forEach((button) => { button.dataset.id = job.id; });
+  }
+  const download = actions.querySelector('[data-action="download"]');
+  download.hidden = !(job.status === "completed" || job.result_available); download.textContent = isPartial(job) ? "下载部分结果" : "下载结果";
+  const retry = actions.querySelector('[data-action="retry"]'); retry.hidden = !canRetry(job); retry.textContent = job.status === "completed" ? "补译未完成段落" : "继续 / 重试";
+  actions.querySelector('[data-action="cancel"]').hidden = ["completed", "failed", "cancelled"].includes(job.status);
+  actions.querySelector('[data-action="delete"]').hidden = !["completed", "failed", "cancelled"].includes(job.status);
+}
+
+async function handleJobAction(event) {
   const button = event.target.closest("[data-action]");
-  if (!button) return;
-  if (button.dataset.action === "download") {
-    window.location.href = `/api/jobs/${button.dataset.id}/result`;
-    return;
+  if (!button || button.disabled) return;
+  const {action, id} = button.dataset;
+  if (action === "details") {
+    detailJobId = id; notice("job-detail-error", ""); updateJobDetail(); $("job-detail-dialog").showModal(); return;
   }
-  if (button.dataset.action === "delete" && !window.confirm("删除这条记录及其任务文件？")) {
-    return;
-  }
+  if (action === "download") { window.location.href = `/api/jobs/${id}/result`; return; }
+  if (action === "delete" && !window.confirm("删除这条记录及任务内文件？保存到文稿或网盘的结果不会删除。")) return;
   button.disabled = true;
   try {
-    if (button.dataset.action === "delete") {
-      await api(`/api/jobs/${button.dataset.id}`, { method: "DELETE" });
-      showToast("记录已删除");
-    } else if (button.dataset.action === "retry") {
-      await api(`/api/jobs/${button.dataset.id}/retry`, { method: "POST" });
-      showToast("任务已重新加入队列");
-    } else {
-      await api(`/api/jobs/${button.dataset.id}/cancel`, { method: "POST" });
-      showToast("任务已取消");
-    }
+    await api(`/api/jobs/${id}${action === "delete" ? "" : `/${action}`}`, {method: action === "delete" ? "DELETE" : "POST"});
+    showToast(action === "delete" ? "记录已删除" : action === "retry" ? "已排队，将复用已完成的翻译" : "任务已取消，已生成的部分结果仍可下载");
+    if (action === "delete") $("job-detail-dialog").close();
     await refreshJobs();
   } catch (error) {
-    showToast(error.message);
-  } finally {
-    button.disabled = false;
-  }
-});
+    if ($("job-detail-dialog").open) notice("job-detail-error", error.message);
+    else { jobsError = error.message; renderJobsState(); }
+  } finally { button.disabled = false; }
+}
+els.jobsBody.addEventListener("click", handleJobAction);
+$("job-detail-actions").addEventListener("click", handleJobAction);
 
 els.startRuntime.addEventListener("click", async () => {
   els.startRuntime.disabled = true;
@@ -1149,7 +1302,7 @@ els.stopRuntime.addEventListener("click", async () => {
   } catch (error) {
     showToast(error.message);
   } finally {
-    els.stopRuntime.disabled = false;
+    updateRuntimeControls();
   }
 });
 
@@ -1178,7 +1331,14 @@ els.jobsNext.addEventListener("click", async () => {
   await refreshJobs(false);
 });
 
+$("retry-jobs").addEventListener("click", () => refreshJobs());
+$("retry-connection").addEventListener("click", () => refreshRuntime());
+$("empty-create").addEventListener("click", () => { switchWorkspace("create"); els.file.click(); });
 setSourceMode("upload");
-refreshJobs(false);
+api("/api/config").then((config) => {
+  maxUploadBytes = config.max_upload_bytes || maxUploadBytes;
+  $("upload-hint").textContent = `支持多文件 · 单文件最大 ${formatBytes(maxUploadBytes)}`;
+}).catch(() => {});
+refreshJobs();
 pollRuntime();
 refreshActiveJobs();

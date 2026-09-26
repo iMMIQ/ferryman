@@ -157,7 +157,21 @@ struct InstalledMarker<'a> {
 }
 
 impl ModelManager {
+    #[cfg(test)]
     pub async fn new(model_root: PathBuf, cache_root: PathBuf) -> Result<Self, String> {
+        let manager = Self::initialize(model_root, cache_root).await?;
+        manager.rescan().await;
+        Ok(manager)
+    }
+
+    pub async fn new_background(model_root: PathBuf, cache_root: PathBuf) -> Result<Self, String> {
+        let manager = Self::initialize(model_root, cache_root).await?;
+        let scanning = manager.clone();
+        tokio::spawn(async move { scanning.rescan().await });
+        Ok(manager)
+    }
+
+    async fn initialize(model_root: PathBuf, cache_root: PathBuf) -> Result<Self, String> {
         tokio::fs::create_dir_all(&model_root)
             .await
             .map_err(|error| format!("create model directory: {error}"))?;
@@ -176,7 +190,12 @@ impl ModelManager {
                 model_root,
                 cache_root,
                 client,
-                models: RwLock::new(HashMap::new()),
+                models: RwLock::new(
+                    [Preset::SevenBFp8, Preset::ThirtyBFp8]
+                        .into_iter()
+                        .map(|preset| (preset, initial_status(preset, ModelPhase::Verifying, 0)))
+                        .collect(),
+                ),
                 downloads: Mutex::new(HashMap::new()),
                 benchmark: RwLock::new(BenchmarkStatus {
                     state: BenchmarkPhase::Idle,
@@ -187,7 +206,6 @@ impl ModelManager {
                 benchmark_cancel: Mutex::new(None),
             }),
         };
-        manager.rescan().await;
         Ok(manager)
     }
 
@@ -222,6 +240,7 @@ impl ModelManager {
             .unwrap_or_else(|| initial_status(preset, ModelPhase::Absent, 0))
     }
 
+    #[cfg(test)]
     pub async fn is_ready(&self, preset: Preset) -> bool {
         self.status(preset).await.state == ModelPhase::Ready
     }
@@ -238,7 +257,10 @@ impl ModelManager {
     }
 
     pub async fn start_download(&self, preset: Preset, source: SourceId) -> Result<(), String> {
-        if self.is_ready(preset).await {
+        if matches!(
+            self.status(preset).await.state,
+            ModelPhase::Ready | ModelPhase::Verifying
+        ) {
             return Ok(());
         }
         let mut downloads = self.inner.downloads.lock().await;
@@ -296,6 +318,9 @@ impl ModelManager {
     }
 
     pub async fn delete_model(&self, preset: Preset) -> Result<(), String> {
+        if self.status(preset).await.state == ModelPhase::Verifying {
+            return Err("wait for model verification before deleting the model".into());
+        }
         if self.inner.downloads.lock().await.contains_key(&preset) {
             return Err("pause the download before deleting the model".to_string());
         }
@@ -1263,6 +1288,28 @@ fn now_epoch_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn initial_scan_exposes_verifying_and_blocks_model_mutations() {
+        let root = tempfile::tempdir().unwrap();
+        let manager =
+            ModelManager::initialize(root.path().join("models"), root.path().join("cache"))
+                .await
+                .unwrap();
+        let preset = Preset::SevenBFp8;
+        assert_eq!(manager.catalog().await.models.len(), 2);
+        assert_eq!(manager.status(preset).await.state, ModelPhase::Verifying);
+        assert!(!manager.is_ready(preset).await);
+        manager
+            .start_download(preset, SourceId::Auto)
+            .await
+            .unwrap();
+        assert!(manager.inner.downloads.lock().await.is_empty());
+        assert!(manager.delete_model(preset).await.is_err());
+        manager.rescan().await;
+        assert_eq!(manager.status(preset).await.state, ModelPhase::Absent);
+        assert!(manager.delete_model(preset).await.is_ok());
+    }
 
     #[test]
     fn modelscope_wins_near_ties() {

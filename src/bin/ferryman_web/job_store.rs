@@ -7,15 +7,13 @@ use ferryman::settings::TranslationSettings;
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex as StdMutex};
-use tokio::task;
 use uuid::Uuid;
 
 const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Clone)]
 pub(crate) struct JobStore {
-    connection: Arc<StdMutex<Connection>>,
+    connection: tokio_rusqlite::Connection,
 }
 
 #[derive(Clone, Debug)]
@@ -39,32 +37,35 @@ pub(crate) enum RetryJobOutcome {
 
 impl JobStore {
     pub(crate) async fn open(path: PathBuf) -> Result<Self> {
-        task::spawn_blocking(move || {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let connection = Connection::open(&path)
-                .with_context(|| format!("open job database {}", path.display()))?;
-            connection.execute_batch(
-                "PRAGMA journal_mode=WAL;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let store = Self {
+            connection: tokio_rusqlite::Connection::open(&path)
+                .await
+                .with_context(|| format!("open job database {}", path.display()))?,
+        };
+        store
+            .call(|connection| {
+                connection.execute_batch(
+                    "PRAGMA journal_mode=WAL;
                  PRAGMA synchronous=NORMAL;
                  PRAGMA foreign_keys=ON;
                  PRAGMA busy_timeout=5000;",
-            )?;
-            let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            if version == 0 {
-                create_schema(&connection)?;
-            } else if version != SCHEMA_VERSION {
-                anyhow::bail!(
-                    "unsupported job database schema {version}; expected {SCHEMA_VERSION}"
-                );
-            }
-            Ok(Self {
-                connection: Arc::new(StdMutex::new(connection)),
+                )?;
+                let version: i64 =
+                    connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+                if version == 0 {
+                    create_schema(connection)?;
+                } else if version != SCHEMA_VERSION {
+                    anyhow::bail!(
+                        "unsupported job database schema {version}; expected {SCHEMA_VERSION}"
+                    );
+                }
+                Ok(())
             })
-        })
-        .await
-        .context("join database initialization")?
+            .await?;
+        Ok(store)
     }
 
     async fn call<T, F>(&self, operation: F) -> Result<T>
@@ -72,15 +73,12 @@ impl JobStore {
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
-        let connection = self.connection.clone();
-        task::spawn_blocking(move || {
-            let mut connection = connection
-                .lock()
-                .map_err(|_| anyhow::anyhow!("job database lock poisoned"))?;
-            operation(&mut connection)
-        })
-        .await
-        .context("join database operation")?
+        // Keep domain errors intact, while the library owns serialization and
+        // the dedicated SQLite thread. A closed worker is reported, not panicked.
+        self.connection
+            .call(move |connection| Ok(operation(connection)))
+            .await
+            .context("database worker")?
     }
 
     pub(crate) async fn insert(&self, entry: JobEntry, active_limit: usize) -> Result<()> {

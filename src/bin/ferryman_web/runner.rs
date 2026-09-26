@@ -15,6 +15,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
+#[cfg(test)]
 use uuid::Uuid;
 
 async fn ensure_safe_output_parent(root: &FsPath, target: &FsPath) -> Result<PathBuf> {
@@ -92,31 +93,42 @@ async fn save_job_result(entry: &JobEntry) -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     }
-    let temp = parent.join(format!(".ferryman-{}.tmp", Uuid::new_v4()));
+    let temporary = tokio::task::spawn_blocking(move || {
+        let mut builder = tempfile::Builder::new();
+        // User-visible outputs retain the previous create(0666 & umask) policy.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o666));
+        }
+        builder.tempfile_in(parent)
+    })
+    .await??;
+    let (file, temporary) = temporary.into_parts();
     let copy_result = async {
         let mut source = tokio::fs::File::open(&entry.output).await?;
-        let mut destination = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .await?;
+        let mut destination = tokio::fs::File::from_std(file);
         tokio::io::copy(&mut source, &mut destination).await?;
         destination.sync_all().await?;
+        drop(destination);
         if retry_replace {
             anyhow::ensure!(
                 files_are_identical(&retry_base, &target).await?,
                 "保存位置在补译期间被修改，结果已保留在任务内，请下载后另存"
             );
         }
-        if overwrite {
-            tokio::fs::rename(&temp, &target).await?;
-        } else {
-            tokio::fs::hard_link(&temp, &target).await?;
-        }
+        let destination = target.clone();
+        tokio::task::spawn_blocking(move || {
+            if overwrite {
+                temporary.persist(destination)
+            } else {
+                temporary.persist_noclobber(destination)
+            }
+        })
+        .await??;
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    let _ = tokio::fs::remove_file(&temp).await;
     copy_result.with_context(|| format!("save result to {}", target.display()))
 }
 

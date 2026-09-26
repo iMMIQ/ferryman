@@ -45,6 +45,7 @@ pub struct Segment {
     Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Deserialize, serde::Serialize,
 )]
 #[serde(rename_all = "snake_case")]
+#[derive(ts_rs::TS)]
 pub enum OutputMode {
     /// Keep the original and add the translation alongside (bilingual).
     #[value(name = "bilingual")]

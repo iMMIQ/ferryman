@@ -4,9 +4,11 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+#[cfg(test)]
+use ferryman::auth::hmac_token;
+use ferryman::auth::{hash_token, verify_pairing_proof};
 use ferryman::preset::{Preset, PresetConfig};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::path::{Path as FsPath, PathBuf};
@@ -14,6 +16,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
@@ -74,7 +77,7 @@ impl AgentAuth {
         let supplied = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
         let expected = self.token_hash.read().await;
         match expected.as_ref() {
-            Some(expected) if constant_time_eq(&hash_token(supplied), expected) => Ok(()),
+            Some(expected) if bool::from(hash_token(supplied).ct_eq(expected)) => Ok(()),
             _ => Err(StatusCode::UNAUTHORIZED),
         }
     }
@@ -93,7 +96,7 @@ impl AgentAuth {
         let supplied_hash = hash_token(&request.token);
         let mut expected = self.token_hash.write().await;
         if let Some(current) = expected.as_ref() {
-            return Ok(constant_time_eq(&supplied_hash, current));
+            return Ok(bool::from(supplied_hash.ct_eq(current)));
         }
         let challenge = self.challenge.write().await.take();
         let Some((nonce, issued_at)) = challenge else {
@@ -102,7 +105,7 @@ impl AgentAuth {
         if issued_at.elapsed() > Duration::from_secs(60) || nonce != request.nonce {
             anyhow::bail!("pairing challenge expired");
         }
-        if request.proof != hmac_token(&request.token, &nonce) {
+        if !verify_pairing_proof(&request.token, &nonce, &request.proof) {
             anyhow::bail!("invalid pairing proof");
         }
         let state_file = self
@@ -113,6 +116,17 @@ impl AgentAuth {
         *expected = Some(supplied_hash);
         Ok(true)
     }
+}
+
+async fn require_agent_auth(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if state.auth.authorize(request.headers()).await.is_err() {
+        return unauthorized_response();
+    }
+    next.run(request).await
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -129,51 +143,11 @@ fn validate_token(token: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn hash_token(token: &str) -> [u8; 32] {
-    Sha256::digest(token.as_bytes()).into()
-}
-
-fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
-    left.iter()
-        .zip(right.iter())
-        .fold(0u8, |diff, (left, right)| diff | (left ^ right))
-        == 0
-}
-
-fn format_token_hash(hash: &[u8; 32]) -> String {
-    hash.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 fn parse_token_hash(value: &str) -> anyhow::Result<[u8; 32]> {
-    if value.len() != 64 {
-        anyhow::bail!("invalid agent auth state");
-    }
-    let mut hash = [0u8; 32];
-    for (index, byte) in hash.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| anyhow::anyhow!("invalid agent auth state"))?;
-    }
+    let mut hash = [0; 32];
+    hex::decode_to_slice(value, &mut hash)
+        .map_err(|_| anyhow::anyhow!("invalid agent auth state"))?;
     Ok(hash)
-}
-
-fn hmac_token(token: &str, nonce: &str) -> String {
-    let mut key = [0u8; 64];
-    key[..32].copy_from_slice(&hash_token(token));
-    let mut inner = Sha256::new();
-    for byte in &key {
-        inner.update([byte ^ 0x36]);
-    }
-    inner.update(nonce.as_bytes());
-    let inner = inner.finalize();
-    let mut outer = Sha256::new();
-    for byte in &key {
-        outer.update([byte ^ 0x5c]);
-    }
-    outer.update(inner);
-    let digest = outer.finalize();
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&digest);
-    format_token_hash(&result)
 }
 
 async fn persist_token_hash(path: &FsPath, hash: &[u8; 32]) -> anyhow::Result<()> {
@@ -181,9 +155,7 @@ async fn persist_token_hash(path: &FsPath, hash: &[u8; 32]) -> anyhow::Result<()
         .parent()
         .ok_or_else(|| anyhow::anyhow!("FERRYMAN_AUTH_STATE_FILE needs a parent directory"))?;
     tokio::fs::create_dir_all(parent).await?;
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    tokio::fs::write(&temporary, format_token_hash(hash)).await?;
-    tokio::fs::rename(&temporary, path).await?;
+    ferryman::atomic_file::write(path.to_path_buf(), hex::encode(hash).into_bytes()).await?;
     Ok(())
 }
 
@@ -213,6 +185,7 @@ struct Controller {
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(ts_rs::TS)]
 enum RuntimePhase {
     Stopped,
     Starting,
@@ -223,6 +196,7 @@ enum RuntimePhase {
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(ts_rs::TS)]
 enum StartupStage {
     StartingProcess,
     LoadingWeights,
@@ -233,7 +207,7 @@ enum StartupStage {
     Failed,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ts_rs::TS)]
 struct RuntimeStatus {
     state: RuntimePhase,
     preset: Option<Preset>,
@@ -728,20 +702,20 @@ impl RuntimeManager {
         self.phase = RuntimePhase::Stopping;
         self.publish();
         let pid = child.id().unwrap_or_default();
-        if pid != 0 {
-            let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
-            unsafe {
-                libc::kill(-(pid as i32), signal);
-            }
+        if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+            let signal = if force {
+                rustix::process::Signal::KILL
+            } else {
+                rustix::process::Signal::TERM
+            };
+            let _ = rustix::process::kill_process_group(pid, signal);
         }
         if tokio::time::timeout(Duration::from_secs(20), child.wait())
             .await
             .is_err()
         {
-            if pid != 0 {
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
-                }
+            if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
             }
             let _ = child.wait().await;
         }
@@ -1010,26 +984,13 @@ async fn pipe_logs<R>(
 }
 
 fn sanitize_log_line(line: &str) -> String {
-    let mut result = String::with_capacity(line.len().min(MAX_LOG_LINE_CHARS));
-    let mut chars = line.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            if chars.next() == Some('[') {
-                for code in chars.by_ref() {
-                    if ('@'..='~').contains(&code) {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        if !ch.is_control() || ch == '\t' {
-            result.push(ch);
-            if result.chars().count() >= MAX_LOG_LINE_CHARS {
-                result.push_str("...");
-                break;
-            }
-        }
+    let stripped = strip_ansi_escapes::strip_str(line);
+    let mut chars = stripped
+        .chars()
+        .filter(|ch| !ch.is_control() || *ch == '\t');
+    let mut result: String = chars.by_ref().take(MAX_LOG_LINE_CHARS).collect();
+    if chars.next().is_some() {
+        result.push_str("...");
     }
     result.trim().to_string()
 }
@@ -1131,29 +1092,19 @@ async fn pair_agent(State(state): State<AppState>, Json(request): Json<PairReque
     }
 }
 
-async fn runtime_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if state.auth.authorize(&headers).await.is_err() {
-        return unauthorized_response();
-    }
+async fn runtime_status(State(state): State<AppState>) -> Response {
     Json(state.controller.snapshot()).into_response()
 }
 
-async fn model_catalog(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if state.auth.authorize(&headers).await.is_err() {
-        return unauthorized_response();
-    }
+async fn model_catalog(State(state): State<AppState>) -> Response {
     Json(state.models.catalog().await).into_response()
 }
 
 async fn start_model_download(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(preset): Path<Preset>,
     Json(request): Json<DownloadRequest>,
 ) -> Response {
-    if state.auth.authorize(&headers).await.is_err() {
-        return unauthorized_response();
-    }
     match state.models.start_download(preset, request.source).await {
         Ok(()) => (StatusCode::ACCEPTED, Json(state.models.catalog().await)).into_response(),
         Err(error) => (StatusCode::CONFLICT, Json(ErrorBody { error })).into_response(),
@@ -1162,26 +1113,15 @@ async fn start_model_download(
 
 async fn pause_model_download(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(preset): Path<Preset>,
 ) -> Response {
-    if state.auth.authorize(&headers).await.is_err() {
-        return unauthorized_response();
-    }
     match state.models.pause_download(preset).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(error) => (StatusCode::CONFLICT, Json(ErrorBody { error })).into_response(),
     }
 }
 
-async fn delete_model(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(preset): Path<Preset>,
-) -> Response {
-    if state.auth.authorize(&headers).await.is_err() {
-        return unauthorized_response();
-    }
+async fn delete_model(State(state): State<AppState>, Path(preset): Path<Preset>) -> Response {
     let runtime = state.controller.snapshot();
     if runtime.preset == Some(preset) && runtime.state != RuntimePhase::Stopped {
         return (
@@ -1205,37 +1145,24 @@ struct BenchmarkRequest {
 
 async fn start_source_benchmark(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(request): Json<BenchmarkRequest>,
 ) -> Response {
-    if state.auth.authorize(&headers).await.is_err() {
-        return unauthorized_response();
-    }
     match state.models.start_benchmark(request.preset).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(error) => (StatusCode::CONFLICT, Json(ErrorBody { error })).into_response(),
     }
 }
 
-async fn cancel_source_benchmark(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if state.auth.authorize(&headers).await.is_err() {
-        return unauthorized_response();
-    }
+async fn cancel_source_benchmark(State(state): State<AppState>) -> Response {
     state.models.cancel_benchmark().await;
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn storage_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if state.auth.authorize(&headers).await.is_err() {
-        return unauthorized_response();
-    }
+async fn storage_status(State(state): State<AppState>) -> Response {
     Json(state.models.storage_status().await).into_response()
 }
 
-async fn clear_runtime_cache(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if state.auth.authorize(&headers).await.is_err() {
-        return unauthorized_response();
-    }
+async fn clear_runtime_cache(State(state): State<AppState>) -> Response {
     if state.controller.snapshot().state != RuntimePhase::Stopped {
         return (
             StatusCode::CONFLICT,
@@ -1255,12 +1182,8 @@ async fn clear_runtime_cache(State(state): State<AppState>, headers: HeaderMap) 
 
 async fn acquire_runtime(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(request): Json<AcquireRequest>,
 ) -> Response {
-    if state.auth.authorize(&headers).await.is_err() {
-        return unauthorized_response();
-    }
     let model = state.models.status(request.preset).await;
     if model.state != ModelPhase::Ready {
         if let Err(error) = state.models.ensure_download(request.preset).await {
@@ -1280,38 +1203,21 @@ async fn acquire_runtime(
     }
 }
 
-async fn release_runtime(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(lease_id): Path<String>,
-) -> Response {
-    if state.auth.authorize(&headers).await.is_err() {
-        return unauthorized_response();
-    }
+async fn release_runtime(State(state): State<AppState>, Path(lease_id): Path<String>) -> Response {
     match state.controller.release(lease_id).await {
         Ok(status) => Json(status).into_response(),
         Err(error) => (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorBody { error })).into_response(),
     }
 }
 
-async fn stop_runtime(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<StopRequest>,
-) -> Response {
-    if state.auth.authorize(&headers).await.is_err() {
-        return unauthorized_response();
-    }
+async fn stop_runtime(State(state): State<AppState>, Json(request): Json<StopRequest>) -> Response {
     match state.controller.stop(request.force).await {
         Ok(status) => Json(status).into_response(),
         Err(error) => (StatusCode::CONFLICT, Json(ErrorBody { error })).into_response(),
     }
 }
 
-async fn proxy_chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if state.auth.authorize(&headers).await.is_err() {
-        return unauthorized_response();
-    }
+async fn proxy_chat(State(state): State<AppState>, body: Bytes) -> Response {
     if state.controller.snapshot().state != RuntimePhase::Ready {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1457,10 +1363,21 @@ async fn main() -> anyhow::Result<()> {
         auth,
         vllm_endpoint: Arc::from(vllm_endpoint),
     };
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/pair/challenge", get(pair_challenge))
-        .route("/pair", post(pair_agent))
+    let app = agent_router(state);
+
+    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    info!(%listen, "Ferryman AI Pod agent listening");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    if let Err(error) = controller.stop(true).await {
+        warn!(%error, "could not stop vLLM during shutdown");
+    }
+    Ok(())
+}
+
+fn agent_router(state: AppState) -> Router {
+    Router::new()
         .route("/runtime", get(runtime_status))
         .route("/runtime/acquire", post(acquire_runtime))
         .route("/runtime/leases/{lease_id}", delete(release_runtime))
@@ -1476,18 +1393,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/storage", get(storage_status))
         .route("/cache", delete(clear_runtime_cache))
         .route("/v1/chat/completions", post(proxy_chat))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_agent_auth,
+        ))
+        .route("/healthz", get(healthz))
+        .route("/pair/challenge", get(pair_challenge))
+        .route("/pair", post(pair_agent))
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(&listen).await?;
-    info!(%listen, "Ferryman AI Pod agent listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    if let Err(error) = controller.stop(true).await {
-        warn!(%error, "could not stop vLLM during shutdown");
-    }
-    Ok(())
+        .with_state(state)
 }
 
 async fn shutdown_signal() {
@@ -1545,6 +1459,116 @@ mod tests {
     #[test]
     fn strips_ansi_and_control_characters() {
         assert_eq!(sanitize_log_line("\u{1b}[32mready\u{1b}[0m\u{7}"), "ready");
+        assert_eq!(
+            sanitize_log_line("\u{1b}]0;SECRET_TITLE\u{7}visible"),
+            "visible"
+        );
+        assert_eq!(
+            sanitize_log_line("\u{1b}]8;;https://example.com\u{1b}\\link\u{1b}]8;;\u{1b}\\"),
+            "link"
+        );
+        assert_eq!(
+            sanitize_log_line(&"中".repeat(MAX_LOG_LINE_CHARS + 2)),
+            format!("{}...", "中".repeat(MAX_LOG_LINE_CHARS))
+        );
+        assert!(parse_token_hash(&format!("A{}", "中".repeat(21))).is_err());
+    }
+
+    #[tokio::test]
+    async fn protected_routes_authenticate_before_reading_bodies_and_pairing_stays_public() {
+        let root = tempfile::tempdir().unwrap();
+        let token = "auth-middleware-test-token";
+        let (commands, _receiver) = mpsc::channel(1);
+        let (_, status) = watch::channel(RuntimeStatus {
+            state: RuntimePhase::Stopped,
+            preset: None,
+            pid: None,
+            active_requests: 0,
+            leases: 0,
+            idle_timeout_seconds: 600,
+            updated_at: 0,
+            last_error: None,
+            startup_stage: None,
+            startup_progress: 0,
+            startup_elapsed_seconds: None,
+            estimated_remaining_seconds: None,
+            recent_logs: vec![],
+        });
+        let state = AppState {
+            controller: Controller {
+                commands,
+                status,
+                active_requests: Arc::new(AtomicUsize::new(0)),
+            },
+            models: ModelManager::new(root.path().join("models"), root.path().join("cache"))
+                .await
+                .unwrap(),
+            client: reqwest::Client::new(),
+            auth: AgentAuth::load(Some(token.into()), None).await.unwrap(),
+            vllm_endpoint: Arc::from("http://127.0.0.1:1"),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server =
+            tokio::spawn(async move { axum::serve(listener, agent_router(state)).await.unwrap() });
+        let client = reqwest::Client::new();
+        for path in [
+            "/runtime/acquire",
+            "/runtime/stop",
+            "/models/7b-fp8/download",
+            "/models/7b-fp8/pause",
+            "/model-sources/benchmark",
+            "/v1/chat/completions",
+        ] {
+            let response = client
+                .post(format!("{origin}{path}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body("invalid JSON")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+        for path in ["/runtime", "/models", "/storage"] {
+            assert_eq!(
+                client
+                    .get(format!("{origin}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            client
+                .get(format!("{origin}/runtime"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(format!("{origin}/healthz"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_ne!(
+            client
+                .get(format!("{origin}/pair/challenge"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -1583,4 +1607,19 @@ mod tests {
         assert!(reloaded.authorize(&valid).await.is_ok());
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "run via npm run types:generate or types:check"]
+fn export_frontend_types() {
+    use ts_rs::TS;
+    let config = ts_rs::Config::new().with_large_int("number").with_out_dir(
+        std::env::var_os("FERRYMAN_TYPES_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/lib/generated")
+            }),
+    );
+    RuntimeStatus::export_all(&config).unwrap();
 }

@@ -1,7 +1,9 @@
-import { reactive, computed, onMounted, onUnmounted } from "vue";
-import { api, json, latestQuery, isCancelled } from "../lib/api";
+import { useQuery, useQueryClient } from "@tanstack/vue-query";
+import { reactive, computed, onUnmounted, useId, watch } from "vue";
+import { api, json, isCancelled } from "../lib/api";
 import { errorText, outputName, bytes } from "../lib/format";
 import type {
+  ClientConfig,
   Source,
   RequestData,
   Preview,
@@ -50,7 +52,20 @@ export function useSubmission(
         s.sourceMode === "upload" &&
         s.files.some((f) => f.name.toLowerCase().endsWith(".docx")),
     );
-  const scope = latestQuery();
+  const client = useQueryClient();
+  const previewKey = ["submission-preview", useId()];
+  const config = useQuery({
+    queryKey: ["config"],
+    queryFn: ({ signal }) => api<ClientConfig>("/api/config", { signal }),
+    staleTime: Infinity,
+  });
+  watch(
+    config.data,
+    (data) => {
+      if (data) s.maxBytes = data.max_upload_bytes;
+    },
+    { immediate: true },
+  );
   let snapshot: Snapshot | undefined,
     upload: XMLHttpRequest | undefined,
     cancelled = false;
@@ -133,45 +148,54 @@ export function useSubmission(
       save = s.save ? { ...s.save } : null;
     // Capture all inputs before the first await. Neither rendering nor submission
     // reads the live draft again until this operation is complete or discarded.
-    const ticket = scope.begin();
     s.stage = "previewing";
     try {
-      let result: Preview;
-      if (sourceMode === "mounted")
-        result = await api<Preview>("/api/jobs/selection/preview", {
-          ...json(data),
-          signal: ticket.signal,
-        });
-      else {
-        const existing = new Set<string>();
-        if (save) {
-          const listing = await api<Listing>(
-            `/api/documents?${new URLSearchParams({ storage: save.storage, path: save.path })}`,
-            { signal: ticket.signal },
-          );
-          listing.entries.forEach((e) => existing.add(e.name));
-        }
-        const planned = new Set<string>();
-        const entries = files.map((file) => {
-          const name = outputName(file.name, data.mode),
-            skip =
-              save && (existing.has(name) || planned.has(name))
-                ? "输出文件已存在或同批文件重名，不会覆盖"
-                : null;
-          planned.add(name);
-          return {
-            source_path: file.name,
-            save_path: `${save?.path ? `${save.path}/` : ""}${name}`,
-            save_storage: save?.storage,
-            skip_reason: skip,
-          };
-        });
-        result = {
-          files: entries,
-          eligible_count: entries.filter((f) => !f.skip_reason).length,
-        };
-      }
-      if (!ticket.current()) return;
+      const result = await client.fetchQuery({
+        queryKey: [
+          ...previewKey,
+          data,
+          files.map((f) => [f.name, f.size, f.lastModified]),
+        ],
+        gcTime: 0,
+        queryFn: async ({ signal }): Promise<Preview> => {
+          let result: Preview;
+          if (sourceMode === "mounted")
+            result = await api<Preview>("/api/jobs/selection/preview", {
+              ...json(data),
+              signal,
+            });
+          else {
+            const existing = new Set<string>();
+            if (save) {
+              const listing = await api<Listing>(
+                `/api/documents?${new URLSearchParams({ storage: save.storage, path: save.path })}`,
+                { signal },
+              );
+              listing.entries.forEach((e) => existing.add(e.name));
+            }
+            const planned = new Set<string>();
+            const entries = files.map((file) => {
+              const name = outputName(file.name, data.mode),
+                skip =
+                  save && (existing.has(name) || planned.has(name))
+                    ? "输出文件已存在或同批文件重名，不会覆盖"
+                    : null;
+              planned.add(name);
+              return {
+                source_path: file.name,
+                save_path: `${save?.path ? `${save.path}/` : ""}${name}`,
+                save_storage: save?.storage,
+                skip_reason: skip,
+              };
+            });
+            result = {
+              files: entries,
+              eligible_count: entries.filter((f) => !f.skip_reason).length,
+            };
+          }
+          return result;
+        },
+      });
       snapshot = {
         request: data,
         sourceMode,
@@ -182,7 +206,7 @@ export function useSubmission(
       s.acknowledged = false;
       s.stage = "confirming";
     } catch (error) {
-      if (ticket.current() && !isCancelled(error)) {
+      if (!isCancelled(error)) {
         s.error = `无法预览：${errorText(error)}`;
         s.stage = "editing";
       }
@@ -190,7 +214,7 @@ export function useSubmission(
   }
   function edit() {
     if (s.stage === "submitting") return;
-    scope.cancel();
+    void client.cancelQueries({ queryKey: previewKey });
     snapshot = undefined;
     s.preview = null;
     s.stage = "editing";
@@ -306,13 +330,8 @@ export function useSubmission(
       ? `将创建 ${snapshot.preview.eligible_count} 个任务，跳过 ${snapshot.preview.files.length - snapshot.preview.eligible_count} 个文件 · ${snapshot.request.target} · ${snapshot.request.mode === "replace" ? "仅译文" : "双语对照"}`
       : "",
   );
-  onMounted(() => {
-    void api<{ max_upload_bytes: number }>("/api/config")
-      .then((c) => (s.maxBytes = c.max_upload_bytes || s.maxBytes))
-      .catch(() => {});
-  });
   onUnmounted(() => {
-    scope.cancel();
+    void client.cancelQueries({ queryKey: previewKey });
     cancel();
   });
   return { s, locked, hasDocx, add, preview, edit, submit, cancel, summary };

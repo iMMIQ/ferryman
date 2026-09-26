@@ -1,50 +1,10 @@
-const { test, before, after } = require("node:test");
+const { test, expect } = require("@playwright/test");
 const assert = require("node:assert/strict");
-const http = require("node:http");
 const fs = require("node:fs/promises");
 const path = require("node:path");
-const { chromium } = require("playwright");
-let browser, server, origin;
-const root = path.join(__dirname, "..", "dist", "web");
 const screenshotDir = process.env.UI_SCREENSHOT_DIR;
-before(async () => {
-  server = http.createServer(async (req, res) => {
-    const name = new URL(req.url, "http://localhost").pathname;
-    const file = name === "/" ? "index.html" : name.replace(/^\//, "");
-    if (!/^(index\.html|assets\/[\w.-]+)$/.test(file)) {
-      res.writeHead(404);
-      res.end();
-      return;
-    }
-    res.setHeader(
-      "Content-Type",
-      file.endsWith(".js")
-        ? "text/javascript"
-        : file.endsWith(".css")
-          ? "text/css"
-          : "text/html",
-    );
-    try {
-      res.end(await fs.readFile(path.join(root, file)));
-    } catch {
-      res.writeHead(404);
-      res.end();
-    }
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  origin = `http://127.0.0.1:${server.address().port}`;
-  browser = await chromium.launch({
-    headless: true,
-    ...(process.env.TEST_BROWSER_EXECUTABLE
-      ? { executablePath: process.env.TEST_BROWSER_EXECUTABLE }
-      : {}),
-    args: ["--no-sandbox"],
-  });
+test.beforeAll(async () => {
   if (screenshotDir) await fs.mkdir(screenshotDir, { recursive: true });
-});
-after(async () => {
-  await browser?.close();
-  await new Promise((resolve) => server?.close(resolve));
 });
 const defaultJobs = () =>
   [
@@ -89,6 +49,7 @@ const defaultJobs = () =>
     source_storage: "documents",
   }));
 async function withPage(
+  page,
   fn,
   viewport = { width: 1440, height: 1000 },
   initial = {},
@@ -102,7 +63,7 @@ async function withPage(
     maxUploadBytes: 512 * 1024 * 1024,
     ...initial,
   };
-  const page = await browser.newPage({ viewport });
+  await page.setViewportSize(viewport);
   page.setDefaultTimeout(10000);
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
@@ -208,15 +169,11 @@ async function withPage(
       if (!state.delayUpload) throw e;
     }
   });
-  try {
-    await page.goto(origin);
-    await page.waitForFunction(
-      () => document.querySelector("#runtime-label").textContent !== "连接中",
-    );
+  {
+    await page.goto("/");
+    await expect(page.locator("#runtime-label")).not.toHaveText("连接中");
     await fn(page, state);
     assert.deepEqual(errors, []);
-  } finally {
-    await page.close();
   }
 }
 async function shot(page, name) {
@@ -227,11 +184,12 @@ async function shot(page, name) {
     });
 }
 
-test("partial status, stable keyboard focus, details and retry", async () =>
-  withPage(async (page, state) => {
+test("partial status, stable keyboard focus, details and retry", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
     await page.locator('tr[data-id="two"] .status-chip').waitFor();
-    assert.equal(
-      await page.locator('tr[data-id="two"] .status-chip').textContent(),
+    await expect(page.locator('tr[data-id="two"] .status-chip')).toHaveText(
       "部分完成",
     );
     assert.equal(
@@ -268,8 +226,7 @@ test("partial status, stable keyboard focus, details and retry", async () =>
     );
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.locator('tr[data-id="two"] .file-title').click();
-    assert.match(
-      await page.locator("#job-detail-content").textContent(),
+    await expect(page.locator("#job-detail-content")).toContainText(
       /季度财务分析报告与附录.docx/,
     );
     await shot(page, "task-details");
@@ -277,45 +234,47 @@ test("partial status, stable keyboard focus, details and retry", async () =>
     assert(state.posts.some((p) => p.path === "/api/jobs/two/retry"));
   }));
 
-test("offline errors persist without false empty history or model failure", async () =>
-  withPage(async (page, state) => {
+test("offline errors persist without false empty history or model failure", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
     await page.locator('tr[data-id="one"]').waitFor();
     state.offline = true;
     await page.locator("#refresh-jobs").click();
     await page.waitForFunction(
       () => document.querySelector("#runtime-label").textContent === "连接中断",
     );
-    assert.equal(
-      await page.locator("#runtime-label").textContent(),
-      "连接中断",
-    );
-    assert.equal(await page.locator("#runtime-startup").isVisible(), false);
-    assert.equal(await page.locator("#jobs-error").isVisible(), true);
-    assert.equal(await page.locator('tr[data-id="one"]').isVisible(), true);
+    await expect(page.locator("#runtime-label")).toHaveText("连接中断");
+    await expect(page.locator("#runtime-startup")).not.toBeVisible();
+    await expect(page.locator("#jobs-error")).toBeVisible();
+    await expect(page.locator('tr[data-id="one"]')).toBeVisible();
     await shot(page, "desktop-offline");
     await page.reload();
     await page.locator("#jobs-error").waitFor();
-    assert.equal(await page.locator("#empty-state").isVisible(), false);
-    assert.equal(await page.locator(".jobs-pagination").isVisible(), false);
+    await expect(page.locator("#empty-state")).not.toBeVisible();
+    await expect(page.locator(".jobs-pagination")).not.toBeVisible();
     state.offline = false;
     await page.locator("#retry-jobs").click();
     await page.waitForFunction(() => !document.querySelector("#jobs-error"));
   }));
 
-test("mobile navigation keeps submission and history reachable", async () =>
+test("mobile navigation keeps submission and history reachable", async ({
+  page,
+}) =>
   withPage(
+    page,
     async (page) => {
       const rect = await page.locator("#submit-job").boundingBox();
       assert(rect.y >= 0 && rect.y + rect.height <= 844);
-      assert.equal(await page.locator(".jobs-section").isVisible(), false);
+      await expect(page.locator(".jobs-section")).not.toBeVisible();
       assert.equal(
         await page.evaluate(() => document.documentElement.scrollWidth),
         390,
       );
       await shot(page, "mobile-create");
       await page.locator('button[data-workspace="jobs"]').click();
-      assert.equal(await page.locator(".jobs-section").isVisible(), true);
-      assert.equal(await page.locator("#submit-job").isVisible(), false);
+      await expect(page.locator(".jobs-section")).toBeVisible();
+      await expect(page.locator("#submit-job")).not.toBeVisible();
       await shot(page, "mobile-tasks");
       await page.setViewportSize({ width: 360, height: 740 });
       assert.equal(
@@ -326,8 +285,10 @@ test("mobile navigation keeps submission and history reachable", async () =>
     { width: 390, height: 844 },
   ));
 
-test("multi-file validation and upload preview submit each selected file", async () =>
-  withPage(async (page, state) => {
+test("multi-file validation and upload preview submit each selected file", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
     await page.locator("#file-input").setInputFiles([
       { name: "one.txt", mimeType: "text/plain", buffer: Buffer.from("one") },
       {
@@ -341,33 +302,28 @@ test("multi-file validation and upload preview submit each selected file", async
         buffer: Buffer.from("bad"),
       },
     ]);
-    assert.equal(await page.locator("#upload-list li").count(), 2);
-    assert.match(
-      await page.locator("#upload-validation").textContent(),
-      /不支持/,
-    );
-    assert.equal(
-      await page.locator('input[name="mode"][value="replace"]').isDisabled(),
-      true,
-    );
-    assert.equal(await page.locator("#mode-hint").isVisible(), true);
+    await expect(page.locator("#upload-list li")).toHaveCount(2);
+    await expect(page.locator("#upload-validation")).toContainText(/不支持/);
+    await expect(
+      page.locator('input[name="mode"][value="replace"]'),
+    ).toBeDisabled();
+    await expect(page.locator("#mode-hint")).toBeVisible();
     await page.locator("#submit-job").click();
     await page.locator("#submission-dialog").waitFor();
-    assert.match(
-      await page.locator("#submission-summary").textContent(),
-      /2 个任务/,
-    );
+    await expect(page.locator("#submission-summary")).toContainText(/2 个任务/);
     await shot(page, "upload-preview");
     await page.locator("#confirm-submit").click();
     await page.waitForFunction(
       () => !document.querySelector("#submit-job").disabled,
     );
     assert.equal(state.posts.filter((p) => p.path === "/api/jobs").length, 2);
-    assert.equal(await page.locator("#upload-list li").count(), 0);
+    await expect(page.locator("#upload-list li")).toHaveCount(0);
   }));
 
-test("cancel upload retains unsubmitted files and shows persistent feedback", async () =>
-  withPage(async (page, state) => {
+test("cancel upload retains unsubmitted files and shows persistent feedback", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
     state.delayUpload = true;
     await page.locator("#file-input").setInputFiles({
       name: "keep.txt",
@@ -380,15 +336,14 @@ test("cancel upload retains unsubmitted files and shows persistent feedback", as
     await page.waitForFunction(
       () => !document.querySelector("#submit-job").disabled,
     );
-    assert.equal(await page.locator("#upload-list li").count(), 1);
-    assert.match(
-      await page.locator("#submission-error").textContent(),
-      /取消|停止/,
-    );
+    await expect(page.locator("#upload-list li")).toHaveCount(1);
+    await expect(page.locator("#submission-error")).toContainText(/取消|停止/);
   }));
 
-test("mounted preview shows skipped files and requires overwrite acknowledgement", async () =>
-  withPage(async (page, state) => {
+test("mounted preview shows skipped files and requires overwrite acknowledgement", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
     await page
       .locator("label.segment")
       .filter({ hasText: "文稿与网盘" })
@@ -405,11 +360,10 @@ test("mounted preview shows skipped files and requires overwrite acknowledgement
       .check({ force: true });
     await page.locator("#submit-job").click();
     await page.locator("#submission-dialog").waitFor();
-    assert.match(
-      await page.locator("#submission-files").textContent(),
+    await expect(page.locator("#submission-files")).toContainText(
       /DOCX 仅支持/,
     );
-    assert.equal(await page.locator("#confirm-submit").isDisabled(), true);
+    await expect(page.locator("#confirm-submit")).toBeDisabled();
     assert.equal(
       state.posts.filter((p) => p.path === "/api/jobs/selection").length,
       0,
@@ -426,17 +380,21 @@ test("mounted preview shows skipped files and requires overwrite acknowledgement
     );
   }));
 
-test("runtime management is secondary and does not offer redundant start", async () =>
-  withPage(async (page, state) => {
-    assert.equal(await page.locator("#start-runtime").isVisible(), false);
+test("runtime management is secondary and does not offer redundant start", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
+    await expect(page.locator("#start-runtime")).not.toBeVisible();
     await page.locator("#manage-models").click();
-    assert.equal(await page.locator("#start-runtime").isDisabled(), true);
-    assert.match(await page.locator("#start-runtime").textContent(), /运行中/);
+    await expect(page.locator("#start-runtime")).toBeDisabled();
+    await expect(page.locator("#start-runtime")).toContainText(/运行中/);
     await page.locator("#model-list button").first().focus();
     await page.evaluate(() => {
       window.modelAction = document.activeElement;
     });
-    await page.waitForTimeout(2800);
+    await page.waitForResponse((response) =>
+      response.url().endsWith("/api/models"),
+    );
     assert.equal(
       await page.evaluate(() => document.activeElement === window.modelAction),
       true,
@@ -448,27 +406,27 @@ test("runtime management is secondary and does not offer redundant start", async
     await shot(page, "mobile-models");
     await page.keyboard.press("Escape");
     state.modelsOffline = true;
-    await page.waitForTimeout(2800);
-    assert.equal(await page.locator("#runtime-label").textContent(), "可用");
-    assert.match(
-      await page.locator("#connection-error").textContent(),
-      /模型目录/,
-    );
+    await expect(page.locator("#connection-error")).toContainText("模型目录");
+    await expect(page.locator("#runtime-label")).toHaveText("可用");
   }));
 
-test("empty state hides pagination and offers creation", async () =>
+test("empty state hides pagination and offers creation", async ({ page }) =>
   withPage(
+    page,
     async (page) => {
       await page.locator("#empty-create").waitFor();
-      assert.equal(await page.locator(".jobs-pagination").isVisible(), false);
+      await expect(page.locator(".jobs-pagination")).not.toBeVisible();
       await shot(page, "desktop-empty");
     },
     { width: 1440, height: 1000 },
     { jobs: [] },
   ));
 
-test("drag and drop accepts multiple files and rejects oversized inputs", async () =>
+test("drag and drop accepts multiple files and rejects oversized inputs", async ({
+  page,
+}) =>
   withPage(
+    page,
     async (page) => {
       await page.evaluate(() => {
         const transfer = new DataTransfer();
@@ -481,21 +439,22 @@ test("drag and drop accepts multiple files and rejects oversized inputs", async 
             new DragEvent("drop", { dataTransfer: transfer, bubbles: true }),
           );
       });
-      assert.equal(await page.locator("#upload-list li").count(), 2);
-      assert.match(
-        await page.locator("#upload-validation").textContent(),
+      await expect(page.locator("#upload-list li")).toHaveCount(2);
+      await expect(page.locator("#upload-validation")).toContainText(
         /large.txt.*超过/,
       );
       await page.locator('[data-remove-file="0"]').click();
-      assert.equal(await page.locator("#upload-list li").count(), 1);
-      assert.match(await page.locator("#upload-list").textContent(), /two.md/);
+      await expect(page.locator("#upload-list li")).toHaveCount(1);
+      await expect(page.locator("#upload-list")).toContainText(/two.md/);
     },
     { width: 1440, height: 1000 },
     { maxUploadBytes: 4 },
   ));
 
-test("late directory responses cannot overwrite another storage or remembered path", async () =>
-  withPage(async (page) => {
+test("late directory responses cannot overwrite another storage or remembered path", async ({
+  page,
+}) =>
+  withPage(page, async (page) => {
     const aborted = [];
     await page.route("**/api/documents?**", async (route) => {
       const storage = new URL(route.request().url()).searchParams.get(
@@ -528,28 +487,25 @@ test("late directory responses cannot overwrite another storage or remembered pa
         .textContent.includes("NEW_REMOTE"),
     );
     await page.waitForTimeout(450);
-    assert.match(
-      await page.locator("#folder-current-path").textContent(),
+    await expect(page.locator("#folder-current-path")).toContainText(
       /网盘挂载.*NEW_REMOTE/,
     );
-    assert.doesNotMatch(
-      await page.locator("#folder-dialog").textContent(),
-      /OLD_DOCS/,
-    );
+    await expect(page.locator("#folder-dialog")).not.toContainText(/OLD_DOCS/);
     await page.locator(".folder-checkbox").click();
     await page.locator("#select-current-folder").click();
     await page.locator("#submit-job").click();
     await page.locator("#submission-dialog").waitFor();
     await page.keyboard.press("Escape");
     await page.locator("#source-directory").click();
-    assert.match(
-      await page.locator("#folder-current-path").textContent(),
+    await expect(page.locator("#folder-current-path")).toContainText(
       /NEW_REMOTE|正在读取/,
     );
   }));
 
-test("preview locks the entire draft and closing it allows a fresh snapshot", async () =>
-  withPage(async (page, state) => {
+test("preview locks the entire draft and closing it allows a fresh snapshot", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
     await page
       .locator("label.segment")
       .filter({ hasText: "文稿与网盘" })
@@ -579,16 +535,12 @@ test("preview locks the entire draft and closing it allows a fresh snapshot", as
     });
     await page.locator("#target-language").fill("English");
     await page.locator("#submit-job").click();
-    assert.equal(await page.locator("#target-language").isDisabled(), true);
-    assert.equal(
-      await page.locator('input[name="source"][value="upload"]').isDisabled(),
-      true,
-    );
+    await expect(page.locator("#target-language")).toBeDisabled();
+    await expect(
+      page.locator('input[name="source"][value="upload"]'),
+    ).toBeDisabled();
     await page.locator("#submission-dialog").waitFor();
-    assert.match(
-      await page.locator("#submission-summary").textContent(),
-      /English/,
-    );
+    await expect(page.locator("#submission-summary")).toContainText(/English/);
     await page.keyboard.press("Escape");
     await page.locator("#target-language").fill("日本語");
     await page.locator("#submit-job").click();
@@ -603,8 +555,10 @@ test("preview locks the entire draft and closing it allows a fresh snapshot", as
     );
   }));
 
-test("cancelled preview cannot open a dialog after its delayed response", async () =>
-  withPage(async (page) => {
+test("cancelled preview cannot open a dialog after its delayed response", async ({
+  page,
+}) =>
+  withPage(page, async (page) => {
     await page
       .locator("label.segment")
       .filter({ hasText: "文稿与网盘" })
@@ -621,12 +575,14 @@ test("cancelled preview cannot open a dialog after its delayed response", async 
     await page.locator("#submit-job").click();
     await page.locator("#cancel-preview").click();
     await page.waitForTimeout(400);
-    assert.equal(await page.locator("#submission-dialog").count(), 0);
-    assert.equal(await page.locator("#target-language").isDisabled(), false);
+    await expect(page.locator("#submission-dialog")).toHaveCount(0);
+    await expect(page.locator("#target-language")).not.toBeDisabled();
   }));
 
-test("job mutations share pending state between table and details", async () =>
-  withPage(async (page, state) => {
+test("job mutations share pending state between table and details", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
     state.delayMutation = true;
     const row = page.locator('tr[data-id="two"]');
     await row.locator('[data-action="retry"]').click();
@@ -634,7 +590,7 @@ test("job mutations share pending state between table and details", async () =>
     const detailRetry = page.locator(
       '#job-detail-actions [data-action="retry"]',
     );
-    assert.equal(await detailRetry.isDisabled(), true);
+    await expect(detailRetry).toBeDisabled();
     await detailRetry.dispatchEvent("click");
     await page.waitForTimeout(100);
     assert.equal(
@@ -647,8 +603,10 @@ test("job mutations share pending state between table and details", async () =>
     );
   }));
 
-test("dialog traps keyboard focus and restores the opener on Escape", async () =>
-  withPage(async (page) => {
+test("dialog traps keyboard focus and restores the opener on Escape", async ({
+  page,
+}) =>
+  withPage(page, async (page) => {
     await page.locator("#manage-models").click();
     const dialog = page.getByRole("dialog", { name: "模型管理", exact: true });
     await dialog.waitFor();
@@ -662,15 +620,15 @@ test("dialog traps keyboard focus and restores the opener on Escape", async () =
       );
     }
     await page.keyboard.press("Escape");
-    assert.equal(await dialog.count(), 0);
+    await expect(dialog).toHaveCount(0);
     assert.equal(
       await page.evaluate(() => document.activeElement.id),
       "manage-models",
     );
   }));
 
-test("job action failures stay local and preserve the list", async () =>
-  withPage(async (page) => {
+test("job action failures stay local and preserve the list", async ({ page }) =>
+  withPage(page, async (page) => {
     await page.route("**/api/jobs/two/retry", (route) =>
       route.fulfill({
         status: 409,
@@ -680,13 +638,15 @@ test("job action failures stay local and preserve the list", async () =>
     const row = page.locator('tr[data-id="two"]');
     await row.locator('[data-action="retry"]').click();
     await row.locator(".notice").waitFor();
-    assert.match(await row.textContent(), /正在停止/);
-    assert.equal(await page.locator("#jobs-error").count(), 0);
-    assert.equal(await page.locator("#jobs-body tr").count(), 3);
+    await expect(row).toContainText(/正在停止/);
+    await expect(page.locator("#jobs-error")).toHaveCount(0);
+    await expect(page.locator("#jobs-body tr")).toHaveCount(3);
   }));
 
-test("runtime mutation invalidates an older poll and refreshes the final state", async () =>
-  withPage(async (page) => {
+test("runtime mutation invalidates an older poll and refreshes the final state", async ({
+  page,
+}) =>
+  withPage(page, async (page) => {
     let current = "ready",
       calls = 0,
       oldResponded = false;
@@ -715,8 +675,7 @@ test("runtime mutation invalidates an older poll and refreshes the final state",
     await page.waitForFunction(
       () => document.querySelector("#runtime-label").textContent === "已卸载",
     );
-    await page.waitForTimeout(850);
-    assert(oldResponded);
-    assert.equal(await page.locator("#runtime-label").textContent(), "已卸载");
-    assert.equal(await page.locator("#stop-runtime").isDisabled(), true);
+    await expect.poll(() => oldResponded).toBe(true);
+    await expect(page.locator("#runtime-label")).toHaveText("已卸载");
+    await expect(page.locator("#stop-runtime")).toBeDisabled();
   }));

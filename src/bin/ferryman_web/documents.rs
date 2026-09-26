@@ -1,11 +1,11 @@
 //! Document listing and directory creation for the mounted user storages.
 
 use super::{
-    json_error, normalize_relative_path, path_for_api, resolve_storage_path, user_identity,
-    AppState, StorageKind,
+    json_error, normalize_relative_path, path_for_api, resolve_storage_path, AppState, StorageKind,
+    UserIdentity,
 };
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use ferryman::format::Format;
@@ -25,16 +25,23 @@ pub(super) struct CreateDirectoryRequest {
     path: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DocumentKind {
+    Directory,
+    File,
+}
+
+#[derive(Serialize, ts_rs::TS)]
 struct DocumentEntry {
     name: String,
     path: String,
-    kind: &'static str,
+    kind: DocumentKind,
     supported: bool,
     size: Option<u64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
 struct DocumentListing {
     path: String,
     parent: Option<String>,
@@ -43,13 +50,9 @@ struct DocumentListing {
 
 pub(super) async fn list_documents(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    identity: UserIdentity,
     Query(query): Query<DocumentQuery>,
 ) -> Response {
-    let identity = match user_identity(&headers, state.config.allow_local_user) {
-        Ok(identity) => identity,
-        Err(status) => return json_error(status, "missing or invalid user identity"),
-    };
     let (_, directory, relative) =
         match resolve_storage_path(&state.config, &identity, query.storage, &query.path).await {
             Ok(paths) => paths,
@@ -81,9 +84,9 @@ pub(super) async fn list_documents(
             _ => continue,
         };
         let kind = if metadata.is_dir() {
-            "directory"
+            DocumentKind::Directory
         } else if metadata.is_file() {
-            "file"
+            DocumentKind::File
         } else {
             continue;
         };
@@ -97,8 +100,14 @@ pub(super) async fn list_documents(
         });
     }
     entries.sort_by(|left, right| {
-        (left.kind != "directory", left.name.to_lowercase())
-            .cmp(&(right.kind != "directory", right.name.to_lowercase()))
+        (
+            left.kind != DocumentKind::Directory,
+            left.name.to_lowercase(),
+        )
+            .cmp(&(
+                right.kind != DocumentKind::Directory,
+                right.name.to_lowercase(),
+            ))
     });
     let parent = relative
         .parent()
@@ -114,13 +123,9 @@ pub(super) async fn list_documents(
 
 pub(super) async fn create_document_directory(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    identity: UserIdentity,
     Json(request): Json<CreateDirectoryRequest>,
 ) -> Response {
-    let identity = match user_identity(&headers, state.config.allow_local_user) {
-        Ok(identity) => identity,
-        Err(status) => return json_error(status, "missing or invalid user identity"),
-    };
     let relative = match normalize_relative_path(&request.path) {
         Ok(path) if !path.as_os_str().is_empty() => path,
         _ => return json_error(StatusCode::BAD_REQUEST, "folder name is required"),
@@ -160,4 +165,19 @@ pub(super) async fn create_document_directory(
         Json(serde_json::json!({"path": path_for_api(&relative)})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "run via npm run types:generate or types:check"]
+fn export_frontend_types() {
+    use ts_rs::TS;
+    let config = ts_rs::Config::new().with_large_int("number").with_out_dir(
+        std::env::var_os("FERRYMAN_TYPES_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/lib/generated")
+            }),
+    );
+    DocumentListing::export_all(&config).unwrap();
 }

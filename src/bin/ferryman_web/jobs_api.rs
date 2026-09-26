@@ -2,15 +2,15 @@
 
 use super::job_store::{JobCursor, RetryJobOutcome};
 use super::{
-    json_error, mutate_job, now_epoch_seconds, path_for_api, resolve_storage_path, user_identity,
-    user_owner, AppState, JobEntry, JobRecord, JobStatus, SaveStrategy, StorageKind, UserIdentity,
-    DEFAULT_JOB_PAGE_SIZE, MAX_DIRECTORY_FILES, MAX_JOB_PAGE_SIZE, MAX_TEXT_FIELD_BYTES,
-    MAX_UPLOAD_BYTES, MAX_USER_NONTERMINAL_JOBS,
+    json_error, mutate_job, now_epoch_seconds, path_for_api, resolve_storage_path, AppState,
+    JobEntry, JobRecord, JobStatus, SaveStrategy, StorageKind, UserIdentity, DEFAULT_JOB_PAGE_SIZE,
+    MAX_DIRECTORY_FILES, MAX_JOB_PAGE_SIZE, MAX_TEXT_FIELD_BYTES, MAX_UPLOAD_BYTES,
+    MAX_USER_NONTERMINAL_JOBS,
 };
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use ferryman::batch::{is_generated_output, suffixed_output_path};
@@ -25,38 +25,65 @@ use tokio_util::io::ReaderStream;
 use tracing::error;
 use uuid::Uuid;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
 struct SourceSelection {
     storage: StorageKind,
     path: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
 pub(super) struct CreateDirectoryJobsRequest {
     #[serde(default)]
+    #[ts(as = "Option<Vec<SourceSelection>>", optional)]
     sources: Vec<SourceSelection>,
     #[serde(default)]
+    #[ts(optional = nullable)]
     source_storage: Option<StorageKind>,
     #[serde(default)]
+    #[ts(as = "Option<Vec<String>>", optional)]
     source_paths: Vec<String>,
     #[serde(default)]
+    #[ts(optional = nullable)]
     source_path: Option<String>,
     #[serde(default)]
+    #[ts(as = "Option<SaveStrategy>", optional)]
     save_strategy: SaveStrategy,
     #[serde(default)]
+    #[ts(optional = nullable)]
     save_storage: Option<StorageKind>,
     #[serde(default)]
+    #[ts(optional = nullable)]
     save_path: Option<String>,
     preset: Preset,
     target: String,
     mode: OutputMode,
     #[serde(default)]
+    #[ts(as = "Option<TranslationSettings>", optional)]
     settings: TranslationSettings,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
 struct DirectoryJobsResponse {
     jobs: Vec<JobRecord>,
+    skipped_existing: usize,
+    skipped_incompatible: usize,
+    skipped_unsupported: usize,
+    skipped_generated: usize,
+}
+
+#[derive(Serialize, ts_rs::TS)]
+struct PreviewFile {
+    source_path: String,
+    source_storage: StorageKind,
+    save_path: String,
+    save_storage: StorageKind,
+    overwrite: bool,
+    skip_reason: Option<String>,
+}
+#[derive(Serialize, ts_rs::TS)]
+struct SelectionPreview {
+    files: Vec<PreviewFile>,
+    eligible_count: usize,
     skipped_existing: usize,
     skipped_incompatible: usize,
     skipped_unsupported: usize,
@@ -72,6 +99,7 @@ pub(super) struct JobListQuery {
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(ts_rs::TS)]
 pub(crate) enum JobPhase {
     Queued,
     InProgress,
@@ -94,14 +122,14 @@ impl JobPhase {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
 struct JobListResponse {
     jobs: Vec<JobRecord>,
     next_cursor: Option<String>,
     total: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
 struct ActiveJobsResponse {
     jobs: Vec<JobRecord>,
 }
@@ -121,28 +149,21 @@ fn decode_job_cursor(value: &str) -> Result<JobCursor> {
 fn collect_selected_inputs(
     paths: &[(StorageKind, PathBuf)],
 ) -> Result<Vec<(StorageKind, PathBuf)>> {
-    fn visit(
-        storage: StorageKind,
-        path: &FsPath,
-        inputs: &mut BTreeSet<(StorageKind, PathBuf)>,
-    ) -> Result<()> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        if metadata.is_dir() {
-            for entry in std::fs::read_dir(path)? {
-                visit(storage, &entry?.path(), inputs)?;
-            }
-        } else if metadata.is_file() {
-            inputs.insert((storage, path.to_path_buf()));
-            anyhow::ensure!(
-                inputs.len() <= MAX_DIRECTORY_FILES,
-                "selection contains too many files"
-            );
-        }
-        Ok(())
-    }
     let mut inputs = BTreeSet::new();
     for (storage, path) in paths {
-        visit(*storage, path, &mut inputs)?;
+        for entry in walkdir::WalkDir::new(path)
+            .follow_links(false)
+            .follow_root_links(false)
+        {
+            let entry = entry?;
+            if entry.file_type().is_file() {
+                inputs.insert((*storage, entry.into_path()));
+                anyhow::ensure!(
+                    inputs.len() <= MAX_DIRECTORY_FILES,
+                    "selection contains too many files"
+                );
+            }
+        }
     }
     Ok(inputs.into_iter().collect())
 }
@@ -156,13 +177,10 @@ fn storage_output_segment(storage: StorageKind) -> &'static str {
 
 pub(super) async fn list_jobs(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    identity: UserIdentity,
     Query(query): Query<JobListQuery>,
 ) -> Response {
-    let owner = match user_owner(&headers, state.config.allow_local_user) {
-        Ok(owner) => owner,
-        Err(status) => return json_error(status, "missing SAFE_UID header"),
-    };
+    let owner = identity.owner.clone();
     let cursor = match query.cursor.as_deref().map(decode_job_cursor).transpose() {
         Ok(cursor) => cursor,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
@@ -188,12 +206,9 @@ pub(super) async fn list_jobs(
 
 pub(super) async fn list_active_jobs(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    identity: UserIdentity,
 ) -> Response {
-    let owner = match user_owner(&headers, state.config.allow_local_user) {
-        Ok(owner) => owner,
-        Err(status) => return json_error(status, "missing SAFE_UID header"),
-    };
+    let owner = identity.owner.clone();
     match state.store.list_active(owner).await {
         Ok(jobs) => Json(ActiveJobsResponse { jobs }).into_response(),
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")),
@@ -255,13 +270,9 @@ async fn bounded_field_text(field: &mut axum::extract::multipart::Field<'_>) -> 
 
 pub(super) async fn create_job(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    identity: UserIdentity,
     mut multipart: Multipart,
 ) -> Response {
-    let identity = match user_identity(&headers, state.config.allow_local_user) {
-        Ok(identity) => identity,
-        Err(status) => return json_error(status, "missing SAFE_UID header"),
-    };
     let owner = identity.owner.clone();
     match state.store.count_active(owner.clone()).await {
         Ok(count) if count >= MAX_USER_NONTERMINAL_JOBS => {
@@ -601,30 +612,26 @@ async fn enqueue_document_job(
 
 pub(super) async fn create_directory_jobs(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    identity: UserIdentity,
     Json(request): Json<CreateDirectoryJobsRequest>,
 ) -> Response {
-    directory_jobs(state, headers, request, false).await
+    directory_jobs(state, identity, request, false).await
 }
 
 pub(super) async fn preview_directory_jobs(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    identity: UserIdentity,
     Json(request): Json<CreateDirectoryJobsRequest>,
 ) -> Response {
-    directory_jobs(state, headers, request, true).await
+    directory_jobs(state, identity, request, true).await
 }
 
 async fn directory_jobs(
     state: AppState,
-    headers: HeaderMap,
+    identity: UserIdentity,
     request: CreateDirectoryJobsRequest,
     preview: bool,
 ) -> Response {
-    let identity = match user_identity(&headers, state.config.allow_local_user) {
-        Ok(identity) => identity,
-        Err(status) => return json_error(status, "missing or invalid user identity"),
-    };
     let mode = request.mode;
     let settings = match request.settings.validate_for_web() {
         Ok(settings) => settings,
@@ -791,12 +798,14 @@ async fn directory_jobs(
         } else {
             None
         };
-        preview_files.push(serde_json::json!({
-            "source_path": source_path, "source_storage": source_storage,
-            "save_path": save_path, "save_storage": save_storage,
-            "overwrite": request.save_strategy == SaveStrategy::SiblingOverwrite,
-            "skip_reason": reason,
-        }));
+        preview_files.push(PreviewFile {
+            source_path: source_path.clone(),
+            source_storage,
+            save_path: save_path.clone(),
+            save_storage,
+            overwrite: request.save_strategy == SaveStrategy::SiblingOverwrite,
+            skip_reason: reason.map(str::to_owned),
+        });
         if unsupported {
             skipped_unsupported += 1;
             continue;
@@ -836,12 +845,14 @@ async fn directory_jobs(
     }
 
     if preview {
-        return Json(serde_json::json!({
-            "eligible_count": eligible_count,
-            "skipped_existing": skipped_existing, "skipped_incompatible": skipped_incompatible,
-            "skipped_unsupported": skipped_unsupported, "skipped_generated": skipped_generated,
-            "files": preview_files,
-        }))
+        return Json(SelectionPreview {
+            eligible_count,
+            skipped_existing,
+            skipped_incompatible,
+            skipped_unsupported,
+            skipped_generated,
+            files: preview_files,
+        })
         .into_response();
     }
     for (input, source_path, source_storage, save_root, save_to, save_path, save_storage) in planned
@@ -885,13 +896,10 @@ async fn directory_jobs(
 
 pub(super) async fn cancel_job(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    identity: UserIdentity,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let owner = match user_owner(&headers, state.config.allow_local_user) {
-        Ok(owner) => owner,
-        Err(status) => return json_error(status, "missing SAFE_UID header"),
-    };
+    let owner = identity.owner.clone();
     let entry = match state.store.get(owner, id).await {
         Ok(Some(entry)) => entry,
         Ok(None) => return json_error(StatusCode::NOT_FOUND, "job not found"),
@@ -921,13 +929,10 @@ pub(super) async fn cancel_job(
 
 pub(super) async fn retry_job(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    identity: UserIdentity,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let owner = match user_owner(&headers, state.config.allow_local_user) {
-        Ok(owner) => owner,
-        Err(status) => return json_error(status, "missing SAFE_UID header"),
-    };
+    let owner = identity.owner.clone();
     if state
         .active_jobs
         .read()
@@ -1031,29 +1036,21 @@ fn result_is_downloadable(status: JobStatus, result_available: bool) -> bool {
 }
 
 fn result_disposition(name: &str, extension: &str) -> String {
-    let encoded: String = name
-        .as_bytes()
-        .iter()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || b"-._~".contains(byte) {
-                (*byte as char).to_string()
-            } else {
-                format!("%{byte:02X}")
-            }
-        })
-        .collect();
+    const ENCODE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    let encoded = percent_encoding::utf8_percent_encode(name, ENCODE);
     format!("attachment; filename=\"ferryman-result.{extension}\"; filename*=UTF-8''{encoded}")
 }
 
 pub(super) async fn download_result(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    identity: UserIdentity,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let owner = match user_owner(&headers, state.config.allow_local_user) {
-        Ok(owner) => owner,
-        Err(status) => return json_error(status, "missing SAFE_UID header"),
-    };
+    let owner = identity.owner.clone();
     let entry = match state.store.get(owner, id).await {
         Ok(Some(entry)) => entry,
         Ok(None) => return json_error(StatusCode::NOT_FOUND, "job not found"),
@@ -1089,13 +1086,10 @@ pub(super) async fn download_result(
 
 pub(super) async fn delete_job(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    identity: UserIdentity,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let owner = match user_owner(&headers, state.config.allow_local_user) {
-        Ok(owner) => owner,
-        Err(status) => return json_error(status, "missing SAFE_UID header"),
-    };
+    let owner = identity.owner.clone();
     if state
         .active_jobs
         .read()
@@ -1264,8 +1258,12 @@ mod tests {
             "save_strategy":"sibling_suffix", "preset":"7b-fp8", "target":"中文", "mode":"replace"
         }))
         .unwrap();
-        let response =
-            preview_directory_jobs(State(state.clone()), HeaderMap::new(), Json(request)).await;
+        let response = preview_directory_jobs(
+            State(state.clone()),
+            crate::user_identity(&axum::http::HeaderMap::new(), true).unwrap(),
+            Json(request),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), 65536)
             .await
@@ -1295,9 +1293,13 @@ mod tests {
             "save_strategy":"sibling_overwrite", "preset":"7b-fp8", "target":"中文", "mode":"bilingual"
         })).unwrap();
         assert_eq!(
-            preview_directory_jobs(State(state), HeaderMap::new(), Json(invalid))
-                .await
-                .status(),
+            preview_directory_jobs(
+                State(state),
+                crate::user_identity(&axum::http::HeaderMap::new(), true).unwrap(),
+                Json(invalid)
+            )
+            .await
+            .status(),
             StatusCode::BAD_REQUEST
         );
         tokio::fs::remove_dir_all(base).await.unwrap();
@@ -1365,7 +1367,12 @@ mod tests {
         target = huge_target
     );
         let multipart = multipart_from_body(body, boundary).await;
-        let response = create_job(State(state.clone()), HeaderMap::new(), multipart).await;
+        let response = create_job(
+            State(state.clone()),
+            crate::user_identity(&axum::http::HeaderMap::new(), true).unwrap(),
+            multipart,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_no_job_dirs(&state).await;
         tokio::fs::remove_dir_all(&base).await.unwrap();
@@ -1382,9 +1389,34 @@ mod tests {
         b = boundary
     );
         let multipart = multipart_from_body(body, boundary).await;
-        let response = create_job(State(state.clone()), HeaderMap::new(), multipart).await;
+        let response = create_job(
+            State(state.clone()),
+            crate::user_identity(&axum::http::HeaderMap::new(), true).unwrap(),
+            multipart,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_no_job_dirs(&state).await;
         tokio::fs::remove_dir_all(&base).await.unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "run via npm run types:generate or types:check"]
+fn export_frontend_types() {
+    use ts_rs::TS;
+    let config = ts_rs::Config::new().with_large_int("number").with_out_dir(
+        std::env::var_os("FERRYMAN_TYPES_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/lib/generated")
+            }),
+    );
+    CreateDirectoryJobsRequest::export_all(&config).unwrap();
+    DirectoryJobsResponse::export_all(&config).unwrap();
+    JobPhase::export_all(&config).unwrap();
+    JobListResponse::export_all(&config).unwrap();
+    ActiveJobsResponse::export_all(&config).unwrap();
+    SelectionPreview::export_all(&config).unwrap();
 }

@@ -1,7 +1,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { api, ApiError, latestQuery } from "../web/src/lib/api";
+import { api, ApiError } from "../web/src/lib/api";
 let server: http.Server, origin: string;
 before(async () => {
   server = http.createServer((req, res) => {
@@ -56,14 +56,40 @@ test("HTTP diagnostics and invalid response contracts remain distinct", async ()
   );
   assert.deepEqual(await api(`${origin}/ok`), { ok: true });
 });
-test("a superseded query cannot commit even if a transport ignores abort", () => {
-  const query = latestQuery(),
-    old = query.begin(),
-    current = query.begin();
-  assert.equal(old.signal.aborted, true);
-  assert.equal(old.current(), false);
-  assert.equal(current.current(), true);
-  query.cancel();
-  assert.equal(current.current(), false);
-  assert.equal(current.signal.aborted, true);
+test("query cache deduplicates reads and cancelled responses cannot replace fresh data", async () => {
+  const { createQueryClient } = await import("../web/src/lib/query");
+  const client = createQueryClient();
+  let finish!: (data: string) => void,
+    calls = 0;
+  const read = () => {
+    calls++;
+    return new Promise<string>((resolve) => {
+      finish = resolve;
+    });
+  };
+  const key = ["race"];
+  const old = client.fetchQuery({ queryKey: key, queryFn: read });
+  const duplicate = client.fetchQuery({ queryKey: key, queryFn: read });
+  const failures = Promise.allSettled([old, duplicate]);
+  assert.equal(calls, 1);
+  await client.cancelQueries({ queryKey: key });
+  await client.fetchQuery({ queryKey: key, queryFn: async () => "fresh" });
+  finish("stale");
+  assert((await failures).every((result) => result.status === "rejected"));
+  assert.equal(client.getQueryData(key), "fresh");
+  client.clear();
+});
+test("failed writes never retry automatically", async () => {
+  const { createQueryClient } = await import("../web/src/lib/query");
+  const client = createQueryClient();
+  let calls = 0;
+  const mutation = client.getMutationCache().build(client, {
+    mutationFn: async () => {
+      calls++;
+      throw new Error("offline");
+    },
+  });
+  await assert.rejects(mutation.execute(undefined), /offline/);
+  assert.equal(calls, 1);
+  client.clear();
 });

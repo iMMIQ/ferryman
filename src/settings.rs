@@ -19,7 +19,7 @@ fn cache_enabled_by_default() -> bool {
     true
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, ts_rs::TS)]
 pub struct TranslationSettings {
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,

@@ -1,3 +1,4 @@
+import { isCancelledError } from "@tanstack/vue-query";
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -8,7 +9,8 @@ export class ApiError extends Error {
   }
 }
 export const isCancelled = (error: unknown) =>
-  error instanceof DOMException && error.name === "AbortError";
+  isCancelledError(error) ||
+  (error instanceof DOMException && error.name === "AbortError");
 export async function api<T>(
   path: string,
   options: RequestInit = {},
@@ -62,21 +64,3 @@ export const json = (body: unknown): RequestInit => ({
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify(body),
 });
-// A scope belongs to one query resource. Every replacement invalidates old responses,
-// including transports that finish after cancellation. Never use this for mutations.
-export function latestQuery() {
-  let version = 0,
-    controller: AbortController | undefined;
-  return {
-    begin() {
-      controller?.abort();
-      controller = new AbortController();
-      const id = ++version;
-      return { signal: controller.signal, current: () => id === version };
-    },
-    cancel() {
-      ++version;
-      controller?.abort();
-    },
-  };
-}

@@ -2,18 +2,20 @@
   "name": "ferryman-frontend",
   "private": true,
   "scripts": {
-    "test": "npm run build && node --test tests/ui.test.cjs",
+    "test": "npm run build && playwright test --project=ui",
     "dev": "vite --host 0.0.0.0",
     "build": "vue-tsc --noEmit && vite build",
     "typecheck": "vue-tsc --noEmit",
     "test:unit": "tsx --test tests/frontend.test.ts",
-    "test:smoke": "node --test tests/web-smoke.test.cjs",
-    "format": "prettier --write web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs",
-    "format:check": "prettier --check web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs"
+    "test:smoke": "playwright test --project=smoke",
+    "format": "prettier --write web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs playwright.config.ts scripts/check-generated-types.mjs",
+    "format:check": "prettier --check web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs playwright.config.ts scripts/check-generated-types.mjs",
+    "types:generate": "cargo test --all-targets export_frontend_types -- --ignored",
+    "types:check": "node scripts/check-generated-types.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "1.63.0",
     "@vitejs/plugin-vue": "6.0.9",
-    "playwright": "1.63.0",
     "prettier": "3.9.9",
     "tsx": "4.23.15",
     "typescript": "5.9.3",
@@ -21,6 +23,7 @@
     "vue-tsc": "3.3.11"
   },
   "dependencies": {
+    "@tanstack/vue-query": "5.103.3",
     "reka-ui": "2.10.5",
     "vue": "3.5.43"
   },

@@ -1,133 +1,138 @@
-import { reactive, onUnmounted } from "vue";
-import { api, latestQuery, isCancelled } from "../lib/api";
+import { reactive, ref, computed, watch, nextTick } from "vue";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/vue-query";
+import { api } from "../lib/api";
 import { errorText, phase } from "../lib/format";
 import type { Job, JobPage, Phase } from "../lib/types";
-import { usePolling } from "./usePolling";
 export function useJobs() {
+  const client = useQueryClient();
+  const selectedPhase = ref<Phase>("all");
+  const cursors = ref<(string | null)[]>([null]);
+  const listKey = computed(() => [
+    "jobs",
+    "list",
+    selectedPhase.value,
+    cursors.value.at(-1),
+  ]);
+  const list = useQuery({
+    queryKey: listKey,
+    queryFn: ({ signal, queryKey }) => {
+      const query = new URLSearchParams();
+      if (queryKey[2] !== "all") query.set("phase", queryKey[2]!);
+      if (queryKey[3]) query.set("cursor", queryKey[3]);
+      return api<JobPage>(`/api/jobs?${query}`, { signal });
+    },
+    // History only refreshes on invalidation; failed initial loads can recover.
+    refetchInterval: (query) => (query.state.status === "error" ? 2500 : false),
+  });
+  const active = useQuery({
+    queryKey: ["jobs", "active"],
+    queryFn: ({ signal }) =>
+      api<{ jobs: Job[] }>("/api/jobs/active", { signal }),
+    refetchInterval: 2500,
+  });
   const state = reactive({
-    jobs: [] as Job[],
+    get jobs() {
+      const live = new Map(
+        active.data.value?.jobs.map((job) => [job.id, job]) ?? [],
+      );
+      return (list.data.value?.jobs ?? []).map(
+        (job) => live.get(job.id) ?? job,
+      );
+    },
     byId: {} as Record<string, Job>,
-    loaded: false,
-    loading: false,
-    error: "",
-    updated: "",
-    total: 0,
-    phase: "all" as Phase,
-    cursors: [null] as (string | null)[],
-    next: null as string | null,
-    active: 0,
+    get loaded() {
+      return !!list.data.value;
+    },
+    get loading() {
+      return list.isFetching.value;
+    },
+    get error() {
+      const error = list.error.value || active.error.value;
+      return error ? errorText(error) : "";
+    },
+    get updated() {
+      return list.dataUpdatedAt.value
+        ? new Date(list.dataUpdatedAt.value).toLocaleTimeString("zh-CN")
+        : "";
+    },
+    get total() {
+      return list.data.value?.total ?? 0;
+    },
+    get phase() {
+      return selectedPhase.value;
+    },
+    get cursors() {
+      return cursors.value;
+    },
+    get next() {
+      return list.data.value?.next_cursor ?? null;
+    },
+    get active() {
+      return active.data.value?.jobs.length ?? 0;
+    },
     pending: {} as Record<string, boolean>,
     errors: {} as Record<string, string>,
   });
-  const listQuery = latestQuery(),
-    activeQuery = latestQuery();
-  let activeFlight: Promise<void> | undefined,
-    previous = new Map<string, Job>();
-  function remember(jobs: Job[]) {
-    for (const job of jobs) state.byId[job.id] = job;
-  }
+  watch(list.data, (page) => {
+    if (!page) return;
+    if (!page.jobs.length && cursors.value.length > 1) cursors.value.pop();
+    for (const job of page.jobs) state.byId[job.id] = job;
+  });
+  watch(active.data, (current, previous) => {
+    if (!current) return;
+    for (const job of current.jobs) state.byId[job.id] = job;
+    const live = new Map(current.jobs.map((job) => [job.id, job]));
+    const changed = previous?.jobs.some(
+      (job) => !live.has(job.id) || phase(job) !== phase(live.get(job.id)!),
+    );
+    const appeared = current.jobs.some(
+      (job) => !previous?.jobs.some((old) => old.id === job.id),
+    );
+    if (changed || appeared)
+      void client.invalidateQueries({ queryKey: ["jobs", "list"] });
+  });
+  const mutation = useMutation({
+    mutationFn: ({
+      id,
+      action,
+    }: {
+      id: string;
+      action: "retry" | "cancel" | "delete";
+    }) =>
+      api(`/api/jobs/${id}${action === "delete" ? "" : `/${action}`}`, {
+        method: action === "delete" ? "DELETE" : "POST",
+      }),
+    onSuccess: async () => {
+      await client.cancelQueries({ queryKey: ["jobs"] });
+      await client.invalidateQueries({ queryKey: ["jobs"] });
+    },
+  });
   async function refresh() {
-    const ticket = listQuery.begin();
-    state.loading = true;
-    const query = new URLSearchParams();
-    const cursor = state.cursors.at(-1);
-    if (cursor) query.set("cursor", cursor);
-    if (state.phase !== "all") query.set("phase", state.phase);
-    try {
-      const page = await api<JobPage>(`/api/jobs?${query}`, {
-        signal: ticket.signal,
-      });
-      if (!ticket.current()) return;
-      if (!Array.isArray(page.jobs)) throw new Error("任务列表格式无效");
-      if (!page.jobs.length && state.cursors.length > 1) {
-        state.cursors.pop();
-        return await refresh();
-      }
-      state.jobs = page.jobs;
-      remember(page.jobs);
-      state.total = page.total;
-      state.next = page.next_cursor || null;
-      state.loaded = true;
-      state.error = "";
-      state.updated = new Date().toLocaleTimeString("zh-CN");
-    } catch (error) {
-      if (ticket.current() && !isCancelled(error))
-        state.error = errorText(error);
-    } finally {
-      if (ticket.current()) state.loading = false;
-    }
-  }
-  function refreshActive() {
-    if (activeFlight) return activeFlight;
-    activeFlight = (async () => {
-      const ticket = activeQuery.begin();
-      try {
-        const response = await api<{ jobs: Job[] }>("/api/jobs/active", {
-          signal: ticket.signal,
-        });
-        if (!ticket.current()) return;
-        const active = new Map(response.jobs.map((job) => [job.id, job]));
-        const changed =
-          [...previous.keys()].some((id) => !active.has(id)) ||
-          response.jobs.some(
-            (job) =>
-              previous.has(job.id) &&
-              phase(previous.get(job.id)!) !== phase(job),
-          );
-        const appeared =
-          state.cursors.length === 1 &&
-          response.jobs.some(
-            (job) =>
-              (state.phase === "all" || phase(job) === state.phase) &&
-              !state.jobs.some((j) => j.id === job.id),
-          );
-        previous = active;
-        state.active = active.size;
-        remember(response.jobs);
-        if (!state.loaded || state.error || changed || appeared)
-          await refresh();
-        else state.jobs = state.jobs.map((job) => active.get(job.id) || job);
-      } catch (error) {
-        if (ticket.current() && !isCancelled(error))
-          state.error = errorText(error);
-      }
-    })().finally(() => {
-      activeFlight = undefined;
-    });
-    return activeFlight;
+    await Promise.all([list.refetch(), active.refetch()]);
   }
   async function first() {
-    state.cursors = [null];
+    cursors.value = [null];
+    await nextTick();
     await refresh();
   }
   async function filter(value: Phase) {
-    if (state.phase === value) return;
-    state.phase = value;
-    await first();
+    if (selectedPhase.value === value) return;
+    selectedPhase.value = value;
+    cursors.value = [null];
   }
   async function next() {
-    if (!state.next || state.loading) return;
-    state.cursors.push(state.next);
-    await refresh();
+    if (state.next && !state.loading) cursors.value.push(state.next);
   }
   async function previousPage() {
-    if (state.cursors.length < 2 || state.loading) return;
-    state.cursors.pop();
-    await refresh();
+    if (cursors.value.length > 1 && !state.loading) cursors.value.pop();
   }
   async function act(id: string, action: "retry" | "cancel" | "delete") {
     if (state.pending[id]) return false;
     state.pending[id] = true;
     state.errors[id] = "";
     try {
-      await api(`/api/jobs/${id}${action === "delete" ? "" : `/${action}`}`, {
-        method: action === "delete" ? "DELETE" : "POST",
-      });
+      await mutation.mutateAsync({ id, action });
       if (action === "delete") delete state.byId[id];
-      activeQuery.cancel();
-      if (activeFlight) await activeFlight;
-      await refresh();
-      await refreshActive();
       return true;
     } catch (error) {
       state.errors[id] = errorText(error);
@@ -136,15 +141,6 @@ export function useJobs() {
       state.pending[id] = false;
     }
   }
-  usePolling(async () => {
-    // Load history independently of the live-progress endpoint.
-    if (!state.loaded) await refresh();
-    if (state.loaded) await refreshActive();
-  });
-  onUnmounted(() => {
-    listQuery.cancel();
-    activeQuery.cancel();
-  });
   return { state, refresh, first, filter, next, previousPage, act };
 }
 export type JobsStore = ReturnType<typeof useJobs>;

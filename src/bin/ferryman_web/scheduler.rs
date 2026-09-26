@@ -34,16 +34,6 @@ async fn process_queued_job(state: AppState, id: Uuid) {
     state.active_jobs.write().await.remove(&id);
 }
 
-async fn queued_job_schedule(state: &AppState, id: Uuid) -> Option<(Preset, Option<PathBuf>)> {
-    state
-        .active_jobs
-        .read()
-        .await
-        .get(&id)
-        .filter(|entry| entry.record.status == JobStatus::Queued)
-        .map(|entry| (entry.record.preset, entry.save_to.clone()))
-}
-
 fn can_dispatch_job<'a>(
     active_preset: Option<Preset>,
     active_outputs: impl IntoIterator<Item = &'a PathBuf>,
@@ -54,6 +44,36 @@ fn can_dispatch_job<'a>(
         return false;
     }
     !output.is_some_and(|candidate| active_outputs.into_iter().any(|active| active == candidate))
+}
+
+// Remove stale entries as we scan, so selection and removal use the same index.
+fn take_dispatchable<K>(
+    pending: &mut VecDeque<Uuid>,
+    active_preset: Option<Preset>,
+    active_outputs: &HashMap<K, PathBuf>,
+    mut lookup: impl FnMut(Uuid) -> Option<(Preset, Option<PathBuf>)>,
+) -> Option<(Uuid, Preset, Option<PathBuf>)> {
+    let mut index = 0;
+    while let Some(&id) = pending.get(index) {
+        match lookup(id) {
+            None => {
+                pending.remove(index);
+            }
+            Some((preset, output)) => {
+                if can_dispatch_job(
+                    active_preset,
+                    active_outputs.values(),
+                    preset,
+                    output.as_ref(),
+                ) {
+                    pending.remove(index);
+                    return Some((id, preset, output));
+                }
+                index += 1;
+            }
+        }
+    }
+    None
 }
 
 pub(super) async fn job_worker(state: AppState, mut queue: mpsc::Receiver<Uuid>) {
@@ -68,34 +88,16 @@ pub(super) async fn job_worker(state: AppState, mut queue: mpsc::Receiver<Uuid>)
             // Scan for the first dispatchable job instead of only the queue
             // head: a 30B job waiting at the head must not starve every 7B
             // job behind it (and vice versa) while the active preset differs.
-            let mut next = None;
-            let mut stale = Vec::new();
-            for (index, id) in pending.iter().enumerate() {
-                match queued_job_schedule(&state, *id).await {
-                    None => stale.push(index),
-                    Some((preset, output)) => {
-                        if can_dispatch_job(
-                            active_preset,
-                            active_outputs.values(),
-                            preset,
-                            output.as_ref(),
-                        ) {
-                            next = Some((index, preset, output));
-                            break;
-                        }
-                    }
-                }
-            }
-            // Drop entries that left the queue while waiting (cancelled,
-            // deleted) — newest first so earlier indexes stay valid.
-            for &index in stale.iter().rev() {
-                pending.remove(index);
-            }
-            let Some((index, preset, output)) = next else {
-                break;
+            let next = {
+                let jobs = state.active_jobs.read().await;
+                take_dispatchable(&mut pending, active_preset, &active_outputs, |id| {
+                    jobs.get(&id)
+                        .filter(|entry| entry.record.status == JobStatus::Queued)
+                        .map(|entry| (entry.record.preset, entry.save_to.clone()))
+                })
             };
-            let Some(id) = pending.remove(index) else {
-                continue;
+            let Some((id, preset, output)) = next else {
+                break;
             };
 
             active_preset = Some(preset);
@@ -141,6 +143,36 @@ pub(super) async fn job_worker(state: AppState, mut queue: mpsc::Receiver<Uuid>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_jobs_do_not_shift_selected_job_or_output() {
+        let cancelled = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let other_model = Uuid::new_v4();
+        let blocked = Uuid::new_v4();
+        let output = PathBuf::from("chosen.txt");
+        let busy = PathBuf::from("busy.txt");
+        let jobs = HashMap::from([
+            (first, (Preset::SevenBFp8, Some(output.clone()))),
+            (other_model, (Preset::ThirtyBFp8, None)),
+            (blocked, (Preset::SevenBFp8, Some(busy.clone()))),
+        ]);
+        let mut pending = VecDeque::from([cancelled, blocked, first, other_model]);
+        let active = HashMap::from([(0, busy)]);
+        assert_eq!(
+            take_dispatchable(&mut pending, Some(Preset::SevenBFp8), &active, |id| jobs
+                .get(&id)
+                .cloned()),
+            Some((first, Preset::SevenBFp8, Some(output)))
+        );
+        assert_eq!(pending, VecDeque::from([blocked, other_model]));
+        assert!(
+            take_dispatchable(&mut pending, Some(Preset::SevenBFp8), &active, |id| jobs
+                .get(&id)
+                .cloned())
+            .is_none()
+        );
+    }
 
     #[test]
     fn dispatch_only_combines_compatible_jobs() {

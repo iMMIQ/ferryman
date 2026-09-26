@@ -4,6 +4,8 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+pub(crate) const TRANSLATION_CACHE_VERSION: &str = "v2-complete-context";
+
 #[derive(Serialize)]
 struct ChatReq<'a> {
     model: &'a str,
@@ -35,11 +37,12 @@ struct ChatResp {
 #[derive(Deserialize)]
 struct Choice {
     message: RespMsg,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct RespMsg {
-    content: String,
+    content: Option<String>,
 }
 
 /// Translate `text` into `target_lang` using the official Hy-MT2 "Default
@@ -147,9 +150,17 @@ async fn translate_single(
                         depth + 1,
                     ))
                     .await?;
-                    return Ok(format!("{left}{right}"));
+                    let separator = if trimmed.chars().any(char::is_whitespace)
+                        && !left.ends_with(char::is_whitespace)
+                        && !right.starts_with(char::is_whitespace)
+                    {
+                        " "
+                    } else {
+                        ""
+                    };
+                    return Ok(format!("{left}{separator}{right}"));
                 }
-                return Err(anyhow!("translation failed (fatal HTTP): {error}"));
+                return Err(anyhow!("translation failed (fatal response): {error}"));
             }
         }
     }
@@ -238,9 +249,8 @@ pub async fn translate_batch(
 /// concatenated in order, so the caller's positional alignment (`trs[idx]` ↔
 /// cue `idx`) is preserved.
 ///
-/// A lone cue that still overflows the whole window — one line longer than
-/// `max_model_len` — can't be split further and is left untranslated, costing
-/// only itself (mirrors the "one bad cue" guarantee).
+/// A lone oversized or truncated cue falls back to the bounded single-text
+/// splitter. Failed recovery leaves that cue untranslated.
 async fn translate_split(
     client: &reqwest::Client,
     endpoint: &str,
@@ -291,11 +301,11 @@ async fn translate_split(
         );
         out
     } else if overflow && cues.len() == 1 {
-        // A lone cue longer than the whole context window: can't split further.
-        // (`translate_one_batch` suppresses its own warn on overflow expecting
-        // the caller to split, so name the cause here.)
-        eprintln!("warn: 1 cue is longer than the model's context window — left untranslated");
-        translations
+        // Recover a single oversized/truncated cue using the bounded text
+        // splitter. Never accept a partial tagged response as a translation.
+        vec![translate(client, endpoint, model, cues[0], target_lang)
+            .await
+            .ok()]
     } else {
         // Complete, or ≤1 cue missing (a degenerate cue the model refused — kept
         // original; already warned by `translate_one_batch` if it dropped all).
@@ -308,8 +318,8 @@ async fn translate_split(
 /// [`translate_split`] halving the slice).
 struct SliceOutcome {
     translations: Vec<Option<String>>,
-    /// Every attempt failed with a context-length-overflow 4xx — the prompt
-    /// itself doesn't fit the window. `false` for any other outcome.
+    /// The input overflowed the context window or the output was truncated;
+    /// the caller should retry smaller pieces.
     overflow: bool,
 }
 
@@ -378,6 +388,32 @@ enum ChatAttempt {
     Fatal { error: String, overflow: bool },
 }
 
+fn validate_choice(choice: Choice) -> ChatAttempt {
+    match choice.finish_reason.as_deref() {
+        Some("length") => {
+            return ChatAttempt::Fatal {
+                error: "model output was truncated".into(),
+                overflow: true,
+            }
+        }
+        // Some compatible servers omit finish_reason. Still reject empty text.
+        None | Some("stop") => {}
+        Some(reason) => {
+            return ChatAttempt::Fatal {
+                error: format!("model did not complete translation: {reason}"),
+                overflow: false,
+            }
+        }
+    }
+    match choice.message.content {
+        Some(content) if !content.trim().is_empty() => ChatAttempt::Success(content),
+        _ => ChatAttempt::Transient {
+            error: "empty translation".into(),
+            retry_after: None,
+        },
+    }
+}
+
 async fn post_chat_once(client: &reqwest::Client, url: &str, body: &ChatReq<'_>) -> ChatAttempt {
     match client.post(url).json(body).send().await {
         Ok(resp) => {
@@ -414,7 +450,7 @@ async fn post_chat_once(client: &reqwest::Client, url: &str, body: &ChatReq<'_>)
             }
             match serde_json::from_str::<ChatResp>(&txt) {
                 Ok(parsed) => match parsed.choices.into_iter().next() {
-                    Some(choice) => ChatAttempt::Success(choice.message.content),
+                    Some(choice) => validate_choice(choice),
                     None => ChatAttempt::Transient {
                         error: "empty choices".into(),
                         retry_after: None,
@@ -653,6 +689,101 @@ pub(crate) fn parse_tagged(resp: &str, count: usize) -> Vec<Option<String>> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn rejects_empty_truncated_and_non_text_completions() {
+        let classify = |reason: Option<&str>, content: Option<&str>| {
+            validate_choice(Choice {
+                finish_reason: reason.map(str::to_owned),
+                message: RespMsg {
+                    content: content.map(str::to_owned),
+                },
+            })
+        };
+        assert!(matches!(
+            classify(Some("length"), Some("partial")),
+            ChatAttempt::Fatal { overflow: true, .. }
+        ));
+        for content in [None, Some(""), Some(" \n ")] {
+            assert!(matches!(
+                classify(Some("stop"), content),
+                ChatAttempt::Transient { .. }
+            ));
+        }
+        assert!(matches!(
+            classify(Some("content_filter"), Some("partial")),
+            ChatAttempt::Fatal {
+                overflow: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify(Some("stop"), Some("complete")),
+            ChatAttempt::Success(_)
+        ));
+        assert!(matches!(
+            classify(None, Some("legacy server")),
+            ChatAttempt::Success(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn truncated_single_and_batch_are_retranslated_in_smaller_pieces() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let prompt = body["messages"][0]["content"].as_str().unwrap();
+                    let tagged = prompt.contains("<c1>");
+                    let truncated = prompt.len() > 600 || prompt.contains("<c2>");
+                    let content = if truncated { "BAD PARTIAL" } else if tagged { "<c1>complete</c1>" } else { "complete" };
+                    axum::Json(serde_json::json!({"choices": [{"finish_reason": if truncated { "length" } else { "stop" }, "message": {"content": content}}]}))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let result = translate(&client, &endpoint, "model", &"word ".repeat(150), "en")
+            .await
+            .unwrap();
+        assert!(!result.contains("BAD"));
+        assert!(result.contains("complete complete"));
+        assert_eq!(
+            translate_batch(&client, &endpoint, "model", &["one", "two"], &[], "en").await,
+            vec![Some("complete".into()), Some("complete".into())]
+        );
+        assert!(calls.load(std::sync::atomic::Ordering::Relaxed) >= 6);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_response_is_retried_instead_of_returned_as_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move || {
+            let seen = seen.clone();
+            async move {
+                let content = if seen.fetch_add(1, Ordering::Relaxed) == 0 { " " } else { "complete" };
+                axum::Json(serde_json::json!({"choices": [{"finish_reason": "stop", "message": {"content": content}}]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert_eq!(
+            translate(&reqwest::Client::new(), &endpoint, "model", "hello", "en")
+                .await
+                .unwrap(),
+            "complete"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
 
     #[test]
     fn parse_tagged_perfect_alignment() {
@@ -899,7 +1030,7 @@ mod tests {
         .await
         .unwrap();
         // The halves came back as two translations joined together.
-        assert!(result.starts_with("tr(") && result.contains(")tr("));
+        assert!(result.starts_with("tr(") && result.contains(") tr("));
 
         let requests = requests.lock().unwrap();
         assert!(requests[0] > 600, "first request should be the long prompt");

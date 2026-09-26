@@ -36,6 +36,13 @@ pub fn build_translation_client(
     Ok(builder.build()?)
 }
 
+// Include all neighboring cues and the position: identical words can carry
+// different meanings even within one batch. Singles use a separate namespace.
+fn cache_scope(endpoint: &str, cues: &[&str], context: &[&str], index: Option<usize>) -> String {
+    serde_json::to_string(&(endpoint.trim_end_matches('/'), index, cues, context))
+        .expect("serialize translation scope")
+}
+
 pub struct Engine {
     client: reqwest::Client,
     endpoint: String,
@@ -156,7 +163,9 @@ impl Engine {
             // Independent: one segment per request, cache checked and filled
             // around a single translate() call.
             Unit::Single { id, text, .. } => {
-                let key = cache.as_ref().map(|c| c.key(model, target, &text));
+                let key = cache
+                    .as_ref()
+                    .map(|c| c.key(model, target, &text, &cache_scope(endpoint, &[], &[], None)));
                 if let (Some(c), Some(k)) = (cache.as_ref(), key.as_deref()) {
                     if let Some(v) = c.get(k).await {
                         return UnitDone {
@@ -214,7 +223,17 @@ impl Engine {
                 // Per-cue cache keys (shared by the get fast-path and the put).
                 let keys: Vec<Option<String>> = cue_refs
                     .iter()
-                    .map(|t| cache.as_ref().map(|c| c.key(model, target, t)))
+                    .enumerate()
+                    .map(|(index, t)| {
+                        cache.as_ref().map(|c| {
+                            c.key(
+                                model,
+                                target,
+                                t,
+                                &cache_scope(endpoint, &cue_refs, &ctx_refs, Some(index)),
+                            )
+                        })
+                    })
                     .collect();
 
                 // All-cached fast path: skip the HTTP round-trip entirely.
@@ -290,6 +309,20 @@ mod tests {
         .with_request_limiter(limiter)
     }
 
+    #[test]
+    fn cache_scope_distinguishes_context_strategy_neighbors_and_position() {
+        let base = cache_scope("http://model", &["bank", "river"], &["water"], Some(0));
+        for different in [
+            cache_scope("http://other", &["bank", "river"], &["water"], Some(0)),
+            cache_scope("http://model", &["bank", "river"], &["money"], Some(0)),
+            cache_scope("http://model", &["bank", "money"], &["water"], Some(0)),
+            cache_scope("http://model", &["bank", "river"], &["water"], Some(1)),
+            cache_scope("http://model", &[], &[], None),
+        ] {
+            assert_ne!(base, different);
+        }
+    }
+
     #[tokio::test]
     async fn engines_share_one_request_budget() {
         let limiter = Arc::new(Semaphore::new(1));
@@ -352,8 +385,18 @@ mod tests {
         let cache_dir = std::env::temp_dir().join(format!("ferryman-cache-test-{}", uuid()));
         let cache = Cache::open(Some(cache_dir.clone())).unwrap();
         // Prime the cache for two of the three cues.
-        for text in ["one", "two"] {
-            let key = cache.key("model", "target", text);
+        for (index, text) in ["one", "two"].into_iter().enumerate() {
+            let key = cache.key(
+                "model",
+                "target",
+                text,
+                &cache_scope(
+                    &format!("http://{addr}"),
+                    &["one", "two", "three"],
+                    &[],
+                    Some(index),
+                ),
+            );
             cache.put(&key, &format!("cached-{text}")).await;
         }
 
@@ -385,16 +428,35 @@ mod tests {
         );
         // Exactly one request, carrying only the missing cue.
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
-        let prompts = prompts.lock().unwrap();
-        assert_eq!(prompts.len(), 1);
-        assert!(
-            prompts[0].contains("<c1>three</c1>"),
-            "only the miss goes out"
-        );
-        assert!(
-            !prompts[0].contains("<c1>one</c1>"),
-            "cached cues stay home"
-        );
+        {
+            let prompts = prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 1);
+            assert!(
+                prompts[0].contains("<c1>three</c1>"),
+                "only the miss goes out"
+            );
+            assert!(
+                !prompts[0].contains("<c1>one</c1>"),
+                "cached cues stay home"
+            );
+        }
+        // Same full request resumes entirely from cache; a different context
+        // must send all cues again instead of reusing the old meaning.
+        for (context, expected_calls) in [(vec![], 1), (vec!["different narrative".into()], 2)] {
+            let result = engine
+                .exec_unit(Unit::Batch {
+                    file: 1,
+                    ids: vec![1, 2, 3],
+                    cues: vec!["one".into(), "two".into(), "three".into()],
+                    context,
+                })
+                .await;
+            assert_eq!(result.pairs.len(), 3);
+            assert_eq!(attempts.load(Ordering::Relaxed), expected_calls);
+            if expected_calls == 2 {
+                assert_eq!(result.pairs[0].1, "one");
+            }
+        }
 
         std::fs::remove_dir_all(cache_dir).ok();
     }

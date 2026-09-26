@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -15,6 +15,82 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
+/// Bound both advertised sizes and actual decompressed bytes. Upload limits
+/// apply to compressed bytes and cannot protect the parser on their own.
+#[derive(Clone, Copy)]
+pub(crate) struct ArchiveLimits {
+    pub entries: usize,
+    pub entry_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl Default for ArchiveLimits {
+    fn default() -> Self {
+        Self {
+            entries: 10_000,
+            entry_bytes: 128 * 1024 * 1024,
+            total_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+pub(crate) fn read_entries<R: Read + Seek>(
+    za: &mut ZipArchive<R>,
+    limits: ArchiveLimits,
+) -> Result<Vec<Entry>> {
+    anyhow::ensure!(
+        za.len() <= limits.entries,
+        "archive exceeds entry count limit ({})",
+        limits.entries
+    );
+    let mut advertised = 0u64;
+    for index in 0..za.len() {
+        let entry = za.by_index(index)?;
+        anyhow::ensure!(
+            entry.size() <= limits.entry_bytes,
+            "archive entry exceeds size limit: {}",
+            entry.name()
+        );
+        advertised = advertised
+            .checked_add(entry.size())
+            .context("archive size overflow")?;
+        anyhow::ensure!(
+            advertised <= limits.total_bytes,
+            "archive exceeds total decompressed size limit"
+        );
+    }
+    let mut remaining = limits.total_bytes;
+    let mut entries = Vec::with_capacity(za.len());
+    for index in 0..za.len() {
+        let mut entry = za.by_index(index)?;
+        let name = entry.name().to_owned();
+        let is_dir = entry.is_dir();
+        let method = entry.compression();
+        let data = read_bounded(&mut entry, limits.entry_bytes.min(remaining))
+            .with_context(|| format!("decompress archive entry {name}"))?;
+        remaining -= data.len() as u64;
+        entries.push(Entry {
+            name,
+            data,
+            method,
+            is_dir,
+        });
+    }
+    Ok(entries)
+}
+
+fn read_bounded(reader: &mut impl Read, limit: u64) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut data)?;
+    anyhow::ensure!(
+        data.len() as u64 <= limit,
+        "archive decompressed byte limit exceeded"
+    );
+    Ok(data)
+}
+
 pub struct Epub {
     pub entries: Vec<Entry>,
 }
@@ -23,21 +99,7 @@ impl Epub {
     pub fn load(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mut za = ZipArchive::new(file).context("read zip")?;
-        let mut entries = Vec::with_capacity(za.len());
-        for i in 0..za.len() {
-            let mut zf = za.by_index(i)?;
-            let name = zf.name().to_string();
-            let is_dir = zf.is_dir();
-            let method = zf.compression();
-            let mut data = Vec::new();
-            zf.read_to_end(&mut data)?;
-            entries.push(Entry {
-                name,
-                data,
-                method,
-                is_dir,
-            });
-        }
+        let entries = read_entries(&mut za, ArchiveLimits::default())?;
         Ok(Epub { entries })
     }
 
@@ -172,6 +234,64 @@ fn join_path(dir: &str, href: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_limits_reject_count_entry_and_total_sizes() {
+        use std::io::Cursor;
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for name in ["one", "two"] {
+            writer
+                .start_file(
+                    name,
+                    SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+                )
+                .unwrap();
+            writer.write_all(&[b'a'; 64]).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        for limits in [
+            ArchiveLimits {
+                entries: 1,
+                entry_bytes: 128,
+                total_bytes: 256,
+            },
+            ArchiveLimits {
+                entries: 2,
+                entry_bytes: 63,
+                total_bytes: 256,
+            },
+            ArchiveLimits {
+                entries: 2,
+                entry_bytes: 64,
+                total_bytes: 127,
+            },
+        ] {
+            let mut zip = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+            assert!(read_entries(&mut zip, limits).is_err());
+        }
+        let mut zip = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        assert_eq!(
+            read_entries(
+                &mut zip,
+                ArchiveLimits {
+                    entries: 2,
+                    entry_bytes: 64,
+                    total_bytes: 128
+                }
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+        // Enforce the actual stream size even when metadata understates it.
+        assert!(read_bounded(&mut Cursor::new(vec![0; 65]), 64).is_err());
+        assert_eq!(
+            read_bounded(&mut Cursor::new(vec![0; 64]), 64)
+                .unwrap()
+                .len(),
+            64
+        );
+    }
 
     #[test]
     fn parent_dir_cases() {

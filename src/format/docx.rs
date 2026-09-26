@@ -29,26 +29,21 @@
 //! is mechanical. Legacy binary `.doc` is not supported (it isn't a zip — it
 //! needs a dedicated OLE parser).
 
+use crate::archive::{read_entries, ArchiveLimits, Entry as DxEntry};
 use crate::format::{Document, OutputMode, Segment, SegmentId, Strategy};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Write};
+#[cfg(test)]
+use std::io::Read;
+use std::io::Write;
 use std::ops::Range;
 use std::path::Path;
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipArchive, ZipWriter};
+use zip::{ZipArchive, ZipWriter};
 
 /// The wordprocessingml namespace (the `w:` prefix used throughout document.xml).
 const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-
-/// One archive entry preserved for round-tripping (only document.xml is edited).
-struct DxEntry {
-    name: String,
-    data: Vec<u8>,
-    method: CompressionMethod,
-    is_dir: bool,
-}
 
 /// A paragraph: its byte range in the original `document.xml` and its
 /// concatenated plain text. Built once at open; [`Document::segments`] and
@@ -77,21 +72,7 @@ impl DocxDoc {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mut za = ZipArchive::new(file).context("read docx zip")?;
-        let mut entries = Vec::with_capacity(za.len());
-        for i in 0..za.len() {
-            let mut zf = za.by_index(i)?;
-            let name = zf.name().to_string();
-            let is_dir = zf.is_dir();
-            let method = zf.compression();
-            let mut data = Vec::new();
-            zf.read_to_end(&mut data)?;
-            entries.push(DxEntry {
-                name,
-                data,
-                method,
-                is_dir,
-            });
-        }
+        let entries = read_entries(&mut za, ArchiveLimits::default())?;
 
         let doc_idx = entries
             .iter()

@@ -1,75 +1,42 @@
 #!/bin/sh
 set -eu
-
-# Produce fingerprinted static assets for the scratch web image.
-npm ci
-npm run build
-
-if ! command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
-    echo "missing x86_64-linux-gnu-gcc (install gcc-x86-64-linux-gnu)" >&2
+. "$(dirname -- "$0")/build-common.sh"
+PRODUCT=web
+BINARY=ferryman-web
+RUST_TARGET=x86_64-unknown-linux-gnu
+CROSS_PREFIX=x86_64-linux-gnu
+init_build
+require_command npm
+require_command node
+test "$(node --version)" = "v$(cat .nvmrc)" || {
+    echo "use the Node version in .nvmrc (nvm install && nvm use)" >&2
     exit 1
-fi
+}
 
-rustup target add x86_64-unknown-linux-gnu >/dev/null
-CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
-AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar \
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
-    cargo build --release --target x86_64-unknown-linux-gnu --bin ferryman-web
-cargo build --release --bin ferryman-agent
-
-mkdir -p build/web-libs ai-pod-service/cloud.lazycat.aipod.ferryman/agxorin
-cp target/x86_64-unknown-linux-gnu/release/ferryman-web build/ferryman-web
-cp target/release/ferryman-agent build/ferryman-agent
-x86_64-linux-gnu-strip build/ferryman-web
-strip build/ferryman-agent
-cp build/ferryman-agent ai-pod-service/cloud.lazycat.aipod.ferryman/agxorin/ferryman-agent
-cp /etc/ssl/certs/ca-certificates.crt build/ca-certificates.crt
-
-for library in \
-    ld-linux-x86-64.so.2 \
-    libgcc_s.so.1 \
-    libm.so.6 \
-    libc.so.6 \
-    libresolv.so.2 \
-    libnss_dns.so.2 \
-    libnss_files.so.2
-do
-    cp "/usr/x86_64-linux-gnu/lib/$library" "build/web-libs/$library"
+# Validate runtime inputs before compiling. Never reuse stale fonts or libraries.
+# Resolve libraries through the selected compiler on both ARM64 and x86 hosts.
+mkdir -p "$STAGE/web-libs" "$STAGE/fonts"
+for library in ld-linux-x86-64.so.2 libgcc_s.so.1 libm.so.6 libc.so.6 libresolv.so.2 libnss_dns.so.2 libnss_files.so.2; do
+    library_path=$("$CROSS_PREFIX-gcc" -print-file-name="$library")
+    test "$library_path" != "$library" && test -r "$library_path" || {
+        echo "compiler runtime library not found: $library" >&2
+        exit 1
+    }
+    cp "$library_path" "$STAGE/web-libs/$library"
 done
-
-# CJK font for PDF output — the scratch web image has none of its own. The
-# PDF backend loads it from /app/fonts (see src/format/pdf.rs).
-mkdir -p build/fonts
-for font in \
-    /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc \
-    /usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc \
-    /usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc \
-    /usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc
-do
-    if [ -f "$font" ]; then
-        cp "$font" build/fonts/NotoSansCJK-Regular.ttc
-        break
-    fi
+cp /etc/ssl/certs/ca-certificates.crt "$STAGE/ca-certificates.crt"
+cp runtime/nsswitch.conf "$STAGE/nsswitch.conf"
+cp /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc "$STAGE/fonts/"
+for name in NotoSans NotoSansArabic NotoSansHebrew NotoSansDevanagari NotoSansThai; do
+    cp "/usr/share/fonts/truetype/noto/$name-Regular.ttf" "$STAGE/fonts/"
 done
-if [ ! -f build/fonts/NotoSansCJK-Regular.ttc ]; then
-    echo "warning: no CJK font found; PDF jobs will fail at runtime (install fonts-noto-cjk)" >&2
-fi
-
-# Optional Unicode fallbacks for shaping; missing coverage produces an explicit
-# job error. Install fonts-noto-core to include Arabic/Hebrew/Indic/Thai support.
-for name in NotoSans-Regular.ttf NotoSansArabic-Regular.ttf NotoSansHebrew-Regular.ttf NotoSansDevanagari-Regular.ttf NotoSansThai-Regular.ttf DejaVuSans.ttf
-do
-    for root in /usr/share/fonts/truetype/noto /usr/share/fonts/truetype/dejavu
-    do
-        if [ -f "$root/$name" ]; then
-            cp "$root/$name" "build/fonts/$name"
-            break
-        fi
-    done
+cp /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf "$STAGE/fonts/"
+for package in fonts-noto-cjk fonts-noto-core fonts-dejavu-core; do
+    cp "/usr/share/doc/$package/copyright" "$STAGE/fonts/$package.copyright"
 done
-for package in fonts-noto-cjk fonts-noto-core fonts-dejavu-core
-do
-    if [ -f "/usr/share/doc/$package/copyright" ]; then
-        cp "/usr/share/doc/$package/copyright" "build/fonts/$package.copyright"
-    fi
-done
+npm ci --prefer-offline --no-audit --no-fund
+npm run build
+cp -R dist/web "$STAGE/assets"
+build_binary "$STAGE/ferryman-web"
+python3 scripts/check-artifacts.py write web "$STAGE"
+publish_stage

@@ -6,6 +6,8 @@ package_override:
   package: cloud.lazycat.aipod.ferryman
   name: Ferryman AI Pod Agent
   description: Ferryman document translation model service for Lazycat AI Pod
+  min_os_version: 1.5.2
+  permissions: {}
 resource_exports:
   - kind: aipod
-    source: ./ai-pod-service/cloud.lazycat.aipod.ferryman
+    source: ./build/aipod

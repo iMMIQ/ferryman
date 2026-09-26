@@ -1,0 +1,17 @@
+# Standalone build context is a source allowlist. The Lazycat root Dockerfiles
+# intentionally use a different context that includes prepared build artifacts.
+**
+!docker/
+!docker/Dockerfile
+!.cargo/
+!.cargo/config.toml
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!package.json
+!package-lock.json
+!tsconfig.json
+!vite.config.ts
+!web/
+!web/**

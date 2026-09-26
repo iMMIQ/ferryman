@@ -1,9 +1,16 @@
 services:
   ferryman-agent:
-    image: docker.io/catdogai/lzc-aipod-vllm:agxorin-cu126-src-18f658bb3185-20260703
+    image: docker.io/catdogai/lzc-aipod-vllm:agxorin-cu126-src-18f658bb3185-20260703@sha256:079f2ab5a3f19da5fbdf930476fed73625c3d47085407280fbee48c4293279be
     entrypoint: ["/usr/local/bin/ferryman-agent"]
     shm_size: 512m
     restart: unless-stopped
+    # Agent health is independent of an on-demand model's loaded state.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
     environment:
       FERRYMAN_AGENT_LISTEN: 0.0.0.0:8090
       FERRYMAN_AUTH_STATE_FILE: /auth/token.sha256

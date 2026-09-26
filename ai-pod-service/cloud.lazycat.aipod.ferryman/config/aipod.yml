@@ -1,2 +1,5 @@
 shortcut:
   disable: false
+  title: Ferryman AI Pod Agent
+depends_on_hosts:
+  - ferryman-agent-ai

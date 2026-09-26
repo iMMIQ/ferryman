@@ -13,7 +13,7 @@ use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use ferryman::batch::{collect_inputs, is_generated_output, suffixed_output_path};
+use ferryman::batch::{is_generated_output, suffixed_output_path};
 use ferryman::format::{Format, OutputMode};
 use ferryman::preset::Preset;
 use ferryman::settings::TranslationSettings;
@@ -59,6 +59,8 @@ struct DirectoryJobsResponse {
     jobs: Vec<JobRecord>,
     skipped_existing: usize,
     skipped_incompatible: usize,
+    skipped_unsupported: usize,
+    skipped_generated: usize,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +77,8 @@ pub(crate) enum JobPhase {
     InProgress,
     Completed,
     Failed,
+    Partial,
+    Cancelled,
 }
 
 impl JobPhase {
@@ -82,7 +86,9 @@ impl JobPhase {
         match self {
             Self::Queued => " AND status='queued'",
             Self::InProgress => " AND status IN ('starting_model', 'translating', 'writing')",
-            Self::Completed => " AND status='completed'",
+            Self::Completed => " AND status='completed' AND failed_segments=0",
+            Self::Partial => " AND status='completed' AND failed_segments>0",
+            Self::Cancelled => " AND status='cancelled'",
             Self::Failed => " AND status='failed'",
         }
     }
@@ -115,13 +121,28 @@ fn decode_job_cursor(value: &str) -> Result<JobCursor> {
 fn collect_selected_inputs(
     paths: &[(StorageKind, PathBuf)],
 ) -> Result<Vec<(StorageKind, PathBuf)>> {
+    fn visit(
+        storage: StorageKind,
+        path: &FsPath,
+        inputs: &mut BTreeSet<(StorageKind, PathBuf)>,
+    ) -> Result<()> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                visit(storage, &entry?.path(), inputs)?;
+            }
+        } else if metadata.is_file() {
+            inputs.insert((storage, path.to_path_buf()));
+            anyhow::ensure!(
+                inputs.len() <= MAX_DIRECTORY_FILES,
+                "selection contains too many files"
+            );
+        }
+        Ok(())
+    }
     let mut inputs = BTreeSet::new();
     for (storage, path) in paths {
-        inputs.extend(
-            collect_inputs(path)?
-                .into_iter()
-                .map(|input| (*storage, input)),
-        );
+        visit(*storage, path, &mut inputs)?;
     }
     Ok(inputs.into_iter().collect())
 }
@@ -583,6 +604,23 @@ pub(super) async fn create_directory_jobs(
     headers: HeaderMap,
     Json(request): Json<CreateDirectoryJobsRequest>,
 ) -> Response {
+    directory_jobs(state, headers, request, false).await
+}
+
+pub(super) async fn preview_directory_jobs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateDirectoryJobsRequest>,
+) -> Response {
+    directory_jobs(state, headers, request, true).await
+}
+
+async fn directory_jobs(
+    state: AppState,
+    headers: HeaderMap,
+    request: CreateDirectoryJobsRequest,
+    preview: bool,
+) -> Response {
     let identity = match user_identity(&headers, state.config.allow_local_user) {
         Ok(identity) => identity,
         Err(status) => return json_error(status, "missing or invalid user identity"),
@@ -671,42 +709,20 @@ pub(super) async fn create_directory_jobs(
             format!("selection contains more than {MAX_DIRECTORY_FILES} supported files"),
         );
     }
-    let eligible_count = inputs
-        .iter()
-        .filter(|(_, path)| !is_generated_output(path))
-        .filter(|(_, path)| {
-            mode != OutputMode::Replace
-                || path
-                    .extension()
-                    .is_none_or(|extension| !extension.eq_ignore_ascii_case("docx"))
-        })
-        .count();
-    match state.store.count_active(identity.owner.clone()).await {
-        Ok(count) if count.saturating_add(eligible_count) > MAX_USER_NONTERMINAL_JOBS => {
-            return json_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "selection would exceed the queued or active job limit",
-            )
-        }
-        Ok(_) => {}
-        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")),
-    }
-
     let mut jobs = Vec::new();
+    let mut preview_files = Vec::new();
+    let mut planned = Vec::new();
     let mut skipped_existing = 0usize;
     let mut skipped_incompatible = 0usize;
-    for (source_storage, input) in inputs
-        .into_iter()
-        .filter(|(_, path)| !is_generated_output(path))
-    {
-        if mode == OutputMode::Replace
+    let mut skipped_unsupported = 0usize;
+    let mut skipped_generated = 0usize;
+    for (source_storage, input) in inputs {
+        let unsupported = Format::from_path(&input).is_err();
+        let generated = is_generated_output(&input);
+        let incompatible = mode == OutputMode::Replace
             && input
                 .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("docx"))
-        {
-            skipped_incompatible += 1;
-            continue;
-        }
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("docx"));
         let source_root = source_roots
             .get(&source_storage)
             .expect("resolved source storage root");
@@ -761,13 +777,75 @@ pub(super) async fn create_directory_jobs(
                 )
             }
         };
-        if request.save_strategy != SaveStrategy::SiblingOverwrite
-            && tokio::fs::symlink_metadata(&save_to).await.is_ok()
-        {
+        let source_path = path_for_api(relative_input);
+        let existing = request.save_strategy != SaveStrategy::SiblingOverwrite
+            && tokio::fs::symlink_metadata(&save_to).await.is_ok();
+        let reason = if unsupported {
+            Some("不支持的文件格式")
+        } else if generated {
+            Some("已生成的译文，不重复翻译")
+        } else if incompatible {
+            Some("DOCX 仅支持双语对照")
+        } else if existing {
+            Some("输出文件已存在，不会覆盖")
+        } else {
+            None
+        };
+        preview_files.push(serde_json::json!({
+            "source_path": source_path, "source_storage": source_storage,
+            "save_path": save_path, "save_storage": save_storage,
+            "overwrite": request.save_strategy == SaveStrategy::SiblingOverwrite,
+            "skip_reason": reason,
+        }));
+        if unsupported {
+            skipped_unsupported += 1;
+            continue;
+        }
+        if generated {
+            skipped_generated += 1;
+            continue;
+        }
+        if incompatible {
+            skipped_incompatible += 1;
+            continue;
+        }
+        if existing {
             skipped_existing += 1;
             continue;
         }
-        let source_path = path_for_api(relative_input);
+        planned.push((
+            input,
+            source_path,
+            source_storage,
+            save_root,
+            save_to,
+            save_path,
+            save_storage,
+        ));
+    }
+    let eligible_count = planned.len();
+    match state.store.count_active(identity.owner.clone()).await {
+        Ok(count) if count.saturating_add(eligible_count) > MAX_USER_NONTERMINAL_JOBS => {
+            return json_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "selection would exceed the queued or active job limit",
+            )
+        }
+        Ok(_) => {}
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")),
+    }
+
+    if preview {
+        return Json(serde_json::json!({
+            "eligible_count": eligible_count,
+            "skipped_existing": skipped_existing, "skipped_incompatible": skipped_incompatible,
+            "skipped_unsupported": skipped_unsupported, "skipped_generated": skipped_generated,
+            "files": preview_files,
+        }))
+        .into_response();
+    }
+    for (input, source_path, source_storage, save_root, save_to, save_path, save_storage) in planned
+    {
         match enqueue_document_job(
             &state,
             &identity,
@@ -798,6 +876,8 @@ pub(super) async fn create_directory_jobs(
             jobs,
             skipped_existing,
             skipped_incompatible,
+            skipped_unsupported,
+            skipped_generated,
         }),
     )
         .into_response()
@@ -848,15 +928,27 @@ pub(super) async fn retry_job(
         Ok(owner) => owner,
         Err(status) => return json_error(status, "missing SAFE_UID header"),
     };
+    if state
+        .active_jobs
+        .read()
+        .await
+        .get(&id)
+        .is_some_and(|entry| entry.owner == owner)
+    {
+        return json_error(StatusCode::CONFLICT, "任务仍在运行或停止中，请稍后重试");
+    }
     let mut entry = match state
         .store
-        .retry_failed(owner, id, now_epoch_seconds(), MAX_USER_NONTERMINAL_JOBS)
+        .retry_incomplete(owner, id, now_epoch_seconds(), MAX_USER_NONTERMINAL_JOBS)
         .await
     {
         Ok(RetryJobOutcome::Retried(entry)) => *entry,
         Ok(RetryJobOutcome::NotFound) => return json_error(StatusCode::NOT_FOUND, "job not found"),
-        Ok(RetryJobOutcome::NotFailed) => {
-            return json_error(StatusCode::CONFLICT, "only failed jobs can be retried")
+        Ok(RetryJobOutcome::NotRetryable) => {
+            return json_error(
+                StatusCode::CONFLICT,
+                "only failed, cancelled or partially completed jobs can be retried",
+            )
         }
         Ok(RetryJobOutcome::AtLimit) => {
             return json_error(
@@ -867,64 +959,15 @@ pub(super) async fn retry_job(
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")),
     };
 
-    // A previous attempt may have already saved its result into the user's
-    // storage. When that saved copy is byte-identical to this job's own last
-    // output it is our artifact and must be cleared too — otherwise the rerun
-    // fails at save time with "output file already exists" and retrying could
-    // never succeed. A file that differs (or predates the job) is left
-    // untouched and reported as a conflict instead.
-    if let Some(target) = entry.save_to.as_ref().filter(|_| entry.save_root.is_some()) {
-        match tokio::fs::symlink_metadata(target).await {
-            Ok(metadata) => {
-                let is_our_artifact = metadata.is_file()
-                    && !metadata.file_type().is_symlink()
-                    && crate::runner::files_are_identical(&entry.output, target)
-                        .await
-                        .unwrap_or(false);
-                if !is_our_artifact {
-                    entry.record.status = JobStatus::Failed;
-                    entry.record.error = Some(
-                        "save target already exists with different content; \
-                         delete it or create the job with overwrite enabled"
-                            .to_string(),
-                    );
-                    entry.record.updated_at = now_epoch_seconds();
-                    if let Err(store_error) = state.store.update(entry).await {
-                        error!(%id, %store_error, "restore failed job after retry conflict");
-                    }
-                    return json_error(
-                        StatusCode::CONFLICT,
-                        "save target already exists with different content; \
-                         delete it or create the job with overwrite enabled",
-                    );
-                }
-                if let Err(error) = tokio::fs::remove_file(target).await {
-                    entry.record.status = JobStatus::Failed;
-                    entry.record.error = Some(format!("clear saved result before retry: {error}"));
-                    entry.record.updated_at = now_epoch_seconds();
-                    if let Err(store_error) = state.store.update(entry).await {
-                        error!(%id, %store_error, "restore failed job after retry cleanup error");
-                    }
-                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    if let Err(error) = prepare_retry_output(&entry).await {
+        entry.record.status = JobStatus::Failed;
+        entry.record.error = Some(format!("{error:#}"));
+        entry.record.result_available = tokio::fs::metadata(&entry.output).await.is_ok();
+        entry.record.updated_at = now_epoch_seconds();
+        if let Err(store_error) = state.store.update(entry).await {
+            error!(%id, %store_error, "restore failed job after retry preparation");
         }
-    }
-
-    match tokio::fs::remove_file(&entry.output).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            entry.record.status = JobStatus::Failed;
-            entry.record.error = Some(format!("clear previous result before retry: {error}"));
-            entry.record.updated_at = now_epoch_seconds();
-            if let Err(store_error) = state.store.update(entry).await {
-                error!(%id, %store_error, "restore failed job after retry cleanup error");
-            }
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
-        }
+        return json_error(StatusCode::CONFLICT, format!("{error:#}"));
     }
 
     let record = entry.record.clone();
@@ -941,8 +984,65 @@ pub(super) async fn retry_job(
     Json(record).into_response()
 }
 
+// Preserve the previous saved copy until a retry has a replacement ready.
+// The snapshot also prevents a retry from overwriting later user edits.
+pub(crate) async fn prepare_retry_output(entry: &JobEntry) -> Result<()> {
+    let snapshot = entry.dir.join("retry-save-base");
+    if let Some(target) = entry.save_to.as_ref().filter(|_| entry.save_root.is_some()) {
+        match tokio::fs::symlink_metadata(target).await {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.is_file() && !metadata.file_type().is_symlink(),
+                    "保存位置不是普通文件"
+                );
+                let previous_result = crate::runner::files_are_identical(&entry.output, target)
+                    .await
+                    .unwrap_or(false);
+                let original = entry.overwrite
+                    && crate::runner::files_are_identical(&entry.input, target)
+                        .await
+                        .unwrap_or(false);
+                let previous_base = crate::runner::files_are_identical(&snapshot, target)
+                    .await
+                    .unwrap_or(false);
+                anyhow::ensure!(
+                    previous_result || original || previous_base,
+                    "保存位置的文件已被修改，无法安全重试；请另建任务并选择新的保存位置"
+                );
+                let temp = entry.dir.join("retry-save-base.tmp");
+                tokio::fs::copy(target, &temp).await?;
+                tokio::fs::rename(temp, snapshot).await?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match tokio::fs::remove_file(snapshot).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn result_is_downloadable(status: JobStatus, result_available: bool) -> bool {
     status == JobStatus::Completed || result_available
+}
+
+fn result_disposition(name: &str, extension: &str) -> String {
+    let encoded: String = name
+        .as_bytes()
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"-._~".contains(byte) {
+                (*byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect();
+    format!("attachment; filename=\"ferryman-result.{extension}\"; filename*=UTF-8''{encoded}")
 }
 
 pub(super) async fn download_result(
@@ -971,7 +1071,9 @@ pub(super) async fn download_result(
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("bin");
-    let disposition = format!("attachment; filename=\"ferryman-result.{extension}\"");
+    let name = suffixed_output_path(FsPath::new(&entry.record.filename), entry.record.mode);
+    let name = name.file_name().unwrap_or_default().to_string_lossy();
+    let disposition = result_disposition(&name, extension);
     let mut response = Response::new(Body::from_stream(ReaderStream::new(file)));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -994,6 +1096,15 @@ pub(super) async fn delete_job(
         Ok(owner) => owner,
         Err(status) => return json_error(status, "missing SAFE_UID header"),
     };
+    if state
+        .active_jobs
+        .read()
+        .await
+        .get(&id)
+        .is_some_and(|entry| entry.owner == owner)
+    {
+        return json_error(StatusCode::CONFLICT, "任务仍在停止中，请稍后删除");
+    }
     let entry = match state.store.get(owner.clone(), id).await {
         Ok(Some(entry)) => entry,
         Ok(None) => return json_error(StatusCode::NOT_FOUND, "job not found"),
@@ -1046,6 +1157,16 @@ mod tests {
     use tokio::sync::{mpsc, Mutex, RwLock};
 
     #[test]
+    fn download_names_preserve_unicode_and_escape_header_characters() {
+        let header = result_disposition("报告.bilingual.pdf", "pdf");
+        assert!(header.contains("filename*=UTF-8''%E6%8A%A5%E5%91%8A.bilingual.pdf"));
+        let header = result_disposition("a\"\r\n.txt", "txt");
+        assert!(!header.contains('\r'));
+        assert!(!header.contains('\n'));
+        assert!(header.contains("%22%0D%0A"));
+    }
+
+    #[test]
     fn completed_or_partial_results_can_be_downloaded() {
         assert!(result_is_downloadable(JobStatus::Completed, false));
         assert!(result_is_downloadable(JobStatus::Cancelled, true));
@@ -1087,6 +1208,7 @@ mod tests {
             vec![
                 (StorageKind::Documents, books.join("Notes/chapter.md")),
                 (StorageKind::Documents, books.join("book.txt")),
+                (StorageKind::Documents, books.join("cover.jpg")),
             ]
         );
 
@@ -1115,6 +1237,70 @@ mod tests {
                 client: reqwest::Client::new(),
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn selection_preview_reports_destinations_and_skips_without_creating_jobs() {
+        let base = env::temp_dir().join(format!("ferryman-preview-{}", Uuid::new_v4()));
+        let state = test_app_state(&base).await;
+        let books = state
+            .config
+            .user_documents_dir
+            .join("local-development-user/Books");
+        tokio::fs::create_dir_all(&books).await.unwrap();
+        for name in [
+            "book.txt",
+            "existing.txt",
+            "existing.translated.txt",
+            "manual.docx",
+            "cover.jpg",
+        ] {
+            tokio::fs::write(books.join(name), b"fixture")
+                .await
+                .unwrap();
+        }
+        let request: CreateDirectoryJobsRequest = serde_json::from_value(serde_json::json!({
+            "sources": [{"storage":"documents","path":"Books"}],
+            "save_strategy":"sibling_suffix", "preset":"7b-fp8", "target":"中文", "mode":"replace"
+        }))
+        .unwrap();
+        let response =
+            preview_directory_jobs(State(state.clone()), HeaderMap::new(), Json(request)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let preview: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(preview["eligible_count"], 1);
+        assert_eq!(preview["skipped_existing"], 1);
+        assert_eq!(preview["skipped_incompatible"], 1);
+        assert_eq!(preview["skipped_unsupported"], 1);
+        assert_eq!(preview["skipped_generated"], 1);
+        assert!(preview["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["save_path"] == "Books/book.translated.txt"));
+        assert_no_job_dirs(&state).await;
+        assert_eq!(
+            state
+                .store
+                .count_active("local-development-user".into())
+                .await
+                .unwrap(),
+            0
+        );
+        let invalid: CreateDirectoryJobsRequest = serde_json::from_value(serde_json::json!({
+            "sources": [{"storage":"documents","path":"../outside"}],
+            "save_strategy":"sibling_overwrite", "preset":"7b-fp8", "target":"中文", "mode":"bilingual"
+        })).unwrap();
+        assert_eq!(
+            preview_directory_jobs(State(state), HeaderMap::new(), Json(invalid))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        tokio::fs::remove_dir_all(base).await.unwrap();
     }
 
     async fn multipart_from_body(body: String, boundary: &str) -> Multipart {

@@ -33,7 +33,7 @@ pub(crate) struct JobPage {
 pub(crate) enum RetryJobOutcome {
     Retried(Box<JobEntry>),
     NotFound,
-    NotFailed,
+    NotRetryable,
     AtLimit,
 }
 
@@ -304,7 +304,7 @@ impl JobStore {
         .await
     }
 
-    pub(crate) async fn retry_failed(
+    pub(crate) async fn retry_incomplete(
         &self,
         owner: String,
         id: Uuid,
@@ -316,15 +316,15 @@ impl JobStore {
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let status = transaction
                 .query_row(
-                    "SELECT status FROM jobs WHERE id=?1 AND owner=?2",
+                    "SELECT status, failed_segments FROM jobs WHERE id=?1 AND owner=?2",
                     params![id.to_string(), &owner],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?;
-            match status.as_deref() {
+            match status {
                 None => return Ok(RetryJobOutcome::NotFound),
-                Some("failed") => {}
-                Some(_) => return Ok(RetryJobOutcome::NotFailed),
+                Some((status, failed)) if status == "failed" || status == "cancelled" || (status == "completed" && failed > 0) => {}
+                Some(_) => return Ok(RetryJobOutcome::NotRetryable),
             }
             let active = transaction.query_row(
                 "SELECT COUNT(*) FROM jobs
@@ -340,7 +340,7 @@ impl JobStore {
                     status='queued', total=0, completed=0, translated=0,
                     failed_segments=0, error=NULL, result_available=0,
                     created_at=?2, updated_at=?2
-                 WHERE id=?1 AND owner=?3 AND status='failed'",
+                 WHERE id=?1 AND owner=?3 AND (status IN ('failed', 'cancelled') OR (status='completed' AND failed_segments>0))",
                 params![id.to_string(), to_i64(now)?, &owner],
             )?;
             let entry = transaction.query_row(
@@ -870,14 +870,14 @@ mod tests {
 
         assert!(matches!(
             store
-                .retry_failed("bob".to_string(), failed_id, 20, 10)
+                .retry_incomplete("bob".to_string(), failed_id, 20, 10)
                 .await
                 .unwrap(),
             RetryJobOutcome::NotFound
         ));
 
         let retried = match store
-            .retry_failed("alice".to_string(), failed_id, 20, 10)
+            .retry_incomplete("alice".to_string(), failed_id, 20, 10)
             .await
             .unwrap()
         {
@@ -896,12 +896,53 @@ mod tests {
 
         assert!(matches!(
             store
-                .retry_failed("alice".to_string(), failed_id, 30, 10)
+                .retry_incomplete("alice".to_string(), failed_id, 30, 10)
                 .await
                 .unwrap(),
-            RetryJobOutcome::NotFailed
+            RetryJobOutcome::NotRetryable
         ));
 
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_accepts_partial_and_cancelled_but_not_complete_jobs() {
+        let (root, store) = test_store().await;
+        for (status, failures, allowed) in [
+            (JobStatus::Completed, 3, true),
+            (JobStatus::Cancelled, 0, true),
+            (JobStatus::Completed, 0, false),
+            (JobStatus::Translating, 3, false),
+        ] {
+            let id = Uuid::new_v4();
+            let mut entry = test_entry("alice", id, 10, status);
+            entry.record.failed_segments = failures;
+            store.insert(entry, 10).await.unwrap();
+            let phase = match status {
+                JobStatus::Completed if failures > 0 => JobPhase::Partial,
+                JobStatus::Completed => JobPhase::Completed,
+                JobStatus::Cancelled => JobPhase::Cancelled,
+                _ => JobPhase::InProgress,
+            };
+            let page = store
+                .list_page("alice".into(), Some(phase), None, 10)
+                .await
+                .unwrap();
+            assert!(page.jobs.iter().any(|job| job.id == id));
+            assert!(page.jobs.iter().all(|job| match phase {
+                JobPhase::Partial => job.failed_segments > 0 && job.status == JobStatus::Completed,
+                JobPhase::Completed =>
+                    job.failed_segments == 0 && job.status == JobStatus::Completed,
+                JobPhase::Cancelled => job.status == JobStatus::Cancelled,
+                _ => true,
+            }));
+            let result = store
+                .retry_incomplete("alice".into(), id, 20, 10)
+                .await
+                .unwrap();
+            assert_eq!(matches!(result, RetryJobOutcome::Retried(_)), allowed);
+        }
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -974,7 +1015,7 @@ mod tests {
 
         assert!(matches!(
             store
-                .retry_failed("alice".to_string(), failed_id, 3, 1)
+                .retry_incomplete("alice".to_string(), failed_id, 3, 1)
                 .await
                 .unwrap(),
             RetryJobOutcome::AtLimit

@@ -2,3 +2,5 @@ target
 .git
 ferryman-data
 *.lpk
+
+node_modules

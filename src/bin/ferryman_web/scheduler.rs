@@ -15,6 +15,7 @@ async fn process_queued_job(state: AppState, id: Uuid) {
     let Some(entry) = claim_queued_job(&state, id).await else {
         return;
     };
+    let output = entry.output.clone();
     if let Err(error) = run_job(&state, entry).await {
         warn!(%id, %error, "job failed");
         let cancelled = state
@@ -24,8 +25,12 @@ async fn process_queued_job(state: AppState, id: Uuid) {
             .get(&id)
             .is_some_and(|entry| entry.record.status == JobStatus::Cancelled);
         if !cancelled {
+            let available = tokio::fs::metadata(&output)
+                .await
+                .is_ok_and(|metadata| metadata.is_file());
             mutate_job(&state, id, |job| {
                 job.status = JobStatus::Failed;
+                job.result_available = available;
                 job.error = Some(format!("{error:#}"));
             })
             .await;

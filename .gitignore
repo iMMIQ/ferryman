@@ -19,3 +19,6 @@ ai-pod-service/**/ferryman-agent
 # Local two-process dev run (README "Web app and Lazycat deployment")
 /ferryman-documents/
 /ferryman-remotefs/
+
+# Browser UI regression tooling
+node_modules/

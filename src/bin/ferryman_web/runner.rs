@@ -59,10 +59,26 @@ async fn save_job_result(entry: &JobEntry) -> Result<()> {
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("output path has no filename"))?;
     let target = parent.join(filename);
+    let retry_base = entry.dir.join("retry-save-base");
+    let retry_replace = tokio::fs::try_exists(&retry_base).await?;
+    if retry_replace {
+        let metadata = tokio::fs::symlink_metadata(&target).await?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "retry target is not a regular file"
+        );
+        if files_are_identical(&entry.output, &target).await? {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            files_are_identical(&retry_base, &target).await?,
+            "保存位置在补译期间被修改，结果已保留在任务内，请下载后另存"
+        );
+    }
+    let overwrite = entry.overwrite || retry_replace;
     match tokio::fs::symlink_metadata(&target).await {
-        Ok(metadata)
-            if entry.overwrite && metadata.is_file() && !metadata.file_type().is_symlink() => {}
-        Ok(_) if entry.overwrite => anyhow::bail!("overwrite target is not a regular file"),
+        Ok(metadata) if overwrite && metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) if overwrite => anyhow::bail!("overwrite target is not a regular file"),
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
             if files_are_identical(&entry.output, &target).await? {
                 return Ok(());
@@ -70,7 +86,7 @@ async fn save_job_result(entry: &JobEntry) -> Result<()> {
             anyhow::bail!("output file already exists")
         }
         Ok(_) => anyhow::bail!("output file already exists"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !entry.overwrite => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !overwrite => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             anyhow::bail!("overwrite target no longer exists")
         }
@@ -86,7 +102,13 @@ async fn save_job_result(entry: &JobEntry) -> Result<()> {
             .await?;
         tokio::io::copy(&mut source, &mut destination).await?;
         destination.sync_all().await?;
-        if entry.overwrite {
+        if retry_replace {
+            anyhow::ensure!(
+                files_are_identical(&retry_base, &target).await?,
+                "保存位置在补译期间被修改，结果已保留在任务内，请下载后另存"
+            );
+        }
+        if overwrite {
             tokio::fs::rename(&temp, &target).await?;
         } else {
             tokio::fs::hard_link(&temp, &target).await?;
@@ -106,8 +128,8 @@ pub(crate) async fn files_are_identical(left: &FsPath, right: &FsPath) -> Result
     }
     let mut left = tokio::fs::File::open(left).await?;
     let mut right = tokio::fs::File::open(right).await?;
-    let mut left_buffer = [0_u8; 64 * 1024];
-    let mut right_buffer = [0_u8; 64 * 1024];
+    let mut left_buffer = vec![0_u8; 64 * 1024];
+    let mut right_buffer = vec![0_u8; 64 * 1024];
     loop {
         let left_read = left.read(&mut left_buffer).await?;
         let right_read = right.read(&mut right_buffer).await?;
@@ -189,7 +211,8 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
             preset.config().concurrency,
             cache,
         )
-        .with_request_limiter(request_limiter);
+        .with_request_limiter(request_limiter)
+        .with_checkpoint(Cache::open(Some(entry.dir.join("checkpoint"))));
 
         let (progress_tx, mut progress_rx) = watch::channel(BatchProgress::default());
         let callback: ProgressCallback = Arc::new(move |progress| {
@@ -351,10 +374,26 @@ mod tests {
             b"translated result"
         );
         save_job_result(&entry).await.unwrap();
-        tokio::fs::write(&target, b"different result")
+        // Retrying must retain the saved copy until an improved result exists.
+        crate::jobs_api::prepare_retry_output(&entry).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(&target).await.unwrap(),
+            b"translated result"
+        );
+        tokio::fs::write(&entry.output, b"complete translation")
             .await
             .unwrap();
+        save_job_result(&entry).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(&target).await.unwrap(),
+            b"complete translation"
+        );
+        save_job_result(&entry).await.unwrap(); // crash recovery is idempotent
+        crate::jobs_api::prepare_retry_output(&entry).await.unwrap();
+        tokio::fs::write(&target, b"user edit").await.unwrap();
+        assert!(crate::jobs_api::prepare_retry_output(&entry).await.is_err());
         assert!(save_job_result(&entry).await.is_err());
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"user edit");
         tokio::fs::remove_dir_all(&base).await.unwrap();
     }
 
@@ -407,6 +446,16 @@ mod tests {
         assert_eq!(
             tokio::fs::read(&target).await.unwrap(),
             b"translated result"
+        );
+        crate::jobs_api::prepare_retry_output(&entry).await.unwrap();
+        assert!(target.exists());
+        tokio::fs::write(&entry.output, b"retry improved result")
+            .await
+            .unwrap();
+        save_job_result(&entry).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(&target).await.unwrap(),
+            b"retry improved result"
         );
         tokio::fs::remove_dir_all(&base).await.unwrap();
     }

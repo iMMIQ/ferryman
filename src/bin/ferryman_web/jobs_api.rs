@@ -25,14 +25,17 @@ use tokio_util::io::ReaderStream;
 use tracing::error;
 use uuid::Uuid;
 
-#[derive(Deserialize, ts_rs::TS)]
+#[derive(Deserialize, Serialize, ts_rs::TS)]
 struct SourceSelection {
     storage: StorageKind,
     path: String,
 }
 
-#[derive(Deserialize, ts_rs::TS)]
+#[derive(Deserialize, Serialize, ts_rs::TS)]
 pub(super) struct CreateDirectoryJobsRequest {
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    request_id: Option<Uuid>,
     #[serde(default)]
     #[ts(as = "Option<Vec<SourceSelection>>", optional)]
     sources: Vec<SourceSelection>,
@@ -522,7 +525,7 @@ pub(super) async fn create_job(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn enqueue_document_job(
+async fn prepare_document_job(
     state: &AppState,
     identity: &UserIdentity,
     source: &FsPath,
@@ -537,7 +540,7 @@ async fn enqueue_document_job(
     target: &str,
     mode: OutputMode,
     settings: TranslationSettings,
-) -> Result<JobRecord> {
+) -> Result<JobEntry> {
     let id = Uuid::new_v4();
     let dir = state
         .config
@@ -592,22 +595,7 @@ async fn enqueue_document_job(
             updated_at: now,
         },
     };
-    state
-        .store
-        .insert(entry.clone(), MAX_USER_NONTERMINAL_JOBS)
-        .await?;
-    let record = entry.record.clone();
-    state.active_jobs.write().await.insert(id, entry);
-    if state.queue.send(id).await.is_err() {
-        mutate_job(state, id, |job| {
-            job.status = JobStatus::Failed;
-            job.error = Some("job worker unavailable".to_string());
-        })
-        .await;
-        state.active_jobs.write().await.remove(&id);
-        anyhow::bail!("job worker unavailable");
-    }
-    Ok(record)
+    Ok(entry)
 }
 
 pub(super) async fn create_directory_jobs(
@@ -615,7 +603,12 @@ pub(super) async fn create_directory_jobs(
     identity: UserIdentity,
     Json(request): Json<CreateDirectoryJobsRequest>,
 ) -> Response {
-    directory_jobs(state, identity, request, false).await
+    // The request owns preparation/publication even if the HTTP client times
+    // out. A retry with the same request_id replays the durable receipt.
+    match tokio::spawn(directory_jobs(state, identity, request, false)).await {
+        Ok(response) => response,
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
 }
 
 pub(super) async fn preview_directory_jobs(
@@ -632,6 +625,36 @@ async fn directory_jobs(
     request: CreateDirectoryJobsRequest,
     preview: bool,
 ) -> Response {
+    let payload = match serde_json::to_string(&request) {
+        Ok(payload) => payload,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    let _submission_lock = if !preview {
+        if let Some(id) = request.request_id {
+            let guard = super::lock_job(&state, id).await;
+            match state
+                .store
+                .submission(identity.owner.clone(), id, payload.clone())
+                .await
+            {
+                Ok(Some(response)) => {
+                    return (
+                        StatusCode::CREATED,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        response,
+                    )
+                        .into_response()
+                }
+                Ok(None) => {}
+                Err(error) => return json_error(StatusCode::CONFLICT, error.to_string()),
+            }
+            Some(guard)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mode = request.mode;
     let settings = match request.settings.validate_for_web() {
         Ok(settings) => settings,
@@ -857,7 +880,7 @@ async fn directory_jobs(
     }
     for (input, source_path, source_storage, save_root, save_to, save_path, save_storage) in planned
     {
-        match enqueue_document_job(
+        match prepare_document_job(
             &state,
             &identity,
             &input,
@@ -877,21 +900,68 @@ async fn directory_jobs(
         {
             Ok(job) => jobs.push(job),
             Err(error) => {
-                return json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+                for entry in &jobs {
+                    let _ = tokio::fs::remove_dir_all(&entry.dir).await;
+                }
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"));
             }
+        }
+    }
+    let response = DirectoryJobsResponse {
+        jobs: jobs.iter().map(|entry| entry.record.clone()).collect(),
+        skipped_existing,
+        skipped_incompatible,
+        skipped_unsupported,
+        skipped_generated,
+    };
+    let body = serde_json::to_string(&response).expect("serialize batch response");
+    let receipt = request
+        .request_id
+        .map(|id| (identity.owner.clone(), id, payload, body.clone()));
+    if let Err(error) = state
+        .store
+        .insert_batch(jobs.clone(), MAX_USER_NONTERMINAL_JOBS, receipt)
+        .await
+    {
+        for entry in &jobs {
+            let _ = tokio::fs::remove_dir_all(&entry.dir).await;
+        }
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+    }
+    {
+        let mut active = state.active_jobs.write().await;
+        for entry in &jobs {
+            active.insert(entry.record.id, entry.clone());
+        }
+    }
+    for entry in jobs {
+        if state.queue.send(entry.record.id).await.is_err() {
+            mutate_job(&state, entry.record.id, |job| {
+                job.status = JobStatus::Failed;
+                job.error = Some("job worker unavailable".into());
+            })
+            .await;
+            state.active_jobs.write().await.remove(&entry.record.id);
         }
     }
     (
         StatusCode::CREATED,
-        Json(DirectoryJobsResponse {
-            jobs,
-            skipped_existing,
-            skipped_incompatible,
-            skipped_unsupported,
-            skipped_generated,
-        }),
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
     )
         .into_response()
+}
+
+pub(super) async fn get_job(
+    State(state): State<AppState>,
+    identity: UserIdentity,
+    Path(id): Path<Uuid>,
+) -> Response {
+    match state.store.get(identity.owner, id).await {
+        Ok(Some(entry)) => Json(entry.record).into_response(),
+        Ok(None) => json_error(StatusCode::NOT_FOUND, "job not found"),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
 }
 
 pub(super) async fn cancel_job(
@@ -899,6 +969,7 @@ pub(super) async fn cancel_job(
     identity: UserIdentity,
     Path(id): Path<Uuid>,
 ) -> Response {
+    let _transition = super::lock_job(&state, id).await;
     let owner = identity.owner.clone();
     let entry = match state.store.get(owner, id).await {
         Ok(Some(entry)) => entry,
@@ -907,6 +978,12 @@ pub(super) async fn cancel_job(
     };
     if entry.record.status.is_terminal() {
         return Json(entry.record).into_response();
+    }
+    if entry.record.status == JobStatus::Writing {
+        return json_error(
+            StatusCode::CONFLICT,
+            "结果正在保存，已无法取消，请等待保存完成",
+        );
     }
     if let Some(cancel) = state.cancellations.lock().await.get(&id) {
         cancel.cancel();
@@ -932,6 +1009,7 @@ pub(super) async fn retry_job(
     identity: UserIdentity,
     Path(id): Path<Uuid>,
 ) -> Response {
+    let _transition = super::lock_job(&state, id).await;
     let owner = identity.owner.clone();
     if state
         .active_jobs
@@ -1089,6 +1167,7 @@ pub(super) async fn delete_job(
     identity: UserIdentity,
     Path(id): Path<Uuid>,
 ) -> Response {
+    let _transition = super::lock_job(&state, id).await;
     let owner = identity.owner.clone();
     if state
         .active_jobs
@@ -1217,6 +1296,7 @@ mod tests {
             persister: JobPersister::spawn(store.clone()),
             store,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
+            job_locks: Arc::default(),
             queue,
             request_limiters: Arc::new(HashMap::new()),
             translation_client: reqwest::Client::new(),

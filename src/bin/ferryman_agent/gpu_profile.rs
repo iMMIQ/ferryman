@@ -39,7 +39,7 @@ const MAX_UTILIZATION: f64 = 0.90;
 const MIN_VIABLE_KV_BYTES: u64 = 1024 * 1024 * 1024;
 const KV_FLAG: &str = "kv-cache-memory-bytes";
 const MIB_256: u64 = 256 * 1024 * 1024;
-const DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn profile(utilization: f64, kv_bytes: u64, kv_flag_supported: bool) -> LaunchProfile {
     LaunchProfile {
@@ -110,6 +110,7 @@ pub async fn detect_gpu_memory() -> Option<GpuMemory> {
     let output = tokio::time::timeout(
         DETECT_TIMEOUT,
         Command::new("python3")
+            .kill_on_drop(true)
             .arg("-c")
             .arg("import torch;free,total=torch.cuda.mem_get_info();print(total,free)")
             .stdout(Stdio::piped())
@@ -135,15 +136,20 @@ pub async fn detect_gpu_memory() -> Option<GpuMemory> {
 /// Returns `None` when the probe itself failed; callers then assume the flag
 /// exists (the behavior of the reference Jetson image).
 async fn vllm_help(vllm_bin: &str, extra: &str) -> Option<String> {
-    Command::new(vllm_bin)
-        .args(["serve", extra])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    tokio::time::timeout(
+        DETECT_TIMEOUT,
+        Command::new(vllm_bin)
+            .args(["serve", extra])
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 pub async fn detect_kv_flag_supported(vllm_bin: &str) -> Option<bool> {

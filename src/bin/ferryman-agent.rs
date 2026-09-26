@@ -36,6 +36,7 @@ struct AppState {
     controller: Controller,
     models: ModelManager,
     client: reqwest::Client,
+    stream_client: reqwest::Client,
     auth: AgentAuth,
     vllm_endpoint: Arc<str>,
 }
@@ -292,6 +293,7 @@ struct RuntimeManager {
     phase: RuntimePhase,
     preset: Option<Preset>,
     child: Option<Child>,
+    process_group: Option<rustix::process::Pid>,
     leases: HashMap<String, Lease>,
     last_activity: Instant,
     last_health_check: Instant,
@@ -374,6 +376,7 @@ impl Controller {
             phase: RuntimePhase::Stopped,
             preset: None,
             child: None,
+            process_group: None,
             leases: HashMap::new(),
             last_activity: Instant::now(),
             last_health_check: Instant::now() - Duration::from_secs(10),
@@ -556,14 +559,14 @@ impl RuntimeManager {
     }
 
     /// Sizes the vLLM launch from the GPU that is actually present. Probes are
-    /// cached for the agent's lifetime; when the hardware cannot be probed the
+    /// refreshed before every launch; when the hardware cannot be probed the
     /// fixed preset values stay in effect.
     async fn size_launch(
         &mut self,
         model_path: &str,
         cfg: &PresetConfig,
     ) -> Result<gpu_profile::LaunchProfile, String> {
-        if matches!(self.gpu_probe, GpuProbe::Pending) {
+        {
             self.gpu_probe = match gpu_profile::detect_gpu_memory().await {
                 Some(memory) => GpuProbe::Known(memory),
                 None => {
@@ -622,9 +625,14 @@ impl RuntimeManager {
             return Err(self.fail_start(preset, message));
         }
 
-        let launch = self
-            .size_launch(&model_path, &cfg)
+        self.phase = RuntimePhase::Starting;
+        self.preset = Some(preset);
+        self.started_at = Some(Instant::now());
+        self.publish();
+        let probe_timeout = self.start_timeout.min(Duration::from_secs(15));
+        let launch = tokio::time::timeout(probe_timeout, self.size_launch(&model_path, &cfg))
             .await
+            .map_err(|_| self.fail_start(preset, "GPU/vLLM capability probe timed out".into()))?
             .map_err(|message| self.fail_start(preset, message))?;
 
         let mut command = Command::new(&self.vllm_bin);
@@ -677,6 +685,7 @@ impl RuntimeManager {
         }
 
         info!(%preset, pid, "vLLM process started");
+        self.process_group = rustix::process::Pid::from_raw(pid as i32);
         self.child = Some(child);
         self.phase = RuntimePhase::Starting;
         self.preset = Some(preset);
@@ -692,7 +701,11 @@ impl RuntimeManager {
     }
 
     async fn stop_child(&mut self, force: bool) -> Result<(), String> {
+        let group = self.process_group.take();
         let Some(mut child) = self.child.take() else {
+            if let Some(pid) = group {
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            }
             self.phase = RuntimePhase::Stopped;
             self.preset = None;
             self.last_error = None;
@@ -719,6 +732,10 @@ impl RuntimeManager {
             }
             let _ = child.wait().await;
         }
+        // The parent may exit before its workers; always reap the remaining group.
+        if let Some(pid) = group {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
         info!(pid, "vLLM process stopped");
         self.phase = RuntimePhase::Stopped;
         self.preset = None;
@@ -738,6 +755,10 @@ impl RuntimeManager {
         if let Some(child) = self.child.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    if let Some(pid) = self.process_group.take() {
+                        let _ =
+                            rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+                    }
                     self.child = None;
                     self.phase = RuntimePhase::Failed;
                     self.last_error = Some(format!("vLLM exited with {status}"));
@@ -1217,6 +1238,12 @@ async fn stop_runtime(State(state): State<AppState>, Json(request): Json<StopReq
     }
 }
 
+fn streaming_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+}
+
 async fn proxy_chat(State(state): State<AppState>, body: Bytes) -> Response {
     if state.controller.snapshot().state != RuntimePhase::Ready {
         return (
@@ -1228,7 +1255,7 @@ async fn proxy_chat(State(state): State<AppState>, body: Bytes) -> Response {
             .into_response();
     }
 
-    let _request_guard = ActiveRequestGuard::new(state.controller.active_requests.clone());
+    let request_guard = ActiveRequestGuard::new(state.controller.active_requests.clone());
     state.controller.touch().await;
     // Streaming requests must be relayed chunk-by-chunk: buffering them until
     // generation finishes would defeat SSE and trip the client's total
@@ -1238,8 +1265,12 @@ async fn proxy_chat(State(state): State<AppState>, body: Bytes) -> Response {
         .ok()
         .and_then(|value| value.get("stream").and_then(|flag| flag.as_bool()))
         .unwrap_or(false);
-    let mut request = match state
-        .client
+    let client = if wants_stream {
+        &state.stream_client
+    } else {
+        &state.client
+    };
+    let request = match client
         .post(format!("{}/v1/chat/completions", state.vllm_endpoint))
         .header(header::CONTENT_TYPE, "application/json")
         .body(body)
@@ -1257,12 +1288,7 @@ async fn proxy_chat(State(state): State<AppState>, body: Bytes) -> Response {
                 .into_response();
         }
     };
-    if wants_stream {
-        // SSE chunks arrive continuously, so inactivity is not a concern;
-        // the downstream client applies its own overall timeout.
-        *request.timeout_mut() = None;
-    }
-    let response = state.client.execute(request).await;
+    let response = client.execute(request).await;
 
     let response = match response {
         Ok(response) => {
@@ -1274,7 +1300,13 @@ async fn proxy_chat(State(state): State<AppState>, body: Bytes) -> Response {
                     builder = builder.header(header::CONTENT_TYPE, content_type);
                 }
                 builder
-                    .body(Body::from_stream(response.bytes_stream()))
+                    .body(Body::from_stream(futures::stream::unfold(
+                        (response.bytes_stream(), request_guard),
+                        |(mut stream, guard)| async move {
+                            use futures::StreamExt;
+                            stream.next().await.map(|chunk| (chunk, (stream, guard)))
+                        },
+                    )))
                     .unwrap_or_else(|error| {
                         error!(%error, "failed to build proxy response");
                         StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -1360,6 +1392,7 @@ async fn main() -> anyhow::Result<()> {
         controller: controller.clone(),
         models,
         client,
+        stream_client: streaming_client()?,
         auth,
         vllm_endpoint: Arc::from(vllm_endpoint),
     };
@@ -1426,6 +1459,91 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn streaming_guard_lives_with_body_and_does_not_inherit_total_timeout() {
+        use futures::StreamExt;
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Body::from_stream(futures::stream::unfold(0, |index| async move {
+                    if index == 6 {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    Some((
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"data: token\n\n")),
+                        index + 1,
+                    ))
+                }))
+            }),
+        );
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", socket.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(socket, upstream).await.unwrap();
+        });
+        let root = tempfile::tempdir().unwrap();
+        let (commands, _receiver) = mpsc::channel(8);
+        let (_, status) = watch::channel(RuntimeStatus {
+            state: RuntimePhase::Ready,
+            preset: Some(Preset::SevenBFp8),
+            pid: None,
+            active_requests: 0,
+            leases: 0,
+            idle_timeout_seconds: 600,
+            updated_at: 0,
+            last_error: None,
+            startup_stage: None,
+            startup_progress: 100,
+            startup_elapsed_seconds: None,
+            estimated_remaining_seconds: None,
+            recent_logs: vec![],
+        });
+        let active = Arc::new(AtomicUsize::new(0));
+        let state = AppState {
+            controller: Controller {
+                commands,
+                status,
+                active_requests: active.clone(),
+            },
+            models: ModelManager::new(root.path().join("models"), root.path().join("cache"))
+                .await
+                .unwrap(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(80))
+                .build()
+                .unwrap(),
+            stream_client: streaming_client().unwrap(),
+            auth: AgentAuth::load(Some("stream-regression-token".into()), None)
+                .await
+                .unwrap(),
+            vllm_endpoint: Arc::from(endpoint),
+        };
+        let response = proxy_chat(
+            State(state.clone()),
+            Bytes::from_static(br#"{"stream":true}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        let chunks = response
+            .into_body()
+            .into_data_stream()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(chunks.len() >= 2);
+        assert!(
+            chunks.iter().all(Result::is_ok),
+            "stream must outlive the buffered client deadline"
+        );
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        let response = proxy_chat(State(state), Bytes::from_static(br#"{"stream":true}"#)).await;
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        drop(response);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        server.abort();
+    }
+
     use axum::http::HeaderValue;
 
     #[test]
@@ -1504,6 +1622,7 @@ mod tests {
                 .await
                 .unwrap(),
             client: reqwest::Client::new(),
+            stream_client: reqwest::Client::new(),
             auth: AgentAuth::load(Some(token.into()), None).await.unwrap(),
             vllm_endpoint: Arc::from("http://127.0.0.1:1"),
         };

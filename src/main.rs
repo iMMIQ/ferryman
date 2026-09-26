@@ -370,5 +370,12 @@ async fn main() -> Result<()> {
     for (p, m) in &summary.failed_files {
         eprintln!("  failed: {} ({})", p.display(), m);
     }
+    anyhow::ensure!(!summary.cancelled, "translation interrupted");
+    anyhow::ensure!(
+        summary.failed_files.is_empty() && summary.failed == 0,
+        "translation incomplete: {} files and {} segments failed",
+        summary.failed_files.len(),
+        summary.failed
+    );
     Ok(())
 }

@@ -100,9 +100,21 @@ async function withPage(
             },
           ],
         };
-      else if (u.pathname === "/api/jobs/selection")
+      else if (u.pathname === "/api/jobs/selection") {
+        if (state.failSelection) {
+          await route.abort("failed");
+          return;
+        }
         data = { jobs: [{ id: "created" }], skipped_incompatible: 1 };
-      else if (u.pathname === "/api/jobs") {
+      } else if (u.pathname === "/api/jobs") {
+        if (state.invalidUpload) {
+          await route.fulfill({
+            status: 200,
+            contentType: "text/html",
+            body: "<html>login</html>",
+          });
+          return;
+        }
         if (state.delayUpload) await new Promise((r) => setTimeout(r, 700));
         data = {
           ...defaultJobs()[0],
@@ -126,8 +138,21 @@ async function withPage(
       };
     else if (u.pathname === "/api/jobs") {
       const phase = u.searchParams.get("phase");
-      const jobs = state.jobs.filter((job) => !phase || job.status === phase);
-      data = { jobs, total: jobs.length, next_cursor: null };
+      const jobs = state.jobs.filter(
+        (job) =>
+          !phase ||
+          (phase === "in_progress"
+            ? ["starting_model", "translating", "writing"].includes(job.status)
+            : job.status === phase),
+      );
+      data = {
+        jobs: state.listLimit ? jobs.slice(0, state.listLimit) : jobs,
+        total: jobs.length,
+        next_cursor: null,
+      };
+    } else if (/^\/api\/jobs\/[^/]+$/.test(u.pathname)) {
+      data =
+        state.jobs.find((job) => job.id === u.pathname.split("/").at(-1)) || {};
     } else if (u.pathname === "/api/runtime")
       data = {
         state: "ready",
@@ -750,4 +775,102 @@ test("design layouts preserve drafts and separate recent tasks from filters", as
       900,
     );
     await shot(page, "tablet-create");
+  }));
+
+test("invalid upload response preserves the draft instead of reporting success", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
+    state.invalidUpload = true;
+    await page.locator("#file-input").setInputFiles({
+      name: "keep.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("keep"),
+    });
+    await page.locator("#submit-job").click();
+    await page.locator("#confirm-submit").click();
+    await expect(page.locator("#submission-error")).toContainText(
+      "有效的任务记录",
+    );
+    await expect(page.locator("#upload-list li")).toHaveCount(1);
+    await expect(page.locator(".submission-success")).toHaveCount(0);
+  }));
+
+test("history reconciles terminal jobs missed by active polling", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
+    await page.locator('button[data-workspace="jobs"]').click();
+    await expect(page.locator('tr[data-id="one"] .status-chip')).toHaveText(
+      "翻译中",
+    );
+    // Simulate a task created and completed in another tab between polls: it
+    // never appears in active, so only periodic history reconciliation sees it.
+    state.jobs.unshift({
+      ...defaultJobs()[1],
+      id: "instant",
+      filename: "instant.txt",
+      failed_segments: 0,
+    });
+    await expect(page.locator('tr[data-id="instant"]')).toBeVisible({
+      timeout: 15000,
+    });
+  }));
+
+test("old task details fetch the terminal record outside the visible history page", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
+    await page.locator('button[data-workspace="jobs"]').click();
+    await page.locator('tr[data-id="one"] .file-title').click();
+    await expect(page.locator("#job-detail-content")).toContainText("翻译中");
+    const old = state.jobs.find((job) => job.id === "one");
+    old.status = "completed";
+    old.translated = old.total;
+    old.completed = old.total;
+    old.result_available = true;
+    state.jobs.unshift({
+      ...defaultJobs()[1],
+      id: "newest",
+      filename: "newest.txt",
+    });
+    state.listLimit = 1;
+    await expect(page.locator("#job-detail-content")).toContainText("已完成");
+    await expect(
+      page.locator('#job-detail-actions [data-action="cancel"]'),
+    ).toHaveCount(0);
+    await expect(
+      page.locator("#job-detail-actions .download-action"),
+    ).toBeVisible();
+  }));
+
+test("mounted submission retries preserve their idempotency key", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
+    await page
+      .locator("label.segment")
+      .filter({ hasText: "文稿与网盘" })
+      .click();
+    await page.locator("#source-directory").click();
+    await page.locator('.folder-checkbox[data-entry-select="Books"]').click();
+    await page.locator("#select-current-folder").click();
+    state.failSelection = true;
+    await page.locator("#submit-job").click();
+    await page.locator("#confirm-overwrite").check();
+    await page.locator("#confirm-submit").click();
+    await expect(page.locator("#submission-error")).toContainText("原提交结果");
+    state.failSelection = false;
+    await page.locator("#submit-job").click();
+    await page.locator("#confirm-overwrite").check();
+    await page.locator("#confirm-submit").click();
+    await expect(page.locator(".submission-success")).toContainText(
+      "已加入 1 个任务",
+    );
+    const attempts = state.posts
+      .filter((post) => post.path === "/api/jobs/selection")
+      .map((post) => JSON.parse(post.body));
+    assert.equal(attempts.length, 2);
+    assert(attempts[0].request_id);
+    assert.equal(attempts[0].request_id, attempts[1].request_id);
   }));

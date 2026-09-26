@@ -21,13 +21,13 @@ export function useJobs() {
       if (queryKey[3]) query.set("cursor", queryKey[3]);
       return api<JobPage>(`/api/jobs?${query}`, { signal });
     },
-    // History only refreshes on invalidation; failed initial loads can recover.
-    refetchInterval: (query) => (query.state.status === "error" ? 2500 : false),
+    // Reconcile even jobs that finish entirely between two active polls.
+    refetchInterval: (query) => (query.state.status === "error" ? 2500 : 10000),
   });
   const recent = useQuery({
     queryKey: ["jobs", "list", "all", null],
     queryFn: ({ signal }) => api<JobPage>("/api/jobs?", { signal }),
-    refetchInterval: (query) => (query.state.status === "error" ? 2500 : false),
+    refetchInterval: (query) => (query.state.status === "error" ? 2500 : 10000),
   });
   const active = useQuery({
     queryKey: ["jobs", "active"],
@@ -111,7 +111,12 @@ export function useJobs() {
     const appeared = current.jobs.some(
       (job) => !previous?.jobs.some((old) => old.id === job.id),
     );
-    if (changed || appeared)
+    const missed = list.data.value?.jobs.some(
+      (job) =>
+        !["completed", "failed", "cancelled"].includes(job.status) &&
+        !live.has(job.id),
+    );
+    if (changed || appeared || missed)
       void client.invalidateQueries({ queryKey: ["jobs", "list"] });
   });
   const mutation = useMutation({

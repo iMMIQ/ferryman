@@ -434,8 +434,10 @@ impl ModelManager {
                     })
                     .await;
                     let model_path = self.inner.model_root.join(preset.config().model_dir_name);
-                    let bytes = validate_model_directory(model_path.clone()).await?;
+                    // The new manifest replaces any stale/corrupt installation
+                    // receipt before validating the freshly verified download.
                     self.write_marker(preset, source, &files).await?;
+                    let bytes = validate_model_directory(model_path.clone()).await?;
                     self.update_model(preset, |status| {
                         status.state = ModelPhase::Ready;
                         status.downloaded_bytes = bytes;
@@ -549,7 +551,29 @@ impl ModelManager {
             .await
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() == file.size)
         {
-            return Ok(());
+            let valid = match &file.sha256 {
+                Some(expected) => sha256_file(final_path.clone())
+                    .await?
+                    .eq_ignore_ascii_case(expected),
+                None if file.path.ends_with(".safetensors") => {
+                    let path = final_path.clone();
+                    tokio::task::spawn_blocking(move || validate_shard(&path).is_ok())
+                        .await
+                        .map_err(|e| e.to_string())?
+                }
+                None if file.path.ends_with(".json") => {
+                    let bytes = tokio::fs::read(&final_path)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    serde_json::from_slice::<Value>(&bytes).is_ok_and(|value| {
+                        value.as_object().is_some_and(|object| !object.is_empty())
+                    })
+                }
+                None => true,
+            };
+            if valid {
+                return Ok(());
+            }
         }
         if let Some(parent) = final_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -1036,6 +1060,43 @@ fn initial_status(preset: Preset, state: ModelPhase, downloaded_bytes: u64) -> M
     }
 }
 
+// Read only the bounded header. safetensors validates dtype/shape/offsets;
+// checking the actual file length detects truncated or incomplete copies.
+fn validate_shard(path: &std::path::Path) -> Result<safetensors::tensor::Metadata, String> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix).map_err(|e| e.to_string())?;
+    let length = u64::from_le_bytes(prefix);
+    if length > 100_000_000 || length.saturating_add(8) > size {
+        return Err("invalid safetensors header length".into());
+    }
+    let mut header = vec![0; length as usize];
+    file.read_exact(&mut header).map_err(|e| e.to_string())?;
+    let mut values: serde_json::Map<String, Value> =
+        serde_json::from_slice(&header).map_err(|e| e.to_string())?;
+    values.remove("__metadata__");
+    let mut tensors = values
+        .into_iter()
+        .map(|(name, value)| {
+            serde_json::from_value::<safetensors::tensor::TensorInfo>(value)
+                .map(|info| (name, info))
+                .map_err(|e| e.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if tensors.is_empty() {
+        return Err("model shard has no tensors".into());
+    }
+    tensors.sort_by_key(|(_, info)| info.data_offsets);
+    let end = tensors.last().unwrap().1.data_offsets.1 as u64;
+    let metadata = safetensors::tensor::Metadata::new(None, tensors).map_err(|e| e.to_string())?;
+    if end.checked_add(length + 8) != Some(size) {
+        return Err("model shard length does not match tensor data".into());
+    }
+    Ok(metadata)
+}
+
 async fn validate_model_directory(path: PathBuf) -> Result<u64, String> {
     tokio::task::spawn_blocking(move || -> Result<u64, String> {
         for required in [
@@ -1049,6 +1110,14 @@ async fn validate_model_directory(path: PathBuf) -> Result<u64, String> {
                 return Err(format!("invalid {required}"));
             }
         }
+        for name in ["config.json", "tokenizer.json"] {
+            let value: Value =
+                serde_json::from_slice(&fs::read(path.join(name)).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            if !value.is_object() || value.as_object().is_none_or(|o| o.is_empty()) {
+                return Err(format!("invalid {name}"));
+            }
+        }
         let index = fs::read(path.join("model.safetensors.index.json"))
             .map_err(|error| format!("read model index: {error}"))?;
         let value: Value = serde_json::from_slice(&index)
@@ -1056,17 +1125,64 @@ async fn validate_model_directory(path: PathBuf) -> Result<u64, String> {
         let weights = value["weight_map"]
             .as_object()
             .ok_or_else(|| "model index has no weight map".to_string())?;
-        let mut shards: Vec<_> = weights.values().filter_map(Value::as_str).collect();
+        let mut shards: Vec<_> = weights
+            .values()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| "invalid shard mapping".to_string())
+            })
+            .collect::<Result<_, _>>()?;
         shards.sort_unstable();
         shards.dedup();
         if shards.is_empty() {
             return Err("model index has no shards".to_string());
         }
         for shard in shards {
-            let metadata = fs::metadata(path.join(shard))
-                .map_err(|_| format!("missing model shard {shard}"))?;
-            if !metadata.is_file() || metadata.len() == 0 {
-                return Err(format!("invalid model shard {shard}"));
+            if shard.contains(['/', '\\']) || !shard.ends_with(".safetensors") {
+                return Err("invalid model shard path".into());
+            }
+            let metadata = validate_shard(&path.join(shard))
+                .map_err(|e| format!("invalid model shard {shard}: {e}"))?;
+            for (name, location) in weights {
+                if location.as_str() == Some(shard) && metadata.info(name).is_none() {
+                    return Err(format!("missing tensor {name} in {shard}"));
+                }
+            }
+        }
+        // Installed models carry authoritative lengths and, when supplied by
+        // the download source, checksums. External models use structural checks.
+        let marker = path.join(".ferryman-model.json");
+        if marker.exists() {
+            let value: Value =
+                serde_json::from_slice(&fs::read(marker).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            let files: Vec<RemoteFile> =
+                serde_json::from_value(value["files"].clone()).map_err(|e| e.to_string())?;
+            for remote in files {
+                if remote.path.contains(['/', '\\']) {
+                    return Err("invalid installed file path".into());
+                }
+                let file_path = path.join(&remote.path);
+                if fs::metadata(&file_path).map_err(|e| e.to_string())?.len() != remote.size {
+                    return Err(format!("installed file changed: {}", remote.path));
+                }
+                if let Some(expected) = remote.sha256 {
+                    use std::io::Read;
+                    let mut file = fs::File::open(file_path).map_err(|e| e.to_string())?;
+                    let mut hash = Sha256::new();
+                    let mut buffer = vec![0; 1024 * 1024];
+                    loop {
+                        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+                        if count == 0 {
+                            break;
+                        }
+                        hash.update(&buffer[..count]);
+                    }
+                    if hex::encode(hash.finalize()) != expected.to_lowercase() {
+                        return Err(format!("installed file checksum mismatch: {}", remote.path));
+                    }
+                }
             }
         }
         Ok(directory_size(&path))
@@ -1178,15 +1294,35 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("ferryman-model-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("config.json"), b"{}").unwrap();
-        fs::write(root.join("tokenizer.json"), b"{}").unwrap();
+        fs::write(root.join("config.json"), br#"{"model_type":"test"}"#).unwrap();
+        fs::write(root.join("tokenizer.json"), br#"{"model":{}}"#).unwrap();
         fs::write(root.join("model.safetensors"), b"weights").unwrap();
         fs::write(
             root.join("model.safetensors.index.json"),
             br#"{"weight_map":{"model.layer":"model.safetensors"}}"#,
         )
         .unwrap();
+        assert!(validate_model_directory(root.clone()).await.is_err());
+        let data = [0u8; 4];
+        let tensor =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![1], &data).unwrap();
+        let bytes = safetensors::tensor::serialize([("model.layer", tensor)], None).unwrap();
+        fs::write(root.join("model.safetensors"), &bytes).unwrap();
         assert!(validate_model_directory(root.clone()).await.is_ok());
+        fs::write(root.join("model.safetensors"), &bytes[..bytes.len() - 1]).unwrap();
+        assert!(validate_model_directory(root.clone()).await.is_err());
+        fs::write(root.join("model.safetensors"), &bytes).unwrap();
+        let marker = serde_json::json!({"files":[{"path":"model.safetensors","size":bytes.len(),"sha256":hex::encode(Sha256::digest(&bytes))}]});
+        fs::write(
+            root.join(".ferryman-model.json"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        assert!(validate_model_directory(root.clone()).await.is_ok());
+        let mut changed = bytes;
+        *changed.last_mut().unwrap() = 1;
+        fs::write(root.join("model.safetensors"), changed).unwrap();
+        assert!(validate_model_directory(root.clone()).await.is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

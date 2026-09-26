@@ -11,10 +11,9 @@
 //! bytes verbatim and, for each translated paragraph, splice in a brand-new
 //! `<w:p>` carrying the translation right after the original's end tag. The
 //! original runs and structure are never mutated, so all formatting survives
-//! byte-for-byte. `w:p` never nests (even inside table cells a `<w:p>` is a
-//! leaf structural unit), so a single left-to-right splice — inserting after
-//! each paragraph's byte range — is correct everywhere. The byte ranges come
-//! from roxmltree's `positions` feature (on by default).
+//! byte-for-byte. Text-box paragraphs can nest inside an outer paragraph, so
+//! insertions are ordered by end position and text belongs to its nearest
+//! paragraph. The byte ranges come from roxmltree's `positions` feature.
 //!
 //! Like epub, `--mode replace` is unsupported here: rewriting fragmented runs
 //! in place would discard inline formatting, and bilingual insertion already
@@ -109,15 +108,18 @@ fn parse_paragraphs(xml: &str) -> Result<(Vec<Par>, Vec<usize>)> {
         .descendants()
         .filter(|n| n.is_element() && n.has_tag_name((W_NS, "p")))
     {
-        // Concatenate every w:t under this paragraph (run fragmentation means a
-        // sentence is split across many <w:t>; joining reconstructs the prose).
+        // Text belongs to its nearest paragraph, including inside text boxes.
         let mut text = String::new();
-        for t in node
-            .descendants()
-            .filter(|n| n.is_element() && n.has_tag_name((W_NS, "t")))
-        {
-            if let Some(s) = t.text() {
-                text.push_str(s);
+        for t in node.descendants().filter(|n| n.is_element()) {
+            if t.ancestors().skip(1).find(|n| n.has_tag_name((W_NS, "p"))) != Some(node) {
+                continue;
+            }
+            if t.has_tag_name((W_NS, "t")) {
+                text.push_str(t.text().unwrap_or(""));
+            } else if t.has_tag_name((W_NS, "tab")) {
+                text.push('\t');
+            } else if t.has_tag_name((W_NS, "br")) || t.has_tag_name((W_NS, "cr")) {
+                text.push('\n');
             }
         }
         let idx = paragraphs.len();
@@ -168,23 +170,22 @@ impl Document for DocxDoc {
             }
         }
 
-        // Left-to-right splice: paragraphs are in ascending byte order and never
-        // overlap, so `src[cursor..range.end]` carries the gap before this
-        // paragraph *and* the paragraph itself; a translated paragraph then gets
-        // a fresh <w:p> appended right after its end tag. Everything outside
-        // translated paragraphs is copied byte-for-byte.
+        // Insertions sorted by end offset also support paragraphs nested in
+        // text boxes: source bytes are copied exactly once.
         let src = self.xml.as_str();
-        let mut out_xml =
-            String::with_capacity(src.len() + tr_by_par.values().map(String::len).sum::<usize>());
-        let mut cursor = 0usize;
-        for (pidx, par) in self.paragraphs.iter().enumerate() {
-            out_xml.push_str(&src[cursor..par.range.end]);
-            cursor = par.range.end;
-            if let Some(tr) = tr_by_par.get(&pidx) {
-                out_xml.push_str(&translated_paragraph(tr));
-            }
+        let mut edits: Vec<_> = tr_by_par
+            .iter()
+            .map(|(&index, text)| (self.paragraphs[index].range.end, translated_paragraph(text)))
+            .collect();
+        edits.sort_by_key(|(position, _)| *position);
+        let mut out_xml = String::new();
+        let mut cursor = 0;
+        for (position, text) in edits {
+            out_xml.push_str(&src[cursor..position]);
+            out_xml.push_str(&text);
+            cursor = position;
         }
-        out_xml.push_str(&src[cursor..]); // trailing sectPr + </w:body></w:document>
+        out_xml.push_str(&src[cursor..]);
 
         self.entries[self.doc_idx].data = out_xml.into_bytes();
         write_zip(&self.entries, out)
@@ -197,11 +198,11 @@ impl Document for DocxDoc {
 
 /// A standalone translated paragraph: a small spacer + grey italic run, visually
 /// distinct from the black original (mirrors epub's `.hy-zh` sibling). The `w:`
-/// prefix resolves against the root `<w:document>` namespace declaration.
+/// prefix is explicitly bound so alternate source prefixes also work.
 fn translated_paragraph(text: &str) -> String {
     let esc = xml_escape(text);
     format!(
-        "<w:p><w:pPr><w:spacing w:after=\"160\"/></w:pPr>\
+        "<w:p xmlns:w=\"{W_NS}\"><w:pPr><w:spacing w:after=\"160\"/></w:pPr>\
          <w:r><w:rPr><w:color w:val=\"6A6A9A\"/><w:i/><w:sz w:val=\"21\"/></w:rPr>\
          <w:t xml:space=\"preserve\">{esc}</w:t></w:r></w:p>"
     )
@@ -246,6 +247,41 @@ fn write_zip(entries: &[DxEntry], path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_textboxes_and_alternate_prefixes_roundtrip() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.docx");
+        let output = root.path().join("output.docx");
+        let source = format!(
+            r#"<x:document xmlns:x="{W_NS}" xmlns:v="urn:schemas-microsoft-com:vml"><x:body><x:p><x:r><x:t>Hello</x:t><x:tab/><x:t>world</x:t><x:br/><x:t>next</x:t><x:pict><v:shape><v:textbox><x:txbxContent><x:p><x:r><x:t>Textbox</x:t></x:r></x:p></x:txbxContent></v:textbox></v:shape></x:pict></x:r></x:p></x:body></x:document>"#
+        );
+        make_docx(&input, &source);
+        let mut doc = DocxDoc::open(&input).unwrap();
+        let segments = doc.segments();
+        assert_eq!(
+            segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            ["Hello\tworld\nnext", "Textbox"]
+        );
+        doc.write(
+            &[
+                (0, "Body translation".into()),
+                (1, "Box translation".into()),
+            ],
+            &output,
+            OutputMode::Bilingual,
+        )
+        .unwrap();
+        let xml = read_document_xml(&output);
+        let parsed = roxmltree::Document::parse(&xml).unwrap();
+        let paragraphs: Vec<_> = parsed
+            .descendants()
+            .filter(|n| n.has_tag_name((W_NS, "p")))
+            .collect();
+        assert_eq!(paragraphs.len(), 4);
+        assert_eq!(xml.matches("Box translation").count(), 1);
+        assert_eq!(xml.matches("Body translation").count(), 1);
+    }
 
     /// A minimal document.xml exercising run fragmentation, an empty paragraph,
     /// a table (paragraph nested in a cell), an entity, and DrawingML `a:p`/`a:t`
@@ -301,7 +337,9 @@ mod tests {
     fn translated_paragraph_is_well_formed_and_distinct() {
         let s = translated_paragraph("你好 & <world>");
         // opens/closes a w:p, has the styled run, preserves the spacer.
-        assert!(s.starts_with("<w:p><w:pPr><w:spacing w:after=\"160\"/></w:pPr>"));
+        assert!(s.starts_with(&format!(
+            "<w:p xmlns:w=\"{W_NS}\"><w:pPr><w:spacing w:after=\"160\"/></w:pPr>"
+        )));
         assert!(s.contains("<w:i/>"));
         assert!(s.contains("<w:t xml:space=\"preserve\">"));
         assert!(s.ends_with("</w:p>"));

@@ -6,4 +6,4 @@ import type { SourceSelection } from "./SourceSelection";
 import type { StorageKind } from "./StorageKind";
 import type { TranslationSettings } from "./TranslationSettings";
 
-export type CreateDirectoryJobsRequest = { sources?: Array<SourceSelection>, source_storage?: StorageKind | null, source_paths?: Array<string>, source_path?: string | null, save_strategy?: SaveStrategy, save_storage?: StorageKind | null, save_path?: string | null, preset: Preset, target: string, mode: OutputMode, settings?: TranslationSettings, };
+export type CreateDirectoryJobsRequest = { request_id?: string | null, sources?: Array<SourceSelection>, source_storage?: StorageKind | null, source_paths?: Array<string>, source_path?: string | null, save_strategy?: SaveStrategy, save_storage?: StorageKind | null, save_path?: string | null, preset: Preset, target: string, mode: OutputMode, settings?: TranslationSettings, };

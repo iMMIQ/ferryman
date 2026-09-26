@@ -455,7 +455,21 @@ on-disk cache means already-translated blocks are instant.
 - **Per-block failures never abort the run.** A 4xx (bad model id, malformed
   request, or a block over the context window) fails that one block immediately
   without retrying; 5xx / 429 / network errors retry with backoff. Failed blocks
-  are left untranslated in the output and counted in the summary.
+  are left untranslated in the output and counted in the summary. The CLI exits
+  with a nonzero status if any file or segment failed, or the run was cancelled.
+- **Web cancellation has a save boundary.** Cancellation is accepted before
+  `Writing`; once final saving begins, the API returns HTTP 409 and the UI hides
+  the cancel action. An accepted cancellation never commits a mounted-file save.
+- **Mounted batches publish atomically.** All input copies are prepared before
+  jobs enter the queue in one database transaction. The UI retains a submission
+  ID across retries and page reloads in the same tab; retrying the same request
+  returns its original job IDs, even if the source directory has since changed.
+  History is periodically reconciled, and open details poll the individual job.
+- **Local models are checked before use.** Detection validates JSON metadata,
+  safetensors headers, tensor offsets and shard lengths. Downloaded models also
+  use recorded file sizes and available hashes; damaged files can be downloaded
+  again. GPU free memory is probed for every launch, and capability probes have
+  bounded execution times.
 
 ## Notes / limitations
 

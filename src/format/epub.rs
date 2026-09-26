@@ -63,6 +63,11 @@ impl EpubDoc {
             });
         }
 
+        anyhow::ensure!(
+            !files.is_empty(),
+            "EPUB spine contains no readable content documents"
+        );
+
         // Dense SegmentId assignment over leaf blocks, in document order.
         // (block.leaf is only ever set true for non-empty leaf blocks — see
         // html.rs — so it's the exact same filter the old main used.)

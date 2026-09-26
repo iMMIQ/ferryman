@@ -39,7 +39,17 @@ async fn ensure_safe_output_parent(root: &FsPath, target: &FsPath) -> Result<Pat
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => anyhow::bail!("output parent is not a directory"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                tokio::fs::create_dir(&next).await?;
+                match tokio::fs::create_dir(&next).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let metadata = tokio::fs::symlink_metadata(&next).await?;
+                        anyhow::ensure!(
+                            metadata.is_dir() && !metadata.file_type().is_symlink(),
+                            "output parent is not a safe directory"
+                        );
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
             Err(error) => return Err(error.into()),
         }
@@ -158,8 +168,13 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
     let id = entry.record.id;
     let preset = entry.record.preset;
     let lease_id = format!("job-{id}");
-    let cancel = CancellationToken::new();
-    state.cancellations.lock().await.insert(id, cancel.clone());
+    let cancel = state
+        .cancellations
+        .lock()
+        .await
+        .entry(id)
+        .or_default()
+        .clone();
     if state
         .active_jobs
         .read()
@@ -197,7 +212,11 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
 
     let result = async {
         wait_for_agent(&state.config, preset, &lease_id, &cancel).await?;
-        mutate_job(state, id, |job| job.status = JobStatus::Translating).await;
+        {
+            let _transition = super::lock_job(state, id).await;
+            anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
+            mutate_job(state, id, |job| job.status = JobStatus::Translating).await;
+        }
 
         let cache_dir = state
             .config
@@ -262,6 +281,7 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
         .await;
         let _ = progress_task.await;
 
+        let transition = super::lock_job(state, id).await;
         if cancel.is_cancelled() || summary.cancelled {
             let result_available = tokio::fs::metadata(&entry.output)
                 .await
@@ -274,8 +294,11 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
         } else if !summary.failed_files.is_empty() {
             anyhow::bail!("{}", summary.failed_files[0].1);
         } else {
+            // This durable state is the save commit boundary. Cancellation
+            // after this point is explicitly rejected by the API.
+            mutate_job(state, id, |job| job.status = JobStatus::Writing).await;
+            drop(transition);
             if entry.save_to.is_some() {
-                mutate_job(state, id, |job| job.status = JobStatus::Writing).await;
                 save_job_result(&entry).await?;
             }
             mutate_job(state, id, |job| {
@@ -303,6 +326,26 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn concurrent_outputs_share_a_new_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..8 {
+            let root = root_path.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                ensure_safe_output_parent(&root, &root.join(format!("new/nested/{index}.txt")))
+                    .await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert!(result.unwrap().is_ok());
+        }
+    }
+
     use crate::{now_epoch_seconds, JobRecord, StorageKind};
     use ferryman::format::OutputMode;
     use ferryman::preset::Preset;

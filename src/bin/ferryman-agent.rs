@@ -1385,7 +1385,7 @@ async fn main() -> anyhow::Result<()> {
         vllm_endpoint.clone(),
         client.clone(),
     );
-    let models = ModelManager::new(model_root.into(), cache_root.into())
+    let models = ModelManager::new_background(model_root.into(), cache_root.into())
         .await
         .map_err(anyhow::Error::msg)?;
     let state = AppState {

@@ -468,7 +468,9 @@ on-disk cache means already-translated blocks are instant.
 - **Local models are checked before use.** Detection validates JSON metadata,
   safetensors headers, tensor offsets and shard lengths. Downloaded models also
   use recorded file sizes and available hashes; damaged files can be downloaded
-  again. GPU free memory is probed for every launch, and capability probes have
+  again. Startup verification runs in the background so the controller's health
+  endpoint stays available; models remain `Verifying` and cannot be loaded or
+  deleted until the scan completes. GPU free memory is probed for every launch, and capability probes have
   bounded execution times.
 
 ## Notes / limitations

@@ -563,19 +563,16 @@ pub fn collect_inputs(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn visit(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let meta =
-        std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    if meta.is_dir() {
-        for entry in
-            std::fs::read_dir(path).with_context(|| format!("read dir {}", path.display()))?
+    for entry in walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .follow_root_links(false)
+    {
+        let entry = entry.with_context(|| format!("walk {}", path.display()))?;
+        if entry.file_type().is_file()
+            && Format::from_path(entry.path()).is_ok()
+            && !is_generated_output(entry.path())
         {
-            visit(&entry?.path(), out)?;
-        }
-    } else if meta.is_file() {
-        // Keep the filter in sync with supported formats and skip both output
-        // modes so a directory rerun does not translate generated files again.
-        if Format::from_path(path).is_ok() && !is_generated_output(path) {
-            out.push(path.to_path_buf());
+            out.push(entry.into_path());
         }
     }
     Ok(())
@@ -638,6 +635,26 @@ fn resolve_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn traversal_skips_links_and_generated_outputs() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("input.txt"), "source").unwrap();
+        std::fs::write(root.path().join("input.translated.txt"), "output").unwrap();
+        std::fs::write(outside.path().join("private.txt"), "private").unwrap();
+        symlink(outside.path(), root.path().join("escape")).unwrap();
+        symlink(root.path(), root.path().join("cycle")).unwrap();
+        assert_eq!(
+            collect_inputs(root.path()).unwrap(),
+            [root.path().join("input.txt")]
+        );
+        assert!(collect_inputs(&root.path().join("escape"))
+            .unwrap()
+            .is_empty());
+    }
 
     #[tokio::test]
     async fn parser_does_not_block_runtime_and_keeps_permit_after_cancellation() {

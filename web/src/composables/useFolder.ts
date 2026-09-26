@@ -1,41 +1,71 @@
-import { reactive, onUnmounted } from "vue";
-import { api, json, latestQuery, isCancelled } from "../lib/api";
-import type { Listing, Storage, Entry } from "../lib/types";
+import { reactive, ref, computed, watch, nextTick } from "vue";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/vue-query";
+import { api, json } from "../lib/api";
+import type { Listing, Storage } from "../lib/types";
 import { errorText } from "../lib/format";
 export function useFolder() {
-  const state = reactive({
-    storage: "documents" as Storage,
+  const client = useQueryClient();
+  const location = ref<{ storage: Storage; path: string }>({
+    storage: "documents",
     path: "",
-    parent: null as string | null,
-    entries: [] as Entry[],
-    loading: false,
-    error: "",
-    creating: false,
+  });
+  const opened = ref(false),
+    actionError = ref("");
+  const key = computed(() => [
+    "documents",
+    location.value.storage,
+    location.value.path,
+  ]);
+  const query = useQuery({
+    queryKey: key,
+    enabled: opened,
+    queryFn: ({ signal, queryKey }) =>
+      api<Listing>(
+        `/api/documents?${new URLSearchParams({ storage: queryKey[1], path: queryKey[2] })}`,
+        { signal },
+      ),
+  });
+  const createFolder = useMutation({
+    mutationFn: (folder: { storage: Storage; path: string }) =>
+      api("/api/documents/directories", json(folder)),
+    onSuccess: () => client.invalidateQueries({ queryKey: ["documents"] }),
+  });
+  const state = reactive({
+    get storage() {
+      return location.value.storage;
+    },
+    get path() {
+      return query.data.value?.path ?? location.value.path;
+    },
+    get parent() {
+      return query.data.value?.parent ?? null;
+    },
+    get entries() {
+      return query.data.value?.entries ?? [];
+    },
+    get loading() {
+      return opened.value && query.isFetching.value;
+    },
+    get error() {
+      return (
+        actionError.value ||
+        (query.error.value ? errorText(query.error.value) : "")
+      );
+    },
+    get creating() {
+      return createFolder.isPending.value;
+    },
     paths: { documents: "", remote_fs: "" },
   });
-  const query = latestQuery();
+  watch(query.data, (data) => {
+    if (data) state.paths[location.value.storage] = data.path;
+  });
   async function load(storage: Storage, path: string) {
-    const ticket = query.begin();
-    state.storage = storage;
-    state.loading = true;
-    state.entries = [];
-    state.error = "";
-    try {
-      const data = await api<Listing>(
-        `/api/documents?${new URLSearchParams({ storage, path })}`,
-        { signal: ticket.signal },
-      );
-      if (!ticket.current()) return;
-      state.path = data.path;
-      state.parent = data.parent;
-      state.entries = data.entries;
-      state.paths[storage] = data.path;
-    } catch (error) {
-      if (ticket.current() && !isCancelled(error))
-        state.error = errorText(error);
-    } finally {
-      if (ticket.current()) state.loading = false;
-    }
+    actionError.value = "";
+    location.value = { storage, path };
+    opened.value = true;
+    await nextTick();
+    await query.refetch({ cancelRefetch: false });
   }
   async function create(name: string) {
     if (state.creating || state.loading) return false;
@@ -44,28 +74,24 @@ export function useFolder() {
       /[\\/]/.test(name) ||
       [".", ".."].includes(name.trim())
     ) {
-      state.error = "请输入有效的文件夹名称";
+      actionError.value = "请输入有效的文件夹名称";
       return false;
     }
     const storage = state.storage,
       path = state.path ? `${state.path}/${name.trim()}` : name.trim();
-    state.creating = true;
-    state.error = "";
+    actionError.value = "";
     try {
-      await api("/api/documents/directories", json({ storage, path }));
+      await createFolder.mutateAsync({ storage, path });
       await load(storage, path);
       return true;
     } catch (error) {
-      state.error = errorText(error);
+      actionError.value = errorText(error);
       return false;
-    } finally {
-      state.creating = false;
     }
   }
   function close() {
-    query.cancel();
-    state.loading = false;
+    opened.value = false;
+    void client.cancelQueries({ queryKey: key.value });
   }
-  onUnmounted(close);
   return { state, load, create, close };
 }

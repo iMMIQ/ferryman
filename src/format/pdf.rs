@@ -34,8 +34,9 @@
 //! The font is embedded as a CID/Type0 font (Identity-H), **subset to the
 //! glyphs actually drawn** (a full Noto CJK face is ~16 MB; a book needs a
 //! few hundred KB), with glyph ids from the font's own cmap plus a generated
-//! ToUnicode map so the output stays searchable. It is shared per process and
-//! loaded once.
+//! ToUnicode map and ActualText for logical text. Unicode shaping, bidi and
+//! grapheme-safe line breaking live in `pdf_text`; optional fallback fonts cover
+//! additional scripts. The primary face is shared per process.
 
 use crate::format::{Document, OutputMode, Segment, SegmentId, Strategy};
 use anyhow::{anyhow, bail, Context, Result};
@@ -928,78 +929,15 @@ fn page_cols_if(paras: &[Para]) -> Option<PageCols> {
 
 // ── line wrapping (for fitting translations into slots) ─────────────────────
 
-/// Wrap `text` to `max_w` with a greedy algorithm: break after spaces, after
-/// CJK characters (which may break anywhere) and after hyphens/slashes; a
-/// token longer than the line hard-breaks. `char_width` supplies each char's
-/// advance at the target size, keeping this pure & unit-testable without a
-/// font. Returns no line for empty input.
+#[path = "pdf_text.rs"]
+mod text;
+
+#[cfg(test)]
 fn wrap_text(text: &str, max_w: f32, char_width: impl Fn(char) -> f32) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    let mut line_w = 0.0;
-    // Width of spaces at the current line end: charged only when the next
-    // word char arrives, so a trailing space never forces a break (it is
-    // dropped when the line breaks here).
-    let mut pending_space_w = 0.0;
-    // Byte offset in `line` a break may follow (right after a space, hyphen,
-    // slash or CJK char). Line-relative, so it stays valid after a break
-    // resets `line` to the overflowing tail.
-    let mut break_at: Option<usize> = None;
-
-    for c in text.chars() {
-        line.push(c);
-        if c == ' ' {
-            pending_space_w += char_width(c);
-            break_at = Some(line.len());
-            continue;
-        }
-        line_w += pending_space_w + char_width(c);
-        pending_space_w = 0.0;
-        // A single-char line never breaks — the first char goes out even
-        // when wider than the whole line.
-        if line_w > max_w && line.chars().count() > 1 {
-            match break_at {
-                Some(at) => {
-                    let head = line[..at].trim_end_matches(' ').to_string();
-                    lines.push(head);
-                    line = line[at..].trim_start_matches(' ').to_string();
-                }
-                None => {
-                    // No break opportunity: hard-break before the char that
-                    // overflowed; it starts the next line.
-                    let keep = line.len() - c.len_utf8();
-                    lines.push(line[..keep].to_string());
-                    line = line[keep..].to_string();
-                }
-            }
-            line_w = line.chars().map(&char_width).sum();
-            pending_space_w = 0.0;
-            break_at = None;
-        }
-        if c == '-' || c == '/' || is_cjk(c) {
-            break_at = Some(line.len());
-        }
-    }
-    if !line.trim_end().is_empty() {
-        lines.push(line.trim_end().to_string());
-    }
-    lines
-}
-
-/// CJK codepoint blocks where a line may break after every character (CJK,
-/// kana, Hangul, CJK punctuation, fullwidth forms).
-fn is_cjk(c: char) -> bool {
-    matches!(c as u32,
-        0x3000..=0x30FF      // CJK punctuation, kana
-        | 0x3400..=0x4DBF    // ext A
-        | 0x4E00..=0x9FFF    // unified
-        | 0xAC00..=0xD7AF    // Hangul syllables
-        | 0xF900..=0xFAFF    // compat ideographs
-        | 0xFF00..=0xFFEF    // fullwidth forms
-    )
+    self::text::wrap(text, max_w as f64, |s| {
+        Ok(s.chars().map(&char_width).sum::<f32>() as f64)
+    })
+    .unwrap()
 }
 
 // ── document IR ─────────────────────────────────────────────────────────────
@@ -1145,39 +1083,49 @@ impl Document for PdfDoc {
         }
 
         let mut doc = lopdf::Document::load_mem(&self.raw).context("re-parse pdf for writing")?;
-        let face = ttf_parser::Face::parse(&self.font.standalone, 0)
-            .map_err(|e| anyhow!("parse pdf font: {e:?}"))?;
-        let upem = face.units_per_em().max(1) as f64;
-        let width = |c: char, size: f64| -> f64 {
-            let adv = face
-                .glyph_index(c)
-                .and_then(|g| face.glyph_hor_advance(g))
-                .unwrap_or((upem * 0.55) as u16) as f64;
-            adv / upem * size
-        };
-        let raw_gid = |c: char| face.glyph_index(c).map(|g| g.0);
-
-        // Collect the glyphs actually used (translations + markers), embed
-        // the font once, and reuse the object on every page we touch.
-        let mut used: BTreeMap<char, u16> = BTreeMap::new();
-        for tr in tr_by_para.values() {
-            for c in tr.chars() {
-                used.entry(c)
-                    .or_insert_with(|| raw_gid(c).unwrap_or_default());
-            }
+        let fonts = text::Fonts::new(self.font.clone())?;
+        let mut layouts = HashMap::new();
+        for (&(page_index, para_index), &translation) in &tr_by_para {
+            let page = &self.pages[page_index];
+            let para = &page.paras[para_index];
+            let bottom = if mode == OutputMode::Replace {
+                para.bot
+            } else {
+                page.paras
+                    .get(para_index + 1)
+                    .map(|next| next.top)
+                    .unwrap_or(page.media.1 + PAGE_BOTTOM_MARGIN)
+            };
+            layouts.insert(
+                (page_index, para_index),
+                fonts.layout(
+                    translation,
+                    (page.cols.x1 - para.x0).max(para.size * 4.0),
+                    (para.top - bottom).max(para.size * 0.8),
+                    para.size * TR_SIZE_RATIO,
+                )?,
+            );
         }
-        for page in 1..=self.pages.len() {
-            for c in format!("[p. {page}]").chars() {
-                used.entry(c)
-                    .or_insert_with(|| raw_gid(c).unwrap_or_default());
+        let markers: Vec<_> = (1..=self.pages.len())
+            .map(|page| fonts.shape(&format!("[p. {page}]")))
+            .collect::<Result<_>>()?;
+        let used = text::collect_used(
+            layouts
+                .values()
+                .flat_map(|layout| layout.lines.iter())
+                .chain(markers.iter()),
+            fonts.fonts.len(),
+        );
+        let mut embedded = BTreeMap::new();
+        for (index, (font, used)) in fonts.fonts.iter().zip(&used).enumerate() {
+            if used.is_empty() {
+                continue;
             }
+            let face = ttf_parser::Face::parse(&font.standalone, 0)
+                .map_err(|error| anyhow!("parse PDF font: {error:?}"))?;
+            let (key, id, remap) = embed_font(&mut doc, font, &face, used, index);
+            embedded.insert(index, EmbeddedFont { key, id, remap });
         }
-        let (font_key, font_id, gid_remap) = embed_font(&mut doc, &self.font, &face, &used);
-        // Everything drawn below addresses glyphs in the *subset's* numbering.
-        let gid = |c: char| -> Option<u16> {
-            let old = raw_gid(c)?;
-            Some(gid_remap.get(&old).copied().unwrap_or(old))
-        };
 
         let pages_in_order: Vec<ObjectId> = doc.get_pages().into_values().collect();
         anyhow::ensure!(
@@ -1202,40 +1150,22 @@ impl Document for PdfDoc {
                 let mut insert_after: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
                 for (i, &page_id) in pages_in_order.iter().enumerate() {
                     let page = &self.pages[i];
-                    let mut cb = ContentBuilder::new(&font_key);
+                    let mut cb = ContentBuilder::new();
                     for (xi, para) in page.paras.iter().enumerate() {
-                        let Some(tr) = tr_by_para.get(&(i, xi)) else {
+                        let Some(layout) = layouts.get(&(i, xi)) else {
                             continue;
                         };
-                        // Slot: from this paragraph's top down to the next
-                        // paragraph (or the bottom margin).
-                        let slot_bot = page
-                            .paras
-                            .get(xi + 1)
-                            .map(|n| n.top)
-                            .unwrap_or(page.media.1 + PAGE_BOTTOM_MARGIN);
-                        draw_translation(
-                            &mut cb,
-                            para,
-                            page.cols.x1,
-                            slot_bot,
-                            tr,
-                            TR_COLOR,
-                            &gid,
-                            &width,
-                        );
+                        draw_translation(&mut cb, para, layout, TR_COLOR, &embedded);
                     }
                     if cb.has_body {
                         // Small centered marker so the mirrored page is
                         // identifiable while scrolling.
-                        let label = format!("[p. {}]", i + 1);
-                        let w: f64 = label.chars().map(|c| width(c, MARKER_SIZE)).sum();
+                        let marker = &markers[i];
                         let (x, y) = (
-                            (page.media.0 + page.media.2) / 2.0 - w / 2.0,
+                            (page.media.0 + page.media.2) / 2.0 - marker.width * MARKER_SIZE / 2.0,
                             page.media.3 - MARKER_SIZE * 1.4,
                         );
-                        let gids: Vec<u16> = label.chars().filter_map(gid).collect();
-                        cb.text(x, y, MARKER_SIZE, 0.0, &gids, MARKER_COLOR);
+                        cb.shaped(x, y, MARKER_SIZE, 0.0, marker, MARKER_COLOR, &embedded);
 
                         let rotate = doc
                             .get_dictionary(page_id)
@@ -1247,8 +1177,7 @@ impl Document for PdfDoc {
                             parent_of.get(&page_id).copied().unwrap_or(root),
                             page.media,
                             rotate,
-                            &font_key,
-                            font_id,
+                            &embedded,
                             cb.finish(),
                         )?;
                         insert_after.insert(page_id, vec![new_id]);
@@ -1259,9 +1188,9 @@ impl Document for PdfDoc {
             OutputMode::Replace => {
                 for (i, &page_id) in pages_in_order.iter().enumerate() {
                     let page = &self.pages[i];
-                    let mut cb = ContentBuilder::new(&font_key);
+                    let mut cb = ContentBuilder::new();
                     for (xi, para) in page.paras.iter().enumerate() {
-                        let Some(tr) = tr_by_para.get(&(i, xi)) else {
+                        let Some(layout) = layouts.get(&(i, xi)) else {
                             continue;
                         };
                         // Cover the original paragraph, then draw the
@@ -1272,20 +1201,13 @@ impl Document for PdfDoc {
                             para.x1 - para.x0 + 2.0,
                             para.top - para.bot + 2.0,
                         );
-                        draw_translation(
-                            &mut cb,
-                            para,
-                            page.cols.x1,
-                            para.bot,
-                            tr,
-                            REPLACE_COLOR,
-                            &gid,
-                            &width,
-                        );
+                        draw_translation(&mut cb, para, layout, REPLACE_COLOR, &embedded);
                     }
                     if cb.has_body {
                         doc.add_page_contents(page_id, cb.finish())?;
-                        add_font_to_page(&mut doc, page_id, &font_key, font_id)?;
+                        for font in embedded.values() {
+                            add_font_to_page(&mut doc, page_id, &font.key, font.id)?;
+                        }
                     }
                 }
             }
@@ -1311,48 +1233,75 @@ fn pdfnum(x: f64) -> String {
     format!("{x:.2}")
 }
 
-struct ContentBuilder<'a> {
+struct EmbeddedFont {
+    key: String,
+    id: ObjectId,
+    remap: BTreeMap<u16, u16>,
+}
+struct ContentBuilder {
     out: Vec<u8>,
-    font_key: &'a str,
     has_body: bool,
 }
 
-impl<'a> ContentBuilder<'a> {
-    fn new(font_key: &'a str) -> Self {
-        ContentBuilder {
+impl ContentBuilder {
+    fn new() -> Self {
+        Self {
             out: Vec::new(),
-            font_key,
             has_body: false,
         }
     }
-
     fn finish(self) -> Vec<u8> {
         self.out
     }
 
-    /// One glyph-id text run at a baseline point (user space) with a text
-    /// direction. GIDs are written as a hex string for Identity-H.
-    fn text(&mut self, x: f64, y: f64, size: f64, angle: f64, gids: &[u16], rgb: (u8, u8, u8)) {
-        let (s, c) = angle.sin_cos();
-        let mut line = format!(
-            "q {} {} {} rg BT /{} {} Tf {} {} {} {} {} {} Tm <",
-            rgb.0 as f32 / 255.0,
-            rgb.1 as f32 / 255.0,
-            rgb.2 as f32 / 255.0,
-            self.font_key,
-            pdfnum(size),
-            pdfnum(c),
-            pdfnum(s),
-            pdfnum(-s),
-            pdfnum(c),
-            pdfnum(x),
-            pdfnum(y),
-        );
-        for g in gids {
-            line.push_str(&format!("{g:04X}"));
+    /// Explicit glyph positions preserve shaping advances, mark offsets and RTL
+    /// order. ActualText retains the logical Unicode string for copying/search.
+    #[allow(clippy::too_many_arguments)]
+    fn shaped(
+        &mut self,
+        x: f64,
+        y: f64,
+        size: f64,
+        angle: f64,
+        line: &text::Line,
+        rgb: (u8, u8, u8),
+        fonts: &BTreeMap<usize, EmbeddedFont>,
+    ) {
+        let actual: String = line
+            .text
+            .encode_utf16()
+            .map(|unit| format!("{unit:04X}"))
+            .collect();
+        self.out
+            .extend_from_slice(format!("/Span << /ActualText <FEFF{actual}> >> BDC\n").as_bytes());
+        let (sin, cos) = angle.sin_cos();
+        let mut advance = 0.0;
+        for glyph in &line.glyphs {
+            let font = &fonts[&glyph.font];
+            let gid = font.remap.get(&glyph.id).copied().unwrap_or(glyph.id);
+            let (dx, dy) = rot(
+                angle,
+                (advance + glyph.x_offset) * size,
+                glyph.y_offset * size,
+            );
+            let operation = format!(
+                "q {} {} {} rg BT /{} {} Tf {} {} {} {} {} {} Tm <{gid:04X}> Tj ET Q\n",
+                rgb.0 as f32 / 255.0,
+                rgb.1 as f32 / 255.0,
+                rgb.2 as f32 / 255.0,
+                font.key,
+                pdfnum(size),
+                pdfnum(cos),
+                pdfnum(sin),
+                pdfnum(-sin),
+                pdfnum(cos),
+                pdfnum(x + dx),
+                pdfnum(y + dy)
+            );
+            self.out.extend_from_slice(operation.as_bytes());
+            advance += glyph.advance;
         }
-        line.push_str("> Tj ET Q\n");
-        self.out.extend_from_slice(line.as_bytes());
+        self.out.extend_from_slice(b"EMC\n");
         self.has_body = true;
     }
 
@@ -1370,39 +1319,18 @@ impl<'a> ContentBuilder<'a> {
     }
 }
 
-/// Wrap a translation into the paragraph's column and shrink it until the
-/// whole thing fits the available slot, then emit the text runs.
-// A drawing helper: every argument is used at a distinct position of the
-// emit call below — bundling them into a struct would only add indirection.
-#[allow(clippy::too_many_arguments)]
 fn draw_translation(
-    cb: &mut ContentBuilder<'_>,
+    cb: &mut ContentBuilder,
     para: &Para,
-    col_x1: f64,
-    slot_bot: f64,
-    tr: &str,
+    layout: &text::Layout,
     rgb: (u8, u8, u8),
-    gid_of: &impl Fn(char) -> Option<u16>,
-    width: &impl Fn(char, f64) -> f64,
+    fonts: &BTreeMap<usize, EmbeddedFont>,
 ) {
-    let avail_w = (col_x1 - para.x0).max(para.size * 4.0);
-    let avail_h = (para.top - slot_bot).max(para.size * 0.8);
-    let mut size = para.size * TR_SIZE_RATIO;
-    let mut lines = Vec::new();
-    while size > TR_MIN_SIZE {
-        lines = wrap_text(tr, avail_w as f32, |c| width(c, size) as f32);
-        let h = lines.len() as f64 * size * TR_LEADING;
-        if h <= avail_h {
-            break;
-        }
-        size *= 0.94;
-    }
     let angle = para.first().angle;
-    let (mut x, mut y) = rot(angle, para.x0, para.top - size * ASCENT);
-    for line in &lines {
-        let gids: Vec<u16> = line.chars().filter_map(gid_of).collect();
-        cb.text(x, y, size, angle, &gids, rgb);
-        let (dx, dy) = rot(angle, 0.0, -size * TR_LEADING);
+    let (mut x, mut y) = rot(angle, para.x0, para.top - layout.size * ASCENT);
+    for line in &layout.lines {
+        cb.shaped(x, y, layout.size, angle, line, rgb, fonts);
+        let (dx, dy) = rot(angle, 0.0, -layout.size * TR_LEADING);
         x += dx;
         y += dy;
     }
@@ -1412,7 +1340,7 @@ fn draw_translation(
 
 /// Embed the shared font as a CID/Type0 (Identity-H) font, subset to the
 /// glyphs actually drawn, and return `(resource key, object id, old→new
-/// glyph-id map)`. `used` maps every character we may draw to its glyph id
+/// glyph-id map)`. `used` maps shaped glyph ids to their Unicode clusters
 /// in the *original* face (drives subsetting, /W widths and the generated
 /// ToUnicode map). [`subsetter`] renumbers glyphs contiguously — feeding the
 /// ids ascending keeps `.notdef` at 0 — so every gid written into content
@@ -1423,12 +1351,14 @@ fn embed_font(
     doc: &mut lopdf::Document,
     font: &PdfFont,
     face: &ttf_parser::Face<'_>,
-    used: &BTreeMap<char, u16>,
+    used: &BTreeMap<u16, String>,
+    index: usize,
 ) -> (String, ObjectId, BTreeMap<u16, u16>) {
+    let font_name = format!("FerrymanFont{index}");
     let upem = face.units_per_em().max(1) as f64;
     let scale = |v: f64| (v / upem * 1000.0).round() as i64;
 
-    let mut old_gids: Vec<u16> = used.values().copied().collect();
+    let mut old_gids: Vec<u16> = used.keys().copied().collect();
     old_gids.sort_unstable();
     old_gids.dedup();
     let remapper = GlyphRemapper::new_from_glyphs_sorted(&old_gids);
@@ -1465,7 +1395,7 @@ fn embed_font(
     );
     let mut fd = Dictionary::new();
     fd.set("Type", "FontDescriptor");
-    fd.set("FontName", "FerrymanCJK");
+    fd.set("FontName", font_name.as_str());
     fd.set("Flags", 4_i64); // symbolic
     fd.set(
         "FontBBox",
@@ -1518,7 +1448,7 @@ fn embed_font(
             "CIDFontType2"
         },
     );
-    cid.set("BaseFont", "FerrymanCJK");
+    cid.set("BaseFont", font_name.as_str());
     let mut csi = Dictionary::new();
     // Registry/Ordering are *strings* in the spec — lopdf's &str converts to
     // a Name, which poppler rejects ("Invalid CIDSystemInfo dictionary").
@@ -1541,14 +1471,13 @@ fn embed_font(
          /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
          1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
     );
-    let entries: Vec<(&char, &u16)> = used.iter().collect();
+    let entries: Vec<(&u16, &String)> = used.iter().collect();
     for chunk in entries.chunks(100) {
         cmap.push_str(&format!("{} beginbfchar\n", chunk.len()));
-        for (c, old) in chunk {
+        for (old, text) in chunk {
             let g = remap.get(old).copied().unwrap_or(**old);
             let mut hex = String::new();
-            let mut buf = [0u16; 2];
-            for unit in c.encode_utf16(&mut buf) {
+            for unit in text.encode_utf16() {
                 hex.push_str(&format!("{unit:04X}"));
             }
             cmap.push_str(&format!("<{g:04X}> <{hex}>\n"));
@@ -1563,13 +1492,13 @@ fn embed_font(
     let mut t0 = Dictionary::new();
     t0.set("Type", "Font");
     t0.set("Subtype", "Type0");
-    t0.set("BaseFont", "FerrymanCJK");
+    t0.set("BaseFont", font_name.as_str());
     t0.set("Encoding", "Identity-H");
     t0.set("DescendantFonts", vec![Object::Reference(cid_id)]);
     t0.set("ToUnicode", Object::Reference(tu_id));
     let t0_id = doc.add_object(Object::Dictionary(t0));
 
-    ("FerHyZH".to_string(), t0_id, remap)
+    (format!("FerHyZH{index}"), t0_id, remap)
 }
 
 /// Record each leaf page's parent Pages node id by walking the tree.
@@ -1626,8 +1555,7 @@ fn make_translation_page(
     parent: ObjectId,
     media: MediaBoxGeo,
     rotate: Option<i64>,
-    font_key: &str,
-    font_id: ObjectId,
+    fonts: &BTreeMap<usize, EmbeddedFont>,
     content: Vec<u8>,
 ) -> Result<ObjectId> {
     let mut stream = Stream::new(Dictionary::new(), content);
@@ -1651,7 +1579,9 @@ fn make_translation_page(
         dict.set("Rotate", r);
     }
     let mut font = Dictionary::new();
-    font.set(font_key, Object::Reference(font_id));
+    for embedded in fonts.values() {
+        font.set(embedded.key.as_str(), Object::Reference(embedded.id));
+    }
     let mut res = Dictionary::new();
     res.set("Font", Object::Dictionary(font));
     dict.set("Resources", Object::Dictionary(res));
@@ -2198,6 +2128,56 @@ mod tests {
 
         let _ = fs::remove_file(&tmp);
         let _ = fs::remove_file(&out);
+    }
+
+    #[test]
+    fn unicode_output_embeds_fallback_fonts_and_logical_text() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.pdf");
+        fs::write(
+            &source,
+            make_pdf(&[(
+                500.0,
+                300.0,
+                &[(
+                    30.0,
+                    40.0,
+                    14.0,
+                    "Multilingual translation fixture for font fallback and shaping.",
+                )],
+            )]),
+        )
+        .unwrap();
+        let mut pdf = PdfDoc::open(&source).unwrap();
+        let translation = "你好，世界。 العربية سلام ffi a\u{301}";
+        let output = root.path().join("output.pdf");
+        pdf.write(&[(0, translation.into())], &output, OutputMode::Bilingual)
+            .unwrap();
+        let doc = lopdf::Document::load(&output).unwrap();
+        let page = *doc.get_pages().get(&2).unwrap();
+        let content = String::from_utf8(doc.get_page_content(page).unwrap()).unwrap();
+        assert!(content.contains("/ActualText <FEFF"));
+        let arabic: String = "سلام".encode_utf16().map(|c| format!("{c:04X}")).collect();
+        assert!(
+            content.contains(&arabic),
+            "logical Arabic must remain available to PDF readers"
+        );
+        let resources = doc
+            .get_dictionary(page)
+            .unwrap()
+            .get(b"Resources")
+            .unwrap()
+            .as_dict()
+            .unwrap();
+        let fonts = resources.get(b"Font").unwrap().as_dict().unwrap();
+        let drawn = fonts
+            .iter()
+            .filter(|(name, _)| content.contains(&format!("/{} ", String::from_utf8_lossy(name))))
+            .count();
+        assert!(drawn >= 2, "CJK and Arabic use separate font coverage");
+        if let Some(path) = std::env::var_os("FERRYMAN_PDF_TEST_OUTPUT") {
+            fs::copy(output, path).unwrap();
+        }
     }
 
     /// Restructure a flat page tree into root → two intermediate /Pages nodes

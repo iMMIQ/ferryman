@@ -11,8 +11,7 @@
 
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+use std::path::PathBuf;
 
 pub struct Cache {
     root: PathBuf,
@@ -47,10 +46,7 @@ impl Cache {
             scope,
         ))
         .expect("serialize cache key strings");
-        Sha256::digest(bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        hex::encode(Sha256::digest(bytes))
     }
 
     /// Returns the cached translation for `key`, or `None` on miss / read
@@ -68,34 +64,9 @@ impl Cache {
     /// exit), not power loss, and fsync per block would dominate a large book.
     pub async fn put(&self, key: &str, val: &str) {
         let final_path = self.path_of(key);
-        let shard = final_path.parent().unwrap_or_else(|| Path::new("."));
-        if let Err(e) = tokio::fs::create_dir_all(shard).await {
-            eprintln!("warn: cache mkdir {:?} failed: {}", shard, e);
-            return;
-        }
-        let tmp = shard.join(format!(".{key}.{}.tmp", uuid::Uuid::new_v4()));
-        let mut file = match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .await
+        if let Err(e) = crate::atomic_file::write(final_path.clone(), val.as_bytes().to_vec()).await
         {
-            Ok(file) => file,
-            Err(e) => {
-                eprintln!("warn: cache temporary file {:?} failed: {}", tmp, e);
-                return;
-            }
-        };
-        let outcome = async {
-            file.write_all(val.as_bytes()).await?;
-            file.flush().await?;
-            drop(file);
-            tokio::fs::rename(&tmp, &final_path).await
-        }
-        .await;
-        if let Err(e) = outcome {
             eprintln!("warn: cache write {:?} failed: {}", final_path, e);
-            let _ = tokio::fs::remove_file(&tmp).await;
         }
     }
 

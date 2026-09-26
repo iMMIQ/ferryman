@@ -52,8 +52,8 @@ numbers and other letterless lines pass through untouched; ligatures (ﬁ/ﬂ…
 are normalized before translation; some producers' broken `/W` glyph-width
 arrays are repaired so line geometry survives extraction.
 
-The output *is* the original file, edited with `lopdf` — figures, diagrams
-and vector art intact, nothing re-typeset:
+The output edits the original file with `lopdf`, preserving figures, diagrams
+and vector art while laying out translated text:
 
 - **bilingual** (default): a translation page of the same size is inserted
   after every original page, each paragraph's Chinese drawn at the mirrored
@@ -66,9 +66,15 @@ overrides discovery, otherwise the first of Noto Sans CJK / WenQuanYi /
 Droid Sans Fallback in the usual distro locations (the Lazycat image bundles
 it at `/app/fonts`; the standalone image installs `fonts-noto-cjk`). The
 font is embedded **subset to the glyphs actually drawn** as a CID/Type0 font
-with a generated ToUnicode map, so the translated text stays selectable and
-searchable and outputs grow by a few hundred KB rather than the full ~16 MB
-face. Scanned PDFs without a text layer and encrypted PDFs fail with a
+with a generated ToUnicode map and logical `ActualText`. Unicode line breaking,
+grapheme boundaries, Rustybuzz shaping and bidi ordering preserve combining marks,
+ligatures and right-to-left runs. Optional Noto/DejaVu fallbacks are discovered in
+`/app/fonts` and standard distro directories; set `FERRYMAN_PDF_FALLBACK_FONTS`
+to an OS path-list of additional fonts (colon-separated on Linux). Install
+`fonts-noto-core` for Arabic, Hebrew, Devanagari and Thai coverage; the release
+script bundles available fallbacks. Missing glyph coverage fails explicitly with
+a font configuration hint instead of silently dropping characters. Fonts are
+subset to the glyphs used, keeping output much smaller than full font files. Scanned PDFs without a text layer and encrypted PDFs fail with a
 clear error.
 
 ## Build
@@ -80,8 +86,9 @@ cargo build --release
 ## Tests and resource limits
 
 PDF tests require a CJK font and fail if it is missing. On Debian/Ubuntu,
-install `fonts-noto-cjk`, or point `FERRYMAN_PDF_FONT` at an installed CJK font.
-CI explicitly installs and selects Noto Sans CJK.
+install `fonts-noto-cjk` and `fonts-dejavu-core` (the latter supplies the Arabic
+shaping fixture), or point `FERRYMAN_PDF_FONT` at an installed CJK font.
+CI installs both and explicitly selects Noto Sans CJK.
 
 ```bash
 cargo fmt --all -- --check
@@ -99,7 +106,7 @@ successful translations; truncation triggers bounded splitting/retranslation.
 
 ### Browser UI regression tests
 
-The frontend uses Vue 3, TypeScript, Vite and Reka UI. Node 22.12+ is needed
+The frontend uses Vue 3, TypeScript, Vite, Reka UI and TanStack Vue Query. Node 22.12+ is needed
 for development/builds; production still serves static files from Rust without
 a Node process. `npm run build` type-checks the frontend and writes fingerprinted
 assets to `dist/web` (the default `FERRYMAN_WEB_DIR`).
@@ -114,6 +121,7 @@ npm ci
 npm run dev # Vite dev server; /api proxies to Rust on 127.0.0.1:8080
 # In another terminal, or stop the dev server before running tests:
 npx playwright install --with-deps chromium
+npm run types:check # regenerate Rust DTOs into a temporary directory and compare
 npm run test:unit
 npm test # type-check, production build, browser regression tests
 cargo build --locked --bin ferryman-web
@@ -130,8 +138,26 @@ formatting, request-layer tests, the real-server smoke test and Rust tests.
 Frontend code is split by domain under `web/src`: `useJobs`, `useSubmission`,
 `useFolder`, and `useRuntime` own state; components render that state. Desktop
 tables and mobile cards share actions and progress components. `lib/api.ts`
-centralizes timeouts/errors and cancellable query scopes; polling pauses when
-the page is hidden. Mutations are not automatically retried. UI tokens live in
+centralizes Fetch timeouts/errors. Vue Query owns query keys, cancellation,
+request deduplication, polling and invalidation; polling pauses when the page is
+hidden. Mutations are not automatically retried, and business-level per-job locks
+prevent duplicate actions. Request snapshots and overwrite acknowledgement remain
+in `useSubmission`.
+
+Wire types in `web/src/lib/generated` are generated from Rust with ts-rs; do not
+edit them manually. Run `npm run types:generate` after changing a DTO and include
+the generated changes. `npm run types:check` checks drift without modifying the
+working tree. Rust numeric counters/timestamps use JSON numbers, so the exporter
+maps large integer types to TypeScript `number` (values must remain within JS safe
+integer precision); nullable and omitted fields retain their Serde semantics.
+Generated types do not validate untrusted JSON at runtime. UI drafts and derived
+views live separately in `lib/types.ts`.
+
+Playwright Test manages browser fixtures, the Vite preview server, retrying DOM
+assertions and failure screenshots/traces. CI uploads failure artifacts from
+`test-results` and `playwright-report`; inspect traces with `npx playwright show-trace`.
+
+UI tokens live in
 `tokens.css`, with shared buttons, notices, dialogs and empty states under
 `components/ui`. Run `npm run format` after editing frontend sources.
 
@@ -439,3 +465,25 @@ on-disk cache means already-translated blocks are instant.
   output budget is left unset so vLLM fills whatever context remains after the
   prompt; a block whose own input exceeds `--max-model-len` fails that block
   rather than producing a truncated translation.
+
+### Shared implementation primitives
+
+- Agent pairing uses the shared RustCrypto HMAC implementation in `src/auth.rs`.
+  Its wire protocol remains `HMAC-SHA256(SHA256(token), nonce)`; verification uses
+  the library's MAC comparison and token hashes use `subtle`.
+- Axum request-part extraction authenticates Web users; an agent route middleware
+  protects runtime/model/proxy endpoints while health and pairing remain public.
+- `tokio-rusqlite` serializes database work on a dedicated thread. Existing SQL,
+  transactions, WAL, ownership and cursor pagination remain authoritative.
+- Markdown uses CommonMark events and original byte ranges. Code, link targets,
+  reference definitions, HTML and leading metadata stay out of translation;
+  translated text nodes are escaped and bilingual output duplicates whole blocks.
+  Source whitespace and line endings round-trip when no translation is supplied.
+- `backon` supplies exponential retry jitter, and `httpdate` handles HTTP-date
+  Retry-After values. Server delays are a floor within an explicit 30-second
+  worker-slot budget; the final cap applies after jitter. Error classification,
+  cancellation and split/recovery rules remain translation-specific.
+- `walkdir`, `rustix`, `strip-ansi-escapes`, `percent-encoding` and `tempfile`
+  replace traversal, raw OS wrappers, terminal-sequence filtering, download-name
+  encoding and temporary-file lifecycle code. Symlink rules, selection limits,
+  atomic no-clobber saves and overwrite checks remain enforced by the application.

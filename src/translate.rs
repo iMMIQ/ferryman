@@ -350,25 +350,37 @@ const MAX_ATTEMPTS: u32 = 4;
 /// so a bogus header can't stall a worker slot for minutes.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// Exponential backoff between attempts — base 1s, 2s, 4s (attempts 1..3) —
-/// with ±50% jitter so concurrent workers don't retry in lockstep and hammer
-/// a recovering server in one wave. A server-supplied `Retry-After` (parsed
-/// from a 429/503) replaces the base when it asks for more.
+/// Server delay is a floor within our explicit 30-second worker-slot budget.
+/// Apply this policy after library jitter, so jitter cannot shorten Retry-After
+/// or exceed the final cap. Long server delays are intentionally capped.
+fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    use backon::BackoffBuilder;
+    let delay = backon::ExponentialBuilder::default()
+        .with_min_delay(Duration::from_secs(1))
+        .with_max_delay(MAX_BACKOFF)
+        .with_jitter()
+        .with_max_times(MAX_ATTEMPTS as usize)
+        .build()
+        .nth(attempt.saturating_sub(1) as usize)
+        .unwrap_or(MAX_BACKOFF);
+    delay.max(retry_after.unwrap_or_default()).min(MAX_BACKOFF)
+}
+
 async fn backoff(attempt: u32, retry_after: Option<Duration>) {
-    let base = Duration::from_millis(500u64 * 2u64.pow(attempt));
-    let delay = match retry_after {
-        Some(server) if server > base => server,
-        _ => base,
-    }
-    .min(MAX_BACKOFF);
-    // Cheap jitter without a rand dependency: scale the delay by a factor
-    // derived from the clock's sub-second nanos (0.5..1.5).
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.subsec_nanos())
-        .unwrap_or(0);
-    let factor = 0.5 + (nanos % 1_000) as f64 / 1_000.0;
-    tokio::time::sleep(delay.mul_f64(factor)).await;
+    tokio::time::sleep(retry_delay(attempt, retry_after)).await;
+}
+
+fn parse_retry_after(value: &str, now: std::time::SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    value
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .or_else(|| {
+            httpdate::parse_http_date(value)
+                .ok()
+                .map(|date| date.duration_since(now).unwrap_or_default())
+        })
 }
 
 /// One POST to `/v1/chat/completions`, classified. This is the single shared
@@ -425,8 +437,7 @@ async fn post_chat_once(client: &reqwest::Client, url: &str, body: &ChatReq<'_>)
                     resp.headers()
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|value| value.to_str().ok())
-                        .and_then(|value| value.trim().parse::<u64>().ok())
-                        .map(Duration::from_secs)
+                        .and_then(|value| parse_retry_after(value, std::time::SystemTime::now()))
                 } else {
                     None
                 };
@@ -1038,5 +1049,37 @@ mod tests {
             requests.iter().skip(1).all(|len| *len <= 600),
             "every follow-up request should be a half: {requests:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod retry_policy_tests {
+    use super::*;
+    #[test]
+    fn server_floor_and_final_cap_survive_jitter() {
+        for attempt in 1..20 {
+            for _ in 0..100 {
+                let delay = retry_delay(attempt, Some(Duration::from_secs(10)));
+                assert!((Duration::from_secs(10)..=MAX_BACKOFF).contains(&delay));
+                assert_eq!(
+                    retry_delay(attempt, Some(Duration::from_secs(120))),
+                    MAX_BACKOFF
+                );
+            }
+        }
+    }
+    #[test]
+    fn retry_after_accepts_seconds_and_dates() {
+        let now = httpdate::parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").unwrap();
+        assert_eq!(parse_retry_after("10", now), Some(Duration::from_secs(10)));
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:28:15 GMT", now),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:27:00 GMT", now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(parse_retry_after("invalid", now), None);
     }
 }

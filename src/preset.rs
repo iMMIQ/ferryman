@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// The two Hy-MT2 deployments supported by Ferryman.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, clap::ValueEnum, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, clap::ValueEnum, Serialize, Deserialize, ts_rs::TS,
+)]
 pub enum Preset {
     #[value(name = "7b-fp8")]
     #[serde(rename = "7b-fp8")]

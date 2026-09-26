@@ -21,6 +21,7 @@ const BENCHMARK_CACHE_SECONDS: u64 = 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+#[derive(ts_rs::TS)]
 pub enum SourceId {
     Auto,
     Modelscope,
@@ -45,6 +46,7 @@ impl SourceId {
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(ts_rs::TS)]
 pub enum ModelPhase {
     Absent,
     Benchmarking,
@@ -55,7 +57,7 @@ pub enum ModelPhase {
     Failed,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ts_rs::TS)]
 pub struct ModelStatus {
     pub preset: Preset,
     pub state: ModelPhase,
@@ -71,6 +73,7 @@ pub struct ModelStatus {
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(ts_rs::TS)]
 pub enum BenchmarkPhase {
     Idle,
     Running,
@@ -78,7 +81,7 @@ pub enum BenchmarkPhase {
     Failed,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ts_rs::TS)]
 pub struct SourceBenchmark {
     pub source: SourceId,
     pub label: String,
@@ -89,7 +92,7 @@ pub struct SourceBenchmark {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ts_rs::TS)]
 pub struct BenchmarkStatus {
     pub state: BenchmarkPhase,
     pub results: Vec<SourceBenchmark>,
@@ -97,14 +100,14 @@ pub struct BenchmarkStatus {
     pub tested_at: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ts_rs::TS)]
 pub struct ModelCatalog {
     pub models: Vec<ModelStatus>,
     pub available_bytes: u64,
     pub benchmark: BenchmarkStatus,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ts_rs::TS)]
 pub struct StorageStatus {
     pub available_bytes: u64,
     pub model_bytes: u64,
@@ -112,7 +115,7 @@ pub struct StorageStatus {
     pub cache_bytes: u64,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, ts_rs::TS)]
 pub struct DownloadRequest {
     #[serde(default = "default_source")]
     pub source: SourceId,
@@ -922,12 +925,7 @@ impl ModelManager {
             files,
         };
         let body = serde_json::to_vec_pretty(&marker).map_err(|error| error.to_string())?;
-        let temporary = dir.join(".ferryman-model.json.tmp");
-        let final_path = dir.join(".ferryman-model.json");
-        tokio::fs::write(&temporary, body)
-            .await
-            .map_err(|error| error.to_string())?;
-        tokio::fs::rename(temporary, final_path)
+        ferryman::atomic_file::write(dir.join(".ferryman-model.json"), body)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1112,18 +1110,9 @@ async fn remove_path(path: &Path) -> Result<(), String> {
 }
 
 fn available_bytes(path: &Path) -> u64 {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
-        return 0;
-    };
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    let result = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
-    if result != 0 {
-        return 0;
-    }
-    let stats = unsafe { stats.assume_init() };
-    stats.f_bavail.saturating_mul(stats.f_frsize)
+    rustix::fs::statvfs(path)
+        .map(|stats| stats.f_bavail.saturating_mul(stats.f_frsize))
+        .unwrap_or(0)
 }
 
 async fn directory_size_async(path: PathBuf) -> u64 {
@@ -1133,33 +1122,19 @@ async fn directory_size_async(path: PathBuf) -> u64 {
 }
 
 fn directory_size(path: &Path) -> u64 {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return 0;
-    };
-    if metadata.file_type().is_symlink() {
-        return 0;
-    }
-    if metadata.is_file() {
-        return metadata.len();
-    }
-    let Ok(entries) = fs::read_dir(path) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| directory_size(&entry.path()))
-        .sum()
+    directory_size_without(path, None)
 }
 
 fn directory_size_without(path: &Path, excluded: Option<&Path>) -> u64 {
-    let Ok(entries) = fs::read_dir(path) else {
-        return 0;
-    };
-    entries
+    walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .filter_entry(|entry| excluded != Some(entry.path()))
         .filter_map(Result::ok)
-        .filter(|entry| excluded != Some(entry.path().as_path()))
-        .map(|entry| directory_size(&entry.path()))
-        .sum()
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| entry.metadata().ok())
+        .fold(0u64, |total, metadata| total.saturating_add(metadata.len()))
 }
 
 fn now_epoch_seconds() -> u64 {
@@ -1214,4 +1189,21 @@ mod tests {
         assert!(validate_model_directory(root.clone()).await.is_ok());
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "run via npm run types:generate or types:check"]
+fn export_frontend_types() {
+    use ts_rs::TS;
+    let config = ts_rs::Config::new().with_large_int("number").with_out_dir(
+        std::env::var_os("FERRYMAN_TYPES_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/lib/generated")
+            }),
+    );
+    ModelCatalog::export_all(&config).unwrap();
+    StorageStatus::export_all(&config).unwrap();
+    DownloadRequest::export_all(&config).unwrap();
 }

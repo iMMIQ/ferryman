@@ -100,6 +100,7 @@ struct JobEntry {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(ts_rs::TS)]
 enum JobStatus {
     Queued,
     StartingModel,
@@ -141,7 +142,7 @@ impl JobStatus {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, ts_rs::TS)]
 struct JobRecord {
     id: Uuid,
     filename: String,
@@ -182,6 +183,7 @@ struct UserIdentity {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
+#[derive(ts_rs::TS)]
 enum StorageKind {
     Documents,
     RemoteFs,
@@ -206,6 +208,7 @@ impl StorageKind {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(ts_rs::TS)]
 enum SaveStrategy {
     SiblingSuffix,
     SiblingOverwrite,
@@ -246,8 +249,15 @@ async fn require_cache_revalidation(request: Request, next: Next) -> Response {
     response
 }
 
-fn user_owner(headers: &HeaderMap, allow_local: bool) -> Result<String, StatusCode> {
-    Ok(user_identity(headers, allow_local)?.owner)
+impl axum::extract::FromRequestParts<AppState> for UserIdentity {
+    type Rejection = Response;
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        user_identity(&parts.headers, state.config.allow_local_user)
+            .map_err(|status| json_error(status, "missing or invalid user identity"))
+    }
 }
 
 fn user_identity(headers: &HeaderMap, allow_local: bool) -> Result<UserIdentity, StatusCode> {
@@ -263,10 +273,7 @@ fn user_identity(headers: &HeaderMap, allow_local: bool) -> Result<UserIdentity,
         return Err(StatusCode::BAD_REQUEST);
     }
     let digest = Sha256::digest(uid.as_bytes());
-    let owner = digest[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let owner = hex::encode(&digest[..16]);
     Ok(UserIdentity { uid, owner })
 }
 
@@ -472,18 +479,49 @@ async fn claim_queued_job(state: &AppState, id: Uuid) -> Option<JobEntry> {
     }
 }
 
-async fn config() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "presets": ["7b-fp8", "30b-fp8"],
-        "formats": ["epub", "docx", "pdf", "srt", "vtt", "ass", "ssa", "lrc", "txt", "md"],
-        "storages": ["documents", "remote_fs"],
-        "max_upload_bytes": MAX_UPLOAD_BYTES,
-        "translation_defaults": TranslationSettings::default(),
-        "translation_limits": {
-            "max_batch_size": MAX_WEB_BATCH_SIZE,
-            "max_context_segments": MAX_WEB_CONTEXT_SEGMENTS
-        }
-    }))
+#[derive(Serialize, ts_rs::TS)]
+struct TranslationLimits {
+    max_batch_size: usize,
+    max_context_segments: usize,
+}
+#[derive(Serialize, ts_rs::TS)]
+struct ClientConfig {
+    presets: Vec<Preset>,
+    formats: Vec<&'static str>,
+    storages: Vec<StorageKind>,
+    max_upload_bytes: u64,
+    translation_defaults: TranslationSettings,
+    translation_limits: TranslationLimits,
+}
+async fn config() -> Json<ClientConfig> {
+    Json(ClientConfig {
+        presets: vec![Preset::SevenBFp8, Preset::ThirtyBFp8],
+        formats: vec![
+            "epub", "docx", "pdf", "srt", "vtt", "ass", "ssa", "lrc", "txt", "md",
+        ],
+        storages: vec![StorageKind::Documents, StorageKind::RemoteFs],
+        max_upload_bytes: MAX_UPLOAD_BYTES,
+        translation_defaults: TranslationSettings::default(),
+        translation_limits: TranslationLimits {
+            max_batch_size: MAX_WEB_BATCH_SIZE,
+            max_context_segments: MAX_WEB_CONTEXT_SEGMENTS,
+        },
+    })
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "run via npm run types:generate or types:check"]
+fn export_frontend_types() {
+    use ts_rs::TS;
+    let config = ts_rs::Config::new().with_large_int("number").with_out_dir(
+        std::env::var_os("FERRYMAN_TYPES_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                FsPath::new(env!("CARGO_MANIFEST_DIR")).join("web/src/lib/generated")
+            }),
+    );
+    ClientConfig::export_all(&config).unwrap();
 }
 
 /// One retention pass: remove the job directories of expired terminal jobs,
@@ -973,6 +1011,62 @@ mod tests {
             .is_some());
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn identity_extractor_rejects_missing_and_invalid_users() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = persister_test_state(root.path()).await;
+        Arc::get_mut(&mut state.config).unwrap().allow_local_user = false;
+        let app = Router::new()
+            .route(
+                "/identity",
+                get(|identity: UserIdentity| async move { identity.uid }),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/identity", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            client
+                .get(&url)
+                .header("safe_uid", "../escape")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            client
+                .get(&url)
+                .header("safe_uid", "alice")
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "alice"
+        );
+        assert_eq!(
+            client
+                .get(&url)
+                .header("x-hc-user-id", "bob")
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "bob"
+        );
+        server.abort();
     }
 
     #[test]

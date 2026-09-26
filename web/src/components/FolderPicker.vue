@@ -53,6 +53,7 @@ const rows = computed(() => {
             name: `当前目录 · ${s.path.split("/").at(-1) || "根目录"}`,
             path: s.path,
             kind: "directory" as const,
+            size: null,
             supported: true,
           },
           ...s.entries,

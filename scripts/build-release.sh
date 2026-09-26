@@ -54,3 +54,22 @@ done
 if [ ! -f build/fonts/NotoSansCJK-Regular.ttc ]; then
     echo "warning: no CJK font found; PDF jobs will fail at runtime (install fonts-noto-cjk)" >&2
 fi
+
+# Optional Unicode fallbacks for shaping; missing coverage produces an explicit
+# job error. Install fonts-noto-core to include Arabic/Hebrew/Indic/Thai support.
+for name in NotoSans-Regular.ttf NotoSansArabic-Regular.ttf NotoSansHebrew-Regular.ttf NotoSansDevanagari-Regular.ttf NotoSansThai-Regular.ttf DejaVuSans.ttf
+do
+    for root in /usr/share/fonts/truetype/noto /usr/share/fonts/truetype/dejavu
+    do
+        if [ -f "$root/$name" ]; then
+            cp "$root/$name" "build/fonts/$name"
+            break
+        fi
+    done
+done
+for package in fonts-noto-cjk fonts-noto-core fonts-dejavu-core
+do
+    if [ -f "/usr/share/doc/$package/copyright" ]; then
+        cp "/usr/share/doc/$package/copyright" "build/fonts/$package.copyright"
+    fi
+done

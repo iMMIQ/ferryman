@@ -1,11 +1,12 @@
 //! Proxy handlers for the AI Pod agent plus model lease acquisition helpers.
 
-use super::{agent_response, json_error, user_owner, AppState, Config, MAX_MODEL_START_ATTEMPTS};
+use super::{agent_response, json_error, AppState, Config, UserIdentity, MAX_MODEL_START_ATTEMPTS};
 use anyhow::Result;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use ferryman::auth::hmac_token;
 use ferryman::preset::Preset;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -35,28 +36,6 @@ async fn pair_agent_once(config: &Config) -> Result<()> {
         anyhow::bail!("agent pairing failed ({})", response.status());
     }
     Ok(())
-}
-
-fn hmac_token(token: &str, nonce: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut key = [0u8; 64];
-    key[..32].copy_from_slice(&Sha256::digest(token.as_bytes()));
-    let mut inner = Sha256::new();
-    for byte in &key {
-        inner.update([byte ^ 0x36]);
-    }
-    inner.update(nonce.as_bytes());
-    let inner = inner.finalize();
-    let mut outer = Sha256::new();
-    for byte in &key {
-        outer.update([byte ^ 0x5c]);
-    }
-    outer.update(inner);
-    outer
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 pub(crate) async fn pair_agent_with_retry(config: &Config) -> Result<()> {
@@ -149,13 +128,10 @@ pub(super) async fn model_storage(State(state): State<AppState>) -> Response {
 
 pub(super) async fn start_model_download(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _identity: UserIdentity,
     Path(preset): Path<Preset>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if user_owner(&headers, state.config.allow_local_user).is_err() {
-        return json_error(StatusCode::UNAUTHORIZED, "missing SAFE_UID header");
-    }
     let path = format!("/models/{preset}/download");
     match agent_json(&state.config, reqwest::Method::POST, &path, Some(body)).await {
         Ok((status, value)) => agent_response(status, value),
@@ -165,12 +141,9 @@ pub(super) async fn start_model_download(
 
 pub(super) async fn pause_model_download(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _identity: UserIdentity,
     Path(preset): Path<Preset>,
 ) -> Response {
-    if user_owner(&headers, state.config.allow_local_user).is_err() {
-        return json_error(StatusCode::UNAUTHORIZED, "missing SAFE_UID header");
-    }
     let path = format!("/models/{preset}/pause");
     match agent_json(&state.config, reqwest::Method::POST, &path, None).await {
         Ok((status, value)) => agent_response(status, value),
@@ -180,12 +153,9 @@ pub(super) async fn pause_model_download(
 
 pub(super) async fn delete_model(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _identity: UserIdentity,
     Path(preset): Path<Preset>,
 ) -> Response {
-    if user_owner(&headers, state.config.allow_local_user).is_err() {
-        return json_error(StatusCode::UNAUTHORIZED, "missing SAFE_UID header");
-    }
     let path = format!("/models/{preset}");
     match agent_json(&state.config, reqwest::Method::DELETE, &path, None).await {
         Ok((status, value)) => agent_response(status, value),
@@ -195,12 +165,9 @@ pub(super) async fn delete_model(
 
 pub(super) async fn start_source_benchmark(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _identity: UserIdentity,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if user_owner(&headers, state.config.allow_local_user).is_err() {
-        return json_error(StatusCode::UNAUTHORIZED, "missing SAFE_UID header");
-    }
     match agent_json(
         &state.config,
         reqwest::Method::POST,
@@ -216,11 +183,8 @@ pub(super) async fn start_source_benchmark(
 
 pub(super) async fn cancel_source_benchmark(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _identity: UserIdentity,
 ) -> Response {
-    if user_owner(&headers, state.config.allow_local_user).is_err() {
-        return json_error(StatusCode::UNAUTHORIZED, "missing SAFE_UID header");
-    }
     match agent_json(
         &state.config,
         reqwest::Method::DELETE,
@@ -236,11 +200,8 @@ pub(super) async fn cancel_source_benchmark(
 
 pub(super) async fn clear_runtime_cache(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _identity: UserIdentity,
 ) -> Response {
-    if user_owner(&headers, state.config.allow_local_user).is_err() {
-        return json_error(StatusCode::UNAUTHORIZED, "missing SAFE_UID header");
-    }
     match agent_json(&state.config, reqwest::Method::DELETE, "/cache", None).await {
         Ok((status, value)) => agent_response(status, value),
         Err(error) => json_error(StatusCode::BAD_GATEWAY, error.to_string()),
@@ -249,13 +210,10 @@ pub(super) async fn clear_runtime_cache(
 
 pub(super) async fn runtime_start(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    identity: UserIdentity,
     Json(request): Json<RuntimeStartRequest>,
 ) -> Response {
-    let owner = match user_owner(&headers, state.config.allow_local_user) {
-        Ok(owner) => owner,
-        Err(status) => return json_error(status, "missing SAFE_UID header"),
-    };
+    let owner = identity.owner.clone();
     let body = serde_json::json!({
         "preset": request.preset,
         "lease_id": format!("manual-{owner}"),
@@ -274,11 +232,11 @@ pub(super) async fn runtime_start(
     }
 }
 
-pub(super) async fn runtime_stop(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let owner = match user_owner(&headers, state.config.allow_local_user) {
-        Ok(owner) => owner,
-        Err(status) => return json_error(status, "missing SAFE_UID header"),
-    };
+pub(super) async fn runtime_stop(
+    State(state): State<AppState>,
+    identity: UserIdentity,
+) -> Response {
+    let owner = identity.owner.clone();
     release_agent(&state.config, &format!("manual-{owner}")).await;
     match agent_json(
         &state.config,

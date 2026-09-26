@@ -1,4 +1,6 @@
 pub mod archive;
+pub mod atomic_file;
+pub mod auth;
 pub mod batch;
 pub mod cache;
 pub mod container;

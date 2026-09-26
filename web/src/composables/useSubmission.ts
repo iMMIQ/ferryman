@@ -69,6 +69,24 @@ export function useSubmission(
   let snapshot: Snapshot | undefined,
     upload: XMLHttpRequest | undefined,
     cancelled = false;
+  const attemptKey = "ferryman-mounted-submission";
+  let mountedAttempt: { payload: string; id: string } | undefined;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(attemptKey) || "null");
+    if (typeof saved?.payload === "string" && typeof saved?.id === "string")
+      mountedAttempt = saved;
+  } catch {
+    /* Storage can be disabled; in-memory retries remain safe. */
+  }
+  function persistAttempt() {
+    try {
+      if (mountedAttempt)
+        sessionStorage.setItem(attemptKey, JSON.stringify(mountedAttempt));
+      else sessionStorage.removeItem(attemptKey);
+    } catch {
+      /* Keep the in-memory attempt when storage is unavailable. */
+    }
+  }
   const extensions = new Set([
     "epub",
     "docx",
@@ -241,11 +259,23 @@ export function useSubmission(
       xhr.onload = () => {
         upload = undefined;
         if (xhr.status >= 200 && xhr.status < 300) {
-          let id: string | undefined;
           try {
-            id = JSON.parse(xhr.responseText).id;
-          } catch {}
-          resolve(id);
+            if (
+              !xhr
+                .getResponseHeader("content-type")
+                ?.includes("application/json")
+            )
+              throw new Error();
+            const id = JSON.parse(xhr.responseText).id;
+            if (typeof id !== "string" || !id.trim()) throw new Error();
+            resolve(id);
+          } catch {
+            reject(
+              new Error(
+                "服务未返回有效的任务记录，提交结果尚未确认；请先刷新任务列表核实。",
+              ),
+            );
+          }
         } else {
           let message = `上传失败 (${xhr.status})`;
           try {
@@ -312,9 +342,14 @@ export function useSubmission(
           s.files = s.files.filter((f) => f !== file);
         }
       else {
+        const payload = JSON.stringify(captured.request);
+        if (mountedAttempt?.payload !== payload)
+          mountedAttempt = { payload, id: crypto.randomUUID() };
+        persistAttempt();
         const result = await api<CreatedJobs>(
           "/api/jobs/selection",
-          json(captured.request),
+          json({ ...captured.request, request_id: mountedAttempt.id }),
+          120000,
         );
         added = result.jobs.length;
         ids.push(...result.jobs.map((job) => job.id));
@@ -327,9 +362,14 @@ export function useSubmission(
           s.result = `已加入 ${added} 个任务；提交时重新检查并跳过 ${skipped} 个文件。`;
       }
       if (!s.result) s.result = `已加入 ${added} 个任务，模型就绪后自动执行。`;
+      mountedAttempt = undefined;
+      persistAttempt();
       await onSuccess(ids, s.result);
     } catch (error) {
-      s.error = `${added ? `已加入 ${added} 个任务。` : ""}${errorText(error)} 未提交的文件已保留。`;
+      s.error =
+        captured.sourceMode === "mounted"
+          ? `${errorText(error)} 请先刷新任务列表核实；以相同设置重试将查询原提交结果，不会重复创建任务。`
+          : `${added ? `已加入 ${added} 个任务。` : ""}${errorText(error)} 未确认的文件已保留，请先核实任务列表。`;
     } finally {
       upload = undefined;
       s.uploading = false;

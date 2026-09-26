@@ -68,6 +68,7 @@ pub fn extract(html: &str) -> Result<(String, Vec<Block>)> {
     let st_sup = st.clone();
     let st_blk = st.clone();
     let st_txt = st.clone();
+    let st_break = st.clone();
 
     let rewritten = rewrite_str(
         html,
@@ -117,6 +118,15 @@ pub fn extract(html: &str) -> Result<(String, Vec<Block>)> {
                     });
                     Ok(())
                 }),
+                element!("br", move |_| {
+                    let mut s = st_break.borrow_mut();
+                    if s.suppress == 0 {
+                        if let Some(&(id, _)) = s.stack.last() {
+                            s.blocks[id].text.push('\n');
+                        }
+                    }
+                    Ok(())
+                }),
                 // Inject the translation style into <head>.
                 element!("head", |el| {
                     el.append(STYLE_HTML, ContentType::Html);
@@ -140,7 +150,11 @@ pub fn extract(html: &str) -> Result<(String, Vec<Block>)> {
         },
     )?;
 
-    let blocks = Rc::try_unwrap(st).ok().unwrap().into_inner().blocks;
+    let mut blocks = Rc::try_unwrap(st).ok().unwrap().into_inner().blocks;
+    // Decode after collecting all chunks so a split entity stays intact.
+    for block in &mut blocks {
+        block.text = html_escape::decode_html_entities(&block.text).into_owned();
+    }
     Ok((rewritten, blocks))
 }
 
@@ -209,6 +223,17 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracted_text_decodes_entities_and_preserves_breaks() {
+        let (_, blocks) =
+            extract("<html><body><p>Tom &amp; Jerry&lt;3 &#x4E2D;<br/>world</p></body></html>")
+                .unwrap();
+        assert_eq!(
+            blocks.iter().find(|b| b.leaf).unwrap().text,
+            "Tom & Jerry<3 中\nworld"
+        );
+    }
 
     #[test]
     fn html_escape_replaces_entities() {

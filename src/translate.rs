@@ -687,7 +687,10 @@ pub(crate) fn parse_tagged(resp: &str, count: usize) -> Vec<Option<String>> {
         let close = format!("</c{}>", n);
         match content.find(&close) {
             Some(end) => {
-                map.entry(n).or_insert(content[..end].trim().to_string());
+                let text = content[..end].trim();
+                if !text.is_empty() {
+                    map.entry(n).or_insert(text.to_string());
+                }
                 rest = &content[end + close.len()..];
             }
             None => rest = content, // opener with no closer: skip it
@@ -699,6 +702,19 @@ pub(crate) fn parse_tagged(resp: &str, count: usize) -> Vec<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_tagged_translations_remain_missing() {
+        assert_eq!(
+            parse_tagged("<c1>  </c1><c2>translated</c2>", 2),
+            vec![None, Some("translated".into())]
+        );
+        assert_eq!(
+            parse_tagged("<c1></c1><c1>recovered</c1>", 1),
+            vec![Some("recovered".into())]
+        );
+    }
+
     use std::sync::Arc;
 
     #[test]

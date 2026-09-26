@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, onBeforeUpdate, onUpdated } from "vue";
+import { useQuery } from "@tanstack/vue-query";
+import { api } from "../lib/api";
 import type { JobsStore } from "../composables/useJobs";
 import type { Job } from "../lib/types";
 import {
@@ -8,6 +10,7 @@ import {
   modelNames,
   time,
   statusLabel,
+  errorText,
   terminal,
 } from "../lib/format";
 import AppButton from "./ui/AppButton.vue";
@@ -35,8 +38,16 @@ defineEmits<{ create: []; browse: [] }>();
 const s = props.store.state,
   detailId = ref<string | null>(null),
   deleting = ref(false);
+const detail = useQuery({
+  queryKey: computed(() => ["jobs", "detail", detailId.value]),
+  enabled: computed(() => !!detailId.value),
+  queryFn: ({ signal, queryKey }) =>
+    api<Job>(`/api/jobs/${queryKey[2]}`, { signal }),
+  refetchInterval: (query) =>
+    query.state.data && terminal(query.state.data) ? false : 2500,
+});
 const job = computed(() =>
-  detailId.value ? s.byId[detailId.value] : undefined,
+  detailId.value ? (detail.data.value ?? s.byId[detailId.value]) : undefined,
 );
 let priorFocus: HTMLElement | null = null,
   focusedRow: Element | null = null;
@@ -287,7 +298,13 @@ async function remove() {
       <p class="helper-text">
         重试会优先复用已完成的翻译；旧任务若缺少翻译记录，可能需要重新翻译。
       </p>
-      <AppNotice id="job-detail-error" :message="job && s.errors[job.id]" />
+      <AppNotice
+        id="job-detail-error"
+        :message="
+          (job && s.errors[job.id]) ||
+          (detail.error.value ? errorText(detail.error.value) : '')
+        "
+      />
       <div v-if="deleting && job && terminal(job)" class="notice error">
         <span>删除这条记录及任务内文件？保存到文稿或网盘的结果不会删除。</span
         ><AppButton variant="danger" :busy="s.pending[job.id]" @click="remove"

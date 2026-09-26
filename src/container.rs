@@ -148,6 +148,11 @@ impl ContainerGuard {
         }
 
         let endpoint = format!("http://127.0.0.1:{}", spec.host_port);
+        let guard = Self {
+            name: spec.container_name.clone(),
+            endpoint: endpoint.clone(),
+            active: true,
+        };
         if !wait_health(&endpoint, &spec.container_name, spec.health_timeout).await {
             // Surface the container logs so the failure is diagnosable.
             let _ = Command::new("docker")
@@ -162,11 +167,7 @@ impl ContainerGuard {
         }
         eprintln!("vLLM healthy at {}", endpoint);
 
-        Ok(Self {
-            name: spec.container_name.clone(),
-            endpoint,
-            active: true,
-        })
+        Ok(guard)
     }
 }
 

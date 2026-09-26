@@ -11,6 +11,7 @@ pub struct MdDoc {
     spans: Vec<Span>,
 }
 struct Block {
+    footnote: bool,
     range: Range<usize>,
     spans: Range<usize>,
 }
@@ -55,7 +56,11 @@ impl MdDoc {
             match event {
                 Event::Start(tag) => {
                     if depth == 0 {
-                        block = Some((range, spans.len()));
+                        block = Some((
+                            range,
+                            spans.len(),
+                            matches!(tag, Tag::FootnoteDefinition(_)),
+                        ));
                     }
                     depth += 1;
                     if matches!(
@@ -84,11 +89,12 @@ impl MdDoc {
                     }
                     depth -= 1;
                     if depth == 0 {
-                        if let Some((mut range, start)) = block.take() {
+                        if let Some((mut range, start, footnote)) = block.take() {
                             range.end = range.start
                                 + source[range.clone()].trim_end_matches(['\r', '\n']).len();
                             if spans.len() > start {
                                 blocks.push(Block {
+                                    footnote,
                                     range,
                                     spans: start..spans.len(),
                                 });
@@ -138,6 +144,10 @@ impl MdDoc {
                     .filter(|t| !t.trim().is_empty() && t.trim() != span.text)
                 {
                     changed = true;
+                    if block.footnote && mode == OutputMode::Bilingual {
+                        translated.push_str(&self.source[span.range.clone()]);
+                        translated.push_str(" / ");
+                    }
                     // A text node must stay a text node, not introduce Markdown.
                     for ch in text.trim().chars() {
                         if "\\`*_{}[]<>#!|~-+.&".contains(ch) {
@@ -155,7 +165,7 @@ impl MdDoc {
                 position = span.range.end;
             }
             translated.push_str(&self.source[position..block.range.end]);
-            if changed && mode == OutputMode::Bilingual {
+            if changed && mode == OutputMode::Bilingual && !block.footnote {
                 output.push_str(original);
                 if !original.ends_with('\n') {
                     output.push_str(newline);
@@ -206,6 +216,26 @@ impl Document for MdDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bilingual_footnotes_keep_one_definition() {
+        let doc = MdDoc::parse("Hello[^note].\n\n[^note]: Original **bold** note.\n".into());
+        let tr = doc
+            .segments()
+            .iter()
+            .map(|s| (s.id, "译文".into()))
+            .collect();
+        let output = doc.render(&tr, OutputMode::Bilingual);
+        assert_eq!(output.matches("[^note]:").count(), 1);
+        let mut html = String::new();
+        pulldown_cmark::html::push_html(
+            &mut html,
+            Parser::new_ext(&output, Options::ENABLE_FOOTNOTES),
+        );
+        assert_eq!(html.matches("id=\"note\"").count(), 1);
+        assert!(html.contains("Original / 译文"));
+    }
+
     #[test]
     fn commonmark_protects_code_metadata_urls_and_preserves_bytes() {
         let source = "---\r\ntitle: secret\r\n---\r\n\r\n# Hello\r\n\r\n    print(\"keep\")\r\n\r\n````text\r\n```\r\nDO_NOT_TRANSLATE\r\n````\r\n\r\nRead `code` and [label](https://example.com \"title\"). <https://example.org>\r\n\r\n[id]: https://example.net\r\n";

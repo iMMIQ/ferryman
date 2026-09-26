@@ -217,7 +217,11 @@ fn parent_dir(path: &str) -> String {
 
 /// Join an OPF-relative href onto the OPF directory, normalising separators.
 fn join_path(dir: &str, href: &str) -> String {
-    let href = href.replace('\\', "/");
+    // Decode the URL path, not a fragment or query component.
+    let path = href.split(['#', '?']).next().unwrap_or(href);
+    let href = percent_encoding::percent_decode_str(path)
+        .decode_utf8_lossy()
+        .replace('\\', "/");
     let mut parts: Vec<&str> = Vec::new();
     for seg in dir.split('/').chain(href.split('/')) {
         match seg {
@@ -234,6 +238,16 @@ fn join_path(dir: &str, href: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spine_paths_decode_urls_after_removing_fragments() {
+        assert_eq!(
+            join_path("OEBPS", "chapter%201.xhtml#part"),
+            "OEBPS/chapter 1.xhtml"
+        );
+        assert_eq!(join_path("", "%E4%B8%AD.xhtml"), "中.xhtml");
+        assert_eq!(join_path("", "part%23one.xhtml"), "part#one.xhtml");
+    }
 
     #[test]
     fn archive_limits_reject_count_entry_and_total_sizes() {

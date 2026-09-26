@@ -53,7 +53,10 @@ impl Cache {
     /// error. Async (`tokio::fs`): a 10k-block book issues ~20k of these per
     /// run, and the sync version blocked the async workers between HTTP polls.
     pub async fn get(&self, key: &str) -> Option<String> {
-        tokio::fs::read_to_string(self.path_of(key)).await.ok()
+        tokio::fs::read_to_string(self.path_of(key))
+            .await
+            .ok()
+            .filter(|text| !text.trim().is_empty())
     }
 
     /// Write `val` under `key`, best-effort. Atomic via tmp-file + rename within
@@ -82,6 +85,15 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_empty_cache_entries_are_misses() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = Cache::open(Some(root.path().into())).unwrap();
+        let key = cache.key("model", "zh", "original", "scope");
+        cache.put(&key, " \n").await;
+        assert_eq!(cache.get(&key).await, None);
+    }
 
     #[test]
     fn cache_keys_are_unambiguous_and_versioned() {

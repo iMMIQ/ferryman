@@ -68,6 +68,7 @@ struct AppState {
     active_jobs: Arc<RwLock<HashMap<Uuid, JobEntry>>>,
     store: JobStore,
     cancellations: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
+    job_locks: Arc<Mutex<HashMap<Uuid, std::sync::Weak<Mutex<()>>>>>,
     queue: mpsc::Sender<Uuid>,
     request_limiters: Arc<HashMap<Preset, Arc<Semaphore>>>,
     translation_client: reqwest::Client,
@@ -206,7 +207,7 @@ impl StorageKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[derive(ts_rs::TS)]
 enum SaveStrategy {
@@ -453,10 +454,26 @@ where
     Some(record)
 }
 
+// One transition lock per job; weak entries do not keep completed jobs alive.
+async fn lock_job(state: &AppState, id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut locks = state.job_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&id).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(id, Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    lock.lock_owned().await
+}
+
 async fn claim_queued_job(state: &AppState, id: Uuid) -> Option<JobEntry> {
-    // The in-memory check is only a fast gate; SQLite's
-    // `UPDATE ... WHERE status='queued'` is the real double-claim guard, so the
-    // lock must not be held across the claim.
+    let _transition = lock_job(state, id).await;
+    // Serialize claim with cancellation, including persistence and token registration.
     if state
         .active_jobs
         .read()
@@ -468,6 +485,11 @@ async fn claim_queued_job(state: &AppState, id: Uuid) -> Option<JobEntry> {
     }
     match state.store.claim(id, now_epoch_seconds()).await {
         Ok(Some(entry)) => {
+            state
+                .cancellations
+                .lock()
+                .await
+                .insert(id, CancellationToken::new());
             state.active_jobs.write().await.insert(id, entry.clone());
             Some(entry)
         }
@@ -546,11 +568,50 @@ async fn sweep_terminal_jobs_at(state: &AppState, retention: Duration, now: u64)
             break;
         }
         let mut removed = Vec::with_capacity(expired.len());
-        for entry in &expired {
+        for candidate in &expired {
+            let _transition = lock_job(state, candidate.record.id).await;
+            // Re-read under the same lock used by retry/delete. A terminal
+            // snapshot from the initial query is not permission to remove files.
+            let entry = match state
+                .store
+                .get(candidate.owner.clone(), candidate.record.id)
+                .await
+            {
+                Ok(Some(entry))
+                    if entry.record.status.is_terminal() && entry.record.updated_at < cutoff =>
+                {
+                    entry
+                }
+                _ => continue,
+            };
+            if state
+                .active_jobs
+                .read()
+                .await
+                .contains_key(&entry.record.id)
+            {
+                continue;
+            }
             match tokio::fs::remove_dir_all(&entry.dir).await {
-                Ok(()) => removed.push(entry.record.id),
+                Ok(()) => {
+                    if state
+                        .store
+                        .delete_terminal_ids(vec![entry.record.id])
+                        .await
+                        .is_ok_and(|deleted| deleted > 0)
+                    {
+                        removed.push(entry.record.id);
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    removed.push(entry.record.id)
+                    if state
+                        .store
+                        .delete_terminal_ids(vec![entry.record.id])
+                        .await
+                        .is_ok_and(|deleted| deleted > 0)
+                    {
+                        removed.push(entry.record.id);
+                    }
                 }
                 Err(error) => {
                     warn!(
@@ -567,13 +628,7 @@ async fn sweep_terminal_jobs_at(state: &AppState, retention: Duration, now: u64)
             // again would spin forever on the same rows.
             break;
         }
-        match state.store.delete_terminal_ids(removed).await {
-            Ok(count) => swept += count,
-            Err(error) => {
-                error!(%error, "delete expired terminal job rows");
-                break;
-            }
-        }
+        swept += removed.len();
         if expired.len() < JOB_SWEEP_BATCH {
             break;
         }
@@ -683,6 +738,7 @@ async fn main() -> Result<()> {
         active_jobs: Arc::new(RwLock::new(active_jobs)),
         store,
         cancellations: Arc::new(Mutex::new(HashMap::new())),
+        job_locks: Arc::default(),
         queue,
         persister,
         request_limiters: Arc::new(HashMap::from([
@@ -733,11 +789,11 @@ async fn main() -> Result<()> {
                 .layer(DefaultBodyLimit::disable()),
         )
         .route("/api/jobs/active", get(jobs_api::list_active_jobs))
+        .route("/api/jobs/directory", post(jobs_api::create_directory_jobs))
         .route(
             "/api/jobs/{id}",
-            axum::routing::delete(jobs_api::delete_job),
+            get(jobs_api::get_job).delete(jobs_api::delete_job),
         )
-        .route("/api/jobs/directory", post(jobs_api::create_directory_jobs))
         .route("/api/jobs/selection", post(jobs_api::create_directory_jobs))
         .route(
             "/api/jobs/selection/preview",
@@ -815,6 +871,7 @@ mod tests {
             active_jobs: Arc::new(RwLock::new(HashMap::new())),
             store: store.clone(),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
+            job_locks: Arc::default(),
             queue: mpsc::channel(1).0,
             request_limiters: Arc::new(HashMap::new()),
             translation_client: reqwest::Client::new(),
@@ -1155,3 +1212,7 @@ mod tests {
         tokio::fs::remove_dir_all(&base).await.unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "ferryman_web/regression_tests.rs"]
+mod regression_tests;

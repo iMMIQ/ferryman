@@ -62,6 +62,11 @@ impl JobStore {
                         "unsupported job database schema {version}; expected {SCHEMA_VERSION}"
                     );
                 }
+                connection.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS submissions (
+                    owner TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL,
+                    response TEXT NOT NULL, PRIMARY KEY(owner, id))",
+                )?;
                 Ok(())
             })
             .await?;
@@ -81,19 +86,54 @@ impl JobStore {
             .context("database worker")?
     }
 
-    pub(crate) async fn insert(&self, entry: JobEntry, active_limit: usize) -> Result<()> {
+    pub(crate) async fn submission(
+        &self,
+        owner: String,
+        id: Uuid,
+        payload: String,
+    ) -> Result<Option<String>> {
         self.call(move |connection| {
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let active = transaction.query_row(
-                "SELECT COUNT(*) FROM jobs
-                 WHERE owner=?1 AND status IN ('queued', 'starting_model', 'translating', 'writing')",
-                [&entry.owner],
-                |row| row.get::<_, i64>(0),
-            )? as usize;
-            if active >= active_limit {
-                anyhow::bail!("too many queued or active jobs");
+            let previous: Option<(String, String)> = connection
+                .query_row(
+                    "SELECT payload, response FROM submissions WHERE owner=?1 AND id=?2",
+                    params![owner, id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            match previous {
+                Some((saved, response)) => {
+                    anyhow::ensure!(
+                        saved == payload,
+                        "submission id already used for another request"
+                    );
+                    Ok(Some(response))
+                }
+                None => Ok(None),
             }
+        })
+        .await
+    }
+
+    pub(crate) async fn insert(&self, entry: JobEntry, active_limit: usize) -> Result<()> {
+        self.insert_batch(vec![entry], active_limit, None).await
+    }
+
+    // Publish a prepared batch and its idempotent response in one transaction.
+    pub(crate) async fn insert_batch(
+        &self,
+        entries: Vec<JobEntry>,
+        active_limit: usize,
+        receipt: Option<(String, Uuid, String, String)>,
+    ) -> Result<()> {
+        self.call(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(entry) = entries.first() {
+                let active: usize = transaction.query_row(
+                    "SELECT COUNT(*) FROM jobs WHERE owner=?1 AND status IN ('queued','starting_model','translating','writing')",
+                    [&entry.owner], |row| row.get(0))?;
+                anyhow::ensure!(active.saturating_add(entries.len()) <= active_limit, "too many queued or active jobs");
+            }
+            for entry in entries {
             transaction.execute(
                 "INSERT INTO jobs (
                     id, owner, filename, preset, target_language, output_mode, status,
@@ -112,10 +152,14 @@ impl JobStore {
                  )",
                 rusqlite::params_from_iter(entry_params(&entry)?),
             )?;
+            }
+            if let Some((owner, id, payload, response)) = receipt {
+                transaction.execute("INSERT INTO submissions(owner,id,payload,response) VALUES (?1,?2,?3,?4)",
+                    params![owner, id.to_string(), payload, response])?;
+            }
             transaction.commit()?;
             Ok(())
-        })
-        .await
+        }).await
     }
 
     pub(crate) async fn update(&self, entry: JobEntry) -> Result<()> {

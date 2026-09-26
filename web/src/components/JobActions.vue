@@ -28,7 +28,7 @@ defineEmits<{ action: [action: "retry" | "cancel" | "delete"]; details: [] }>();
       }}</AppButton
     >
     <AppButton
-      v-if="!terminal(job)"
+      v-if="!terminal(job) && job.status !== 'writing'"
       variant="ghost"
       data-action="cancel"
       :busy="pending"

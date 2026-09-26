@@ -788,9 +788,10 @@ struct Para {
     bot: f64,
     size: f64,
     translatable: bool,
-    /// Continuation of the previous page's last paragraph (text was merged
-    /// there; this one draws nothing and gets no segment).
+    /// Continuation of an earlier page's paragraph. It shares that segment
+    /// and receives a proportion of its translation when writing.
     merged_up: bool,
+    merged_into: Option<(usize, usize)>,
 }
 
 impl Para {
@@ -823,6 +824,7 @@ impl Para {
             size,
             translatable,
             merged_up: false,
+            merged_into: None,
         }
     }
 
@@ -909,10 +911,15 @@ fn merge_across_pages(pages: &mut [(MediaBoxGeo, Vec<Para>)]) {
         };
         if merge {
             let text = pages[i].1[0].text.clone();
-            let last = pages[i - 1].1.last_mut().unwrap();
-            last.text = join_lines(&last.text, &text);
-            last.translatable = is_translatable(&last.text);
+            let previous = (i - 1, pages[i - 1].1.len() - 1);
+            let owner = pages[previous.0].1[previous.1]
+                .merged_into
+                .unwrap_or(previous);
+            let first = &mut pages[owner.0].1[owner.1];
+            first.text = join_lines(&first.text, &text);
+            first.translatable = is_translatable(&first.text);
             pages[i].1[0].merged_up = true;
+            pages[i].1[0].merged_into = Some(owner);
         }
     }
 }
@@ -1078,7 +1085,29 @@ impl Document for PdfDoc {
         let mut tr_by_para: HashMap<(usize, usize), &str> = HashMap::new();
         for (id, tr) in translations {
             if let Some(&(p, x)) = self.seg_index.get(*id) {
-                tr_by_para.insert((p, x), tr.as_str());
+                let mut fragments = vec![(p, x)];
+                for (pi, page) in self.pages.iter().enumerate() {
+                    for (xi, para) in page.paras.iter().enumerate() {
+                        if para.merged_into == Some((p, x)) {
+                            fragments.push((pi, xi));
+                        }
+                    }
+                }
+                let weights: Vec<usize> = fragments
+                    .iter()
+                    .map(|&(pi, xi)| {
+                        self.pages[pi].paras[xi]
+                            .lines
+                            .iter()
+                            .map(|line| line.text.len())
+                            .sum::<usize>()
+                            .max(1)
+                    })
+                    .collect();
+                let pieces = split_page_translation(tr, &weights);
+                for (position, piece) in fragments.into_iter().zip(pieces) {
+                    tr_by_para.insert(position, piece);
+                }
             }
         }
 
@@ -1224,6 +1253,31 @@ impl Document for PdfDoc {
         // preserve.
         Strategy::Independent
     }
+}
+
+// Distribute a translated cross-page paragraph over its original page slots.
+// UAX #14 boundaries keep graphemes/words intact whenever a break is available.
+fn split_page_translation<'a>(text: &'a str, weights: &[usize]) -> Vec<&'a str> {
+    let total: usize = weights.iter().sum();
+    let mut cumulative = 0;
+    let mut start = 0;
+    let mut pieces = Vec::new();
+    for (index, weight) in weights.iter().enumerate() {
+        cumulative += weight;
+        let end = if index + 1 == weights.len() {
+            text.len()
+        } else {
+            let target = text.len().saturating_mul(cumulative) / total.max(1);
+            unicode_linebreak::linebreaks(text)
+                .map(|(end, _)| end)
+                .filter(|&end| end >= start)
+                .min_by_key(|&end| end.abs_diff(target))
+                .unwrap_or(text.len())
+        };
+        pieces.push(text[start..end].trim());
+        start = end;
+    }
+    pieces
 }
 
 // ── content stream building ─────────────────────────────────────────────────
@@ -1655,7 +1709,10 @@ fn add_font_to_page(
             let base = match own {
                 Some(Object::Dictionary(d)) => d,
                 _ => inherited(doc, doc.get_dictionary(page_id)?, b"Resources")
-                    .and_then(|o| o.as_dict().ok())
+                    .and_then(|o| match o {
+                        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+                        other => other.as_dict().ok(),
+                    })
                     .cloned()
                     .context("page tree has no Resources")?,
             };
@@ -1692,6 +1749,94 @@ fn add_font_to_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn three_page_continuations_keep_all_text_and_replace_every_page() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("input.pdf");
+        fs::write(
+            &source,
+            make_pdf(&[
+                (600., 800., &[(50., 60., 12., "First page continuation")]),
+                (600., 800., &[(50., 60., 12., "Second page continuation")]),
+                (600., 800., &[(50., 60., 12., "Third page continuation")]),
+            ]),
+        )
+        .unwrap();
+        let mut pdf = PdfDoc::open(&source).unwrap();
+        let segments = pdf.segments();
+        assert_eq!(segments.len(), 1);
+        for word in ["First", "Second", "Third"] {
+            assert!(segments[0].text.contains(word));
+        }
+        let output = root.path().join("translated.pdf");
+        pdf.write(
+            &[(0, "第一页译文。第二页译文。第三页译文。".into())],
+            &output,
+            OutputMode::Replace,
+        )
+        .unwrap();
+        let doc = lopdf::Document::load(&output).unwrap();
+        for id in doc.get_pages().values() {
+            let content = String::from_utf8_lossy(&doc.get_page_content(*id).unwrap()).into_owned();
+            assert!(
+                content.contains(" re f"),
+                "every source fragment is covered"
+            );
+            assert!(
+                content.contains("/ActualText"),
+                "every page gets a translation fragment"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_resolves_indirect_inherited_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let mut doc = lopdf::Document::load_mem(&make_pdf(&[(
+            600.,
+            800.,
+            &[(50., 60., 12., "Hello world")],
+        )]))
+        .unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let resources = doc
+            .get_dictionary(page)
+            .unwrap()
+            .get(b"Resources")
+            .unwrap()
+            .clone();
+        let resources = match resources {
+            Object::Reference(id) => id,
+            other => doc.add_object(other),
+        };
+        let parent = doc
+            .get_dictionary(page)
+            .unwrap()
+            .get(b"Parent")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        doc.get_object_mut(parent)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Resources", Object::Reference(resources));
+        doc.get_object_mut(page)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .remove(b"Resources");
+        let input = root.path().join("input.pdf");
+        doc.save(&input).unwrap();
+        let mut pdf = PdfDoc::open(&input).unwrap();
+        pdf.write(
+            &[(0, "你好世界".into())],
+            &root.path().join("output.pdf"),
+            OutputMode::Replace,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn normalize_expands_ligatures_and_spaces() {

@@ -48,7 +48,7 @@ defineEmits<{ action: [action: "retry" | "cancel" | "delete"]; details: [] }>();
       variant="ghost"
       data-action="details"
       @click="$emit('details')"
-      >更多</AppButton
+      >查看详情</AppButton
     >
   </div>
 </template>

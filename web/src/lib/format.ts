@@ -17,7 +17,7 @@ export const modelStates: Record<string, string> = {
   failed: "准备失败",
 };
 export const runtimeNames: Record<string, string> = {
-  stopped: "已卸载",
+  stopped: "待机",
   starting: "启动中",
   ready: "可用",
   stopping: "卸载中",

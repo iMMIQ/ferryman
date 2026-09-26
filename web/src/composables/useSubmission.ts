@@ -21,7 +21,7 @@ interface Snapshot {
 }
 export function useSubmission(
   download: (preset: Preset) => Promise<void>,
-  onSuccess: () => Promise<void>,
+  onSuccess: (ids: string[], message: string) => Promise<void>,
 ) {
   const s = reactive({
     stage: "editing" as SubmissionStage,
@@ -225,7 +225,7 @@ export function useSubmission(
     index: number,
     count: number,
   ) {
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<string | undefined>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       upload = xhr;
       s.uploading = true;
@@ -240,8 +240,13 @@ export function useSubmission(
       };
       xhr.onload = () => {
         upload = undefined;
-        if (xhr.status >= 200 && xhr.status < 300) resolve();
-        else {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          let id: string | undefined;
+          try {
+            id = JSON.parse(xhr.responseText).id;
+          } catch {}
+          resolve(id);
+        } else {
           let message = `上传失败 (${xhr.status})`;
           try {
             message = JSON.parse(xhr.responseText).error || message;
@@ -288,6 +293,7 @@ export function useSubmission(
     s.stage = "submitting";
     cancelled = false;
     let added = 0;
+    const ids: string[] = [];
     try {
       await download(captured.request.preset);
       if (cancelled) throw new Error("已停止提交；已加入队列的任务不会取消。");
@@ -295,7 +301,13 @@ export function useSubmission(
         for (const [index, file] of captured.files.entries()) {
           if (cancelled)
             throw new Error("已停止后续上传；已经加入队列的任务不会取消。");
-          await sendFile(file, captured.request, index, captured.files.length);
+          const id = await sendFile(
+            file,
+            captured.request,
+            index,
+            captured.files.length,
+          );
+          if (id) ids.push(id);
           added++;
           s.files = s.files.filter((f) => f !== file);
         }
@@ -305,6 +317,7 @@ export function useSubmission(
           json(captured.request),
         );
         added = result.jobs.length;
+        ids.push(...result.jobs.map((job) => job.id));
         const skipped =
           (result.skipped_existing || 0) +
           (result.skipped_generated || 0) +
@@ -314,7 +327,7 @@ export function useSubmission(
           s.result = `已加入 ${added} 个任务；提交时重新检查并跳过 ${skipped} 个文件。`;
       }
       if (!s.result) s.result = `已加入 ${added} 个任务，模型就绪后自动执行。`;
-      await onSuccess();
+      await onSuccess(ids, s.result);
     } catch (error) {
       s.error = `${added ? `已加入 ${added} 个任务。` : ""}${errorText(error)} 未提交的文件已保留。`;
     } finally {

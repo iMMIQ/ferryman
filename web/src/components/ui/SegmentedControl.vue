@@ -3,7 +3,12 @@ defineProps<{
   modelValue: T;
   name: string;
   label: string;
-  options: readonly { value: T; label: string; disabled?: boolean }[];
+  options: readonly {
+    value: T;
+    label: string;
+    description?: string;
+    disabled?: boolean;
+  }[];
   disabled?: boolean;
 }>();
 defineEmits<{ "update:modelValue": [value: T] }>();
@@ -24,7 +29,12 @@ defineEmits<{ "update:modelValue": [value: T] }>();
           :checked="modelValue === option.value"
           :disabled="disabled || option.disabled"
           @change="$emit('update:modelValue', option.value)"
-        /><span>{{ option.label }}</span></label
+        /><span
+          >{{ option.label
+          }}<small v-if="option.description">{{
+            option.description
+          }}</small></span
+        ></label
       >
     </div>
   </fieldset>

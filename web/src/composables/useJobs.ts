@@ -24,6 +24,11 @@ export function useJobs() {
     // History only refreshes on invalidation; failed initial loads can recover.
     refetchInterval: (query) => (query.state.status === "error" ? 2500 : false),
   });
+  const recent = useQuery({
+    queryKey: ["jobs", "list", "all", null],
+    queryFn: ({ signal }) => api<JobPage>("/api/jobs?", { signal }),
+    refetchInterval: (query) => (query.state.status === "error" ? 2500 : false),
+  });
   const active = useQuery({
     queryKey: ["jobs", "active"],
     queryFn: ({ signal }) =>
@@ -39,7 +44,22 @@ export function useJobs() {
         (job) => live.get(job.id) ?? job,
       );
     },
+    get recent() {
+      const live = new Map(
+        active.data.value?.jobs.map((job) => [job.id, job]) ?? [],
+      );
+      return (recent.data.value?.jobs ?? [])
+        .slice(0, 3)
+        .map((job) => live.get(job.id) ?? job);
+    },
     byId: {} as Record<string, Job>,
+    get recentLoaded() {
+      return !!recent.data.value;
+    },
+    get recentError() {
+      const error = recent.error.value || active.error.value;
+      return error ? errorText(error) : "";
+    },
     get loaded() {
       return !!list.data.value;
     },
@@ -78,6 +98,9 @@ export function useJobs() {
     if (!page.jobs.length && cursors.value.length > 1) cursors.value.pop();
     for (const job of page.jobs) state.byId[job.id] = job;
   });
+  watch(recent.data, (page) => {
+    for (const job of page?.jobs ?? []) state.byId[job.id] = job;
+  });
   watch(active.data, (current, previous) => {
     if (!current) return;
     for (const job of current.jobs) state.byId[job.id] = job;
@@ -108,9 +131,10 @@ export function useJobs() {
     },
   });
   async function refresh() {
-    await Promise.all([list.refetch(), active.refetch()]);
+    await client.refetchQueries({ queryKey: ["jobs"], type: "active" });
   }
   async function first() {
+    selectedPhase.value = "all";
     cursors.value = [null];
     await nextTick();
     await refresh();

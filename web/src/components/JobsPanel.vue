@@ -17,8 +17,21 @@ import EmptyState from "./ui/EmptyState.vue";
 import StatusBadge from "./ui/StatusBadge.vue";
 import JobActions from "./JobActions.vue";
 import JobProgress from "./JobProgress.vue";
-const props = defineProps<{ store: JobsStore }>();
-defineEmits<{ create: [] }>();
+const props = defineProps<{
+  store: JobsStore;
+  compact?: boolean;
+  createdIds?: string[];
+}>();
+const visibleJobs = computed(() =>
+  props.compact ? props.store.state.recent : props.store.state.jobs,
+);
+const loaded = computed(() =>
+  props.compact ? props.store.state.recentLoaded : props.store.state.loaded,
+);
+const error = computed(() =>
+  props.compact ? props.store.state.recentError : props.store.state.error,
+);
+defineEmits<{ create: []; browse: [] }>();
 const s = props.store.state,
   detailId = ref<string | null>(null),
   deleting = ref(false);
@@ -88,16 +101,25 @@ async function remove() {
 }
 </script>
 <template>
-  <section class="jobs-section" aria-labelledby="jobs-title">
+  <section
+    class="jobs-section"
+    :class="{ compact }"
+    aria-labelledby="jobs-title"
+  >
     <div class="section-heading">
       <div>
-        <span class="eyebrow">任务队列</span>
         <h2 id="jobs-title">
-          翻译记录
-          <small id="jobs-count">{{ s.loaded ? `${s.total} 项` : "" }}</small>
+          {{ compact ? "最近任务" : "翻译记录" }}
+          <small v-if="!compact" id="jobs-count">{{
+            s.loaded ? `${s.total} 项` : ""
+          }}</small>
         </h2>
       </div>
+      <AppButton v-if="compact" variant="ghost" @click="$emit('browse')"
+        >查看全部</AppButton
+      >
       <AppButton
+        v-else
         id="refresh-jobs"
         :busy="s.loading"
         aria-label="刷新任务"
@@ -106,6 +128,7 @@ async function remove() {
       >
     </div>
     <div
+      v-if="!compact"
       id="job-status-filter"
       class="filter-bar"
       role="group"
@@ -121,15 +144,15 @@ async function remove() {
         {{ p.label }}
       </button>
     </div>
-    <AppNotice id="jobs-error" :message="s.error"
+    <AppNotice id="jobs-error" :message="error"
       ><AppButton id="retry-jobs" @click="store.refresh"
         >重试</AppButton
       ></AppNotice
     >
-    <p id="jobs-updated" class="helper-text">
+    <p v-if="!compact" id="jobs-updated" class="helper-text">
       {{ s.updated ? `列表最近更新 ${s.updated}` : "正在加载任务…" }}
     </p>
-    <div v-if="s.jobs.length" class="table-shell desktop-jobs">
+    <div v-if="visibleJobs.length && !compact" class="table-shell desktop-jobs">
       <table>
         <thead>
           <tr>
@@ -141,7 +164,12 @@ async function remove() {
           </tr>
         </thead>
         <tbody id="jobs-body">
-          <tr v-for="item in s.jobs" :key="item.id" :data-id="item.id">
+          <tr
+            v-for="item in visibleJobs"
+            :key="item.id"
+            :data-id="item.id"
+            :class="{ 'new-job': createdIds?.includes(item.id) }"
+          >
             <td>
               <button
                 class="file-title"
@@ -179,10 +207,11 @@ async function remove() {
     </div>
     <div class="mobile-jobs">
       <article
-        v-for="item in s.jobs"
+        v-for="item in visibleJobs"
         :key="item.id"
         class="job-card"
         :data-id="item.id"
+        :class="{ 'new-job': createdIds?.includes(item.id) }"
       >
         <button class="file-title" @click="details(item)">
           {{ item.filename }}
@@ -193,6 +222,14 @@ async function remove() {
             {{ item.preset === "7b-fp8" ? "7B" : "30B" }}</span
           ><StatusBadge :job="item" />
         </div>
+        <p v-if="item.error" class="job-error-summary">{{ item.error }}</p>
+        <p v-if="item.failed_segments" class="job-warning">
+          {{ item.failed_segments }} 段未翻译{{
+            item.result_available
+              ? "，可下载部分结果或补译。"
+              : "，请查看详情后重试。"
+          }}
+        </p>
         <JobProgress :job="item" /><AppNotice
           :message="s.errors[item.id]"
         /><JobActions
@@ -204,12 +241,12 @@ async function remove() {
       </article>
     </div>
     <EmptyState
-      v-if="!s.jobs.length && !s.error"
+      v-if="!visibleJobs.length && !error"
       id="empty-state"
-      :title="s.loaded ? '暂无任务' : '正在加载任务…'"
+      :title="loaded ? '暂无任务' : '正在加载任务…'"
       description="选择文档后，翻译进度会显示在这里"
       ><AppButton
-        v-if="s.loaded"
+        v-if="loaded"
         id="empty-create"
         variant="primary"
         @click="$emit('create')"
@@ -217,7 +254,7 @@ async function remove() {
       ></EmptyState
     >
     <nav
-      v-if="s.cursors.length > 1 || s.next"
+      v-if="!compact && (s.cursors.length > 1 || s.next)"
       class="jobs-pagination"
       aria-label="翻译记录分页"
     >
@@ -234,6 +271,7 @@ async function remove() {
         >下一页</AppButton
       >
     </nav>
+    <p class="background-note">任务在后台继续，离开页面也不会中断。</p>
     <AppDialog
       id="job-detail-dialog"
       :open="!!job"

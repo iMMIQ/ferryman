@@ -4,3 +4,20 @@ ferryman-data
 *.lpk
 
 node_modules
+.lzc-cli-cache
+.lzc-cli-build*
+lzc-build-image-context.tar
+.env
+.env.*
+data
+documents
+remotefs
+models
+agent-cache
+ferryman-documents
+ferryman-remotefs
+playwright-report
+test-results
+**/__pycache__
+
+# build/web and build/aipod are required by the root Lazycat Dockerfiles.

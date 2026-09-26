@@ -1,0 +1,12 @@
+# lzc-cli 2.0.9 supports local Buildx packaging without a connected MicroServer.
+# Explicit release config: do not install this as the development override.
+# Use scripts/lzc-ci-release.sh for the 2.0.9 scratch compatibility fix.
+manifest: ./lzc-manifest.yml
+buildscript: sh ./scripts/build-release.sh
+pkgout: ./dist
+icon: ./icon.png
+images:
+  ferryman-web:
+    context: ./
+    dockerfile: ./Dockerfile.web
+    builder: local

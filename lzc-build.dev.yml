@@ -1,7 +1,2 @@
 package_override:
   package: cloud.lazycat.app.ferryman.dev
-
-images:
-  ferryman-web:
-    context: ./
-    dockerfile: ./Dockerfile.web

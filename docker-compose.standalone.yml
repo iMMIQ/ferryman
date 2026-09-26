@@ -6,7 +6,7 @@ services:
   # Creates the per-user storage directories the web app expects; storage is
   # "unavailable" for a user until <root>/<uid>/ exists.
   init-dirs:
-    image: debian:bookworm-slim
+    image: debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
     entrypoint: ["/bin/mkdir", "-p"]
     command:
       - /documents/local-development-user
@@ -19,7 +19,8 @@ services:
   web:
     build:
       context: .
-      dockerfile: docker/Dockerfile.web
+      dockerfile: docker/Dockerfile
+      target: web
     image: ferryman-web:standalone
     restart: unless-stopped
     ports:
@@ -52,9 +53,10 @@ services:
   agent:
     build:
       context: .
-      dockerfile: docker/Dockerfile.agent
+      dockerfile: docker/Dockerfile
+      target: agent
       args:
-        VLLM_BASE_IMAGE: ${VLLM_BASE_IMAGE:-docker.io/catdogai/lzc-aipod-vllm:agxorin-cu126-src-18f658bb3185-20260703}
+        VLLM_BASE_IMAGE: ${VLLM_BASE_IMAGE:-docker.io/catdogai/lzc-aipod-vllm:agxorin-cu126-src-18f658bb3185-20260703@sha256:079f2ab5a3f19da5fbdf930476fed73625c3d47085407280fbee48c4293279be}
     image: ferryman-agent:standalone
     restart: unless-stopped
     shm_size: 512m

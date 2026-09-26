@@ -237,13 +237,14 @@ cargo run --bin ferryman-web
 
 The Web UI is then available at `http://127.0.0.1:8080`.
 
-For AI Pod deployment, the release build packages the native ARM64 controller
+For AI Pod deployment, the release build packages the explicit ARM64 controller
 binary in a separate resource-only LPK and reuses the official vLLM image:
 
 ```bash
-# On an ARM64 development host, install the MicroServer Web cross compiler once:
-# sudo apt-get install gcc-x86-64-linux-gnu
+# Install the pinned toolchains, cross compilers, fonts and verifier dependencies
+# described in docs/packaging.md. Build either product independently:
 sh scripts/build-release.sh
+sh scripts/build-agent-release.sh
 ```
 
 Models are downloaded from the Web model manager into the app's persistent AI
@@ -272,6 +273,10 @@ lzc-cli project lint .
 lzc-cli project release .
 lzc-cli project release -f lzc-build.aipod.yml
 ```
+
+The AI Pod resource package requires LZCOS 1.5.2+ and currently supports AGX Orin.
+See [packaging](docs/packaging.md) for final LPK verification, local CI packaging,
+artifact checksums, toolchain pins and standalone build targets.
 
 ### Standalone Docker deployment (single machine)
 

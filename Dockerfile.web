@@ -1,12 +1,13 @@
 FROM scratch
 WORKDIR /app
-COPY build/web-libs/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
-COPY build/web-libs/ /lib/x86_64-linux-gnu/
-COPY build/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY runtime/nsswitch.conf /etc/nsswitch.conf
-COPY build/ferryman-web /usr/local/bin/ferryman-web
-COPY build/fonts /app/fonts
-COPY dist/web ./web
+COPY build/web/web-libs/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
+COPY build/web/web-libs/ /lib/x86_64-linux-gnu/
+COPY build/web/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY build/web/nsswitch.conf /etc/nsswitch.conf
+COPY build/web/ferryman-web /usr/local/bin/ferryman-web
+COPY build/web/fonts /app/fonts
+COPY build/web/assets ./web
+COPY build/web/artifacts.json /app/artifacts.json
 ENV FERRYMAN_WEB_LISTEN=0.0.0.0:8080 \
     FERRYMAN_WEB_DIR=/app/web \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \

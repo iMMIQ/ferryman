@@ -30,7 +30,7 @@ class Handler(BaseHTTPRequestHandler):
             f"<c{cue_id}>translated {cue_id}</c{cue_id}>" for cue_id in cue_ids
         ) or "translated"
         body = json.dumps(
-            {"choices": [{"message": {"content": translated}}]}
+            {"choices": [{"finish_reason": "stop", "message": {"content": translated}}]}
         ).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")

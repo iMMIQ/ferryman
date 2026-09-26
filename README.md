@@ -65,15 +65,37 @@ Rendering needs one CJK-capable OpenType font on disk: `FERRYMAN_PDF_FONT`
 overrides discovery, otherwise the first of Noto Sans CJK / WenQuanYi /
 Droid Sans Fallback in the usual distro locations (the Lazycat image bundles
 it at `/app/fonts`; the standalone image installs `fonts-noto-cjk`). The
-font is embedded as a CID/Type0 font with a generated ToUnicode map, so the
-translated text stays selectable and searchable. Scanned PDFs without a text
-layer and encrypted PDFs fail with a clear error.
+font is embedded **subset to the glyphs actually drawn** as a CID/Type0 font
+with a generated ToUnicode map, so the translated text stays selectable and
+searchable and outputs grow by a few hundred KB rather than the full ~16 MB
+face. Scanned PDFs without a text layer and encrypted PDFs fail with a
+clear error.
 
 ## Build
 
 ```bash
 cargo build --release
 ```
+
+## Tests and resource limits
+
+PDF tests require a CJK font and fail if it is missing. On Debian/Ubuntu,
+install `fonts-noto-cjk`, or point `FERRYMAN_PDF_FONT` at an installed CJK font.
+CI explicitly installs and selects Noto Sans CJK.
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+```
+
+EPUB/DOCX archives are limited to 10,000 entries, 128 MiB per decompressed
+entry and 512 MiB decompressed in total. Both declared sizes and actual reads
+are checked. Document parsing runs on blocking threads, with at most two
+parsers per process. Cancellation stops waiting immediately; an already
+running parser finishes in the background while retaining its concurrency
+slot. Empty or explicitly truncated model responses are never cached as
+successful translations; truncation triggers bounded splitting/retranslation.
 
 ## Web app and Lazycat deployment
 
@@ -330,9 +352,11 @@ on-disk cache means already-translated blocks are instant.
 ## Resumability & interruption
 
 - **Translation cache.** Every translated block is written to a content-addressed
-  cache keyed by `(model, target, text)`, so re-running ferryman on the same
-  book with the same model + target language skips already-done blocks almost
-  instantly. Cache bodies remain sharded files rather than SQLite rows: cache
+  cache keyed by the translation revision, endpoint, model, target language,
+  text and strategy. Batched keys also include all neighboring cues, preceding
+  context and the cue position, so changing context or batch boundaries cannot
+  reuse an unrelated translation. Older cache revisions are ignored (existing
+  files are not deleted); the first run after this update translates again. Cache bodies remain sharded files rather than SQLite rows: cache
   writes are frequent, best-effort optimization data and should not inflate or
   contend on the authoritative job database. `--no-cache` disables it;
   `--cache-dir` points it elsewhere.

@@ -31,9 +31,11 @@
 //! expose it) and is assumed near-black; backgrounds are assumed white.
 //! Rendering needs one CJK-capable OpenType font on disk — see
 //! [`PdfFont::shared`]; in the Docker images one is bundled/installed.
-//! The font is embedded as a CID/Type0 font (Identity-H, glyph ids from the
-//! font's own cmap plus a generated ToUnicode map so the output stays
-//! searchable), shared per process, and loaded once.
+//! The font is embedded as a CID/Type0 font (Identity-H), **subset to the
+//! glyphs actually drawn** (a full Noto CJK face is ~16 MB; a book needs a
+//! few hundred KB), with glyph ids from the font's own cmap plus a generated
+//! ToUnicode map so the output stays searchable. It is shared per process and
+//! loaded once.
 
 use crate::format::{Document, OutputMode, Segment, SegmentId, Strategy};
 use anyhow::{anyhow, bail, Context, Result};
@@ -43,6 +45,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use subsetter::GlyphRemapper;
 
 // ── style constants ─────────────────────────────────────────────────────────
 
@@ -1152,22 +1155,29 @@ impl Document for PdfDoc {
                 .unwrap_or((upem * 0.55) as u16) as f64;
             adv / upem * size
         };
-        let gid = |c: char| face.glyph_index(c).map(|g| g.0);
+        let raw_gid = |c: char| face.glyph_index(c).map(|g| g.0);
 
         // Collect the glyphs actually used (translations + markers), embed
         // the font once, and reuse the object on every page we touch.
         let mut used: BTreeMap<char, u16> = BTreeMap::new();
         for tr in tr_by_para.values() {
             for c in tr.chars() {
-                used.entry(c).or_insert_with(|| gid(c).unwrap_or_default());
+                used.entry(c)
+                    .or_insert_with(|| raw_gid(c).unwrap_or_default());
             }
         }
         for page in 1..=self.pages.len() {
             for c in format!("[p. {page}]").chars() {
-                used.entry(c).or_insert_with(|| gid(c).unwrap_or_default());
+                used.entry(c)
+                    .or_insert_with(|| raw_gid(c).unwrap_or_default());
             }
         }
-        let (font_key, font_id) = embed_font(&mut doc, &self.font, &face, &used);
+        let (font_key, font_id, gid_remap) = embed_font(&mut doc, &self.font, &face, &used);
+        // Everything drawn below addresses glyphs in the *subset's* numbering.
+        let gid = |c: char| -> Option<u16> {
+            let old = raw_gid(c)?;
+            Some(gid_remap.get(&old).copied().unwrap_or(old))
+        };
 
         let pages_in_order: Vec<ObjectId> = doc.get_pages().into_values().collect();
         anyhow::ensure!(
@@ -1211,7 +1221,7 @@ impl Document for PdfDoc {
                             slot_bot,
                             tr,
                             TR_COLOR,
-                            &face,
+                            &gid,
                             &width,
                         );
                     }
@@ -1269,7 +1279,7 @@ impl Document for PdfDoc {
                             para.bot,
                             tr,
                             REPLACE_COLOR,
-                            &face,
+                            &gid,
                             &width,
                         );
                     }
@@ -1372,7 +1382,7 @@ fn draw_translation(
     slot_bot: f64,
     tr: &str,
     rgb: (u8, u8, u8),
-    face: &ttf_parser::Face<'_>,
+    gid_of: &impl Fn(char) -> Option<u16>,
     width: &impl Fn(char, f64) -> f64,
 ) {
     let avail_w = (col_x1 - para.x0).max(para.size * 4.0);
@@ -1390,10 +1400,7 @@ fn draw_translation(
     let angle = para.first().angle;
     let (mut x, mut y) = rot(angle, para.x0, para.top - size * ASCENT);
     for line in &lines {
-        let gids: Vec<u16> = line
-            .chars()
-            .filter_map(|c| face.glyph_index(c).map(|g| g.0))
-            .collect();
+        let gids: Vec<u16> = line.chars().filter_map(gid_of).collect();
         cb.text(x, y, size, angle, &gids, rgb);
         let (dx, dy) = rot(angle, 0.0, -size * TR_LEADING);
         x += dx;
@@ -1403,26 +1410,48 @@ fn draw_translation(
 
 // ── font embedding + page tree surgery (lopdf) ──────────────────────────────
 
-/// Embed the shared font as a CID/Type0 (Identity-H) font and return its
-/// resource key and object id. `used` maps every character we may draw to
-/// its glyph id (drives /W widths and the generated ToUnicode map).
+/// Embed the shared font as a CID/Type0 (Identity-H) font, subset to the
+/// glyphs actually drawn, and return `(resource key, object id, old→new
+/// glyph-id map)`. `used` maps every character we may draw to its glyph id
+/// in the *original* face (drives subsetting, /W widths and the generated
+/// ToUnicode map). [`subsetter`] renumbers glyphs contiguously — feeding the
+/// ids ascending keeps `.notdef` at 0 — so every gid written into content
+/// streams, /W and ToUnicode must go through the returned map. A full Noto
+/// CJK face is ~16 MB; a book's worth of glyphs is a few hundred KB. If
+/// subsetting fails the full face is embedded with an identity map.
 fn embed_font(
     doc: &mut lopdf::Document,
     font: &PdfFont,
     face: &ttf_parser::Face<'_>,
     used: &BTreeMap<char, u16>,
-) -> (String, ObjectId) {
+) -> (String, ObjectId, BTreeMap<u16, u16>) {
     let upem = face.units_per_em().max(1) as f64;
     let scale = |v: f64| (v / upem * 1000.0).round() as i64;
+
+    let mut old_gids: Vec<u16> = used.values().copied().collect();
+    old_gids.sort_unstable();
+    old_gids.dedup();
+    let remapper = GlyphRemapper::new_from_glyphs_sorted(&old_gids);
+    let (program, remap): (Vec<u8>, BTreeMap<u16, u16>) =
+        match subsetter::subset(&font.standalone, 0, &remapper) {
+            Ok(sub) => {
+                let map = old_gids
+                    .iter()
+                    .map(|&old| (old, remapper.get(old).unwrap_or(old)))
+                    .collect();
+                (sub, map)
+            }
+            Err(_) => (font.standalone.to_vec(), BTreeMap::new()), // identity
+        };
 
     // Font program stream.
     let mut ff_dict = Dictionary::new();
     if font.cff {
         ff_dict.set("Subtype", "OpenType");
     } else {
-        ff_dict.set("Length1", font.standalone.len() as i64);
+        ff_dict.set("Length1", program.len() as i64);
     }
-    let mut ff_stream = Stream::new(ff_dict, font.standalone.to_vec());
+    let mut ff_stream = Stream::new(ff_dict, program);
     let _ = ff_stream.compress();
     let ff_id = doc.add_object(ff_stream);
 
@@ -1464,12 +1493,14 @@ fn embed_font(
     // CIDFont (descendant), with per-glyph widths for the glyphs we use.
     // /W takes `c [w…]` or `c_first c_last w` entries — one single-glyph
     // range per used glyph, ascending (the spec has no `cid w` pairs form).
+    // Advances come from the original face (subsetting keeps metrics);
+    // the ids are the subset's new gids.
     let mut by_gid: BTreeMap<u16, i64> = BTreeMap::new();
-    for &g in used.values() {
+    for &old in &old_gids {
         let adv = face
-            .glyph_hor_advance(ttf_parser::GlyphId(g))
+            .glyph_hor_advance(ttf_parser::GlyphId(old))
             .unwrap_or((upem * 0.55) as u16) as f64;
-        by_gid.insert(g, scale(adv));
+        by_gid.insert(remap.get(&old).copied().unwrap_or(old), scale(adv));
     }
     let mut w = Vec::new();
     for (&g, &adv) in &by_gid {
@@ -1513,7 +1544,8 @@ fn embed_font(
     let entries: Vec<(&char, &u16)> = used.iter().collect();
     for chunk in entries.chunks(100) {
         cmap.push_str(&format!("{} beginbfchar\n", chunk.len()));
-        for (c, g) in chunk {
+        for (c, old) in chunk {
+            let g = remap.get(old).copied().unwrap_or(**old);
             let mut hex = String::new();
             let mut buf = [0u16; 2];
             for unit in c.encode_utf16(&mut buf) {
@@ -1537,7 +1569,7 @@ fn embed_font(
     t0.set("ToUnicode", Object::Reference(tu_id));
     let t0_id = doc.add_object(Object::Dictionary(t0));
 
-    ("FerHyZH".to_string(), t0_id)
+    ("FerHyZH".to_string(), t0_id, remap)
 }
 
 /// Record each leaf page's parent Pages node id by walking the tree.
@@ -1972,10 +2004,9 @@ mod tests {
 
     #[test]
     fn face_extraction_keeps_tables() {
-        let Ok(font) = PdfFont::shared() else {
-            eprintln!("skipping: no CJK font found");
-            return;
-        };
+        let font = PdfFont::shared().expect(
+            "PDF tests require a CJK font; install fonts-noto-cjk or set FERRYMAN_PDF_FONT",
+        );
         let f: &[u8] = &font.standalone;
         assert!(&f[..4] == b"OTTO" || &f[..4] == b"\x00\x01\x00\x00" || &f[..4] == b"true");
         let tables = sfnt_tables(f, 0).unwrap();
@@ -2063,10 +2094,9 @@ mod tests {
 
     #[test]
     fn roundtrip_layout_preserving_bilingual() {
-        let Ok(_) = PdfFont::shared() else {
-            eprintln!("skipping: no CJK font found");
-            return;
-        };
+        PdfFont::shared().expect(
+            "PDF tests require a CJK font; install fonts-noto-cjk or set FERRYMAN_PDF_FONT",
+        );
         // Page 1: a paragraph wrapped over two lines (long first line + short
         // flush tail) + a separate paragraph. Page 2: one paragraph.
         let src = make_pdf(&[
@@ -2143,6 +2173,29 @@ mod tests {
             re_segs.iter().map(|s| &s.text).collect::<Vec<_>>()
         );
 
+        // The embedded font must be a subset: with a full CJK face on disk
+        // (≥2 MB), embedding it whole would dwarf everything else in the
+        // file — a fixture's few dozen glyphs are a tiny fraction of it.
+        if pdf.font.standalone.len() > 2_000_000 {
+            let mut largest_font = 0usize;
+            for obj in reread.objects.values() {
+                let Object::Stream(s) = obj else { continue };
+                let is_font = s.dict.has(b"Length1")
+                    || s.dict
+                        .get(b"Subtype")
+                        .and_then(Object::as_name)
+                        .is_ok_and(|t| t == b"OpenType");
+                if is_font {
+                    largest_font = largest_font.max(s.content.len());
+                }
+            }
+            assert!(
+                largest_font * 4 < pdf.font.standalone.len(),
+                "embedded font {largest_font} should be a small subset of {}",
+                pdf.font.standalone.len()
+            );
+        }
+
         let _ = fs::remove_file(&tmp);
         let _ = fs::remove_file(&out);
     }
@@ -2207,10 +2260,9 @@ mod tests {
     /// strict parsers see zero pages).
     #[test]
     fn nested_page_tree_spliced_intact() {
-        let Ok(_) = PdfFont::shared() else {
-            eprintln!("skipping: no CJK font found");
-            return;
-        };
+        PdfFont::shared().expect(
+            "PDF tests require a CJK font; install fonts-noto-cjk or set FERRYMAN_PDF_FONT",
+        );
         let src = nest_page_tree(&make_pdf(&[
             (
                 400.0,
@@ -2307,10 +2359,9 @@ mod tests {
     #[test]
     #[ignore = "manual: writes /tmp/ferryman_fixture_out.pdf for rendering"]
     fn write_fixture_output() {
-        let Ok(_) = PdfFont::shared() else {
-            eprintln!("skipping: no CJK font found");
-            return;
-        };
+        PdfFont::shared().expect(
+            "PDF tests require a CJK font; install fonts-noto-cjk or set FERRYMAN_PDF_FONT",
+        );
         let src = make_pdf(&[
             (
                 400.0,
@@ -2346,10 +2397,9 @@ mod tests {
 
     #[test]
     fn replace_mode_overlays_in_place() {
-        let Ok(_) = PdfFont::shared() else {
-            eprintln!("skipping: no CJK font found");
-            return;
-        };
+        PdfFont::shared().expect(
+            "PDF tests require a CJK font; install fonts-noto-cjk or set FERRYMAN_PDF_FONT",
+        );
         let src = make_pdf(&[(
             400.0,
             500.0,

@@ -1,6 +1,6 @@
 //! On-disk translation cache.
 //!
-//! Content-addressed: each `(model, target, text)` triple hashes to a SHA-256
+//! Content-addressed: each versioned translation request hashes to a SHA-256
 //! key whose translation is stored as a UTF-8 file under a sharded directory.
 //! This makes translation runs **resumable** — re-running ferryman on the same
 //! book (same model + target language) skips already-translated blocks
@@ -12,13 +12,10 @@
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::AsyncWriteExt;
 
 pub struct Cache {
     root: PathBuf,
-    /// Monotonic counter making concurrent tmp-file names unique within this
-    /// process (two segments with identical text would otherwise collide).
-    counter: AtomicU64,
 }
 
 impl Cache {
@@ -27,10 +24,7 @@ impl Cache {
     /// warning rather than aborting — translation works fine without it.
     pub fn open(dir: Option<PathBuf>) -> Option<Self> {
         let root = dir?;
-        let cache = Cache {
-            root,
-            counter: AtomicU64::new(0),
-        };
+        let cache = Cache { root };
         if fs::create_dir_all(&cache.root).is_err() {
             eprintln!(
                 "warn: cache dir {:?} unusable, caching disabled",
@@ -41,25 +35,22 @@ impl Cache {
         Some(cache)
     }
 
-    /// Stable content key: lowercase hex of SHA-256 over
-    /// `model ‖ 0x1f ‖ target ‖ 0x1f ‖ text`. The `0x1f` (ASCII unit
-    /// separator) prevents concatenation ambiguity between triples such as
-    /// `("ab","c")` and `("a","bc")`.
-    ///
-    /// NOTE: model + target + input text fully determine the cached value only
-    /// because the sampling params (temperature/top_p/top_k/repetition_penalty)
-    /// are hardcoded in `translate.rs`. If you ever make any of those a CLI
-    /// flag or preset-derived, fold them into this key — otherwise the cache
-    /// will silently serve translations produced under a different decoding
-    /// config.
-    pub fn key(&self, model: &str, target: &str, text: &str) -> String {
-        let mut h = Sha256::new();
-        h.update(model.as_bytes());
-        h.update([0x1f]);
-        h.update(target.as_bytes());
-        h.update([0x1f]);
-        h.update(text.as_bytes());
-        h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+    /// Versioned, unambiguous key. Bump TRANSLATION_CACHE_VERSION whenever
+    /// prompts, decoding parameters or recovery semantics change.
+    /// `scope` identifies the endpoint, strategy and complete batch context.
+    pub fn key(&self, model: &str, target: &str, text: &str, scope: &str) -> String {
+        let bytes = serde_json::to_vec(&(
+            crate::translate::TRANSLATION_CACHE_VERSION,
+            model,
+            target,
+            text,
+            scope,
+        ))
+        .expect("serialize cache key strings");
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     /// Returns the cached translation for `key`, or `None` on miss / read
@@ -82,12 +73,26 @@ impl Cache {
             eprintln!("warn: cache mkdir {:?} failed: {}", shard, e);
             return;
         }
-        let ctr = self.counter.fetch_add(1, Ordering::Relaxed);
-        let tmp = shard.join(format!(".{}.{}.tmp", key, ctr));
-        let outcome = match tokio::fs::write(&tmp, val).await {
-            Ok(()) => tokio::fs::rename(&tmp, &final_path).await,
-            Err(e) => Err(e),
+        let tmp = shard.join(format!(".{key}.{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await
+        {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("warn: cache temporary file {:?} failed: {}", tmp, e);
+                return;
+            }
         };
+        let outcome = async {
+            file.write_all(val.as_bytes()).await?;
+            file.flush().await?;
+            drop(file);
+            tokio::fs::rename(&tmp, &final_path).await
+        }
+        .await;
         if let Err(e) = outcome {
             eprintln!("warn: cache write {:?} failed: {}", final_path, e);
             let _ = tokio::fs::remove_file(&tmp).await;
@@ -100,5 +105,61 @@ impl Cache {
     fn path_of(&self, key: &str) -> PathBuf {
         let (prefix, rest) = key.split_at(2.min(key.len()));
         self.root.join(prefix).join(rest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_keys_are_unambiguous_and_versioned() {
+        let cache = Cache {
+            root: PathBuf::new(),
+        };
+        assert_ne!(
+            cache.key("a\u{1f}b", "c", "text", "scope"),
+            cache.key("a", "b\u{1f}c", "text", "scope")
+        );
+        assert_ne!(
+            cache.key("model", "zh", "text", "context-one"),
+            cache.key("model", "zh", "text", "context-two")
+        );
+        let legacy: String = Sha256::digest(b"model\x1fzh\x1ftext")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_ne!(cache.key("model", "zh", "text", "scope"), legacy);
+    }
+
+    #[tokio::test]
+    async fn independent_instances_publish_only_complete_values() {
+        let root = std::env::temp_dir().join(format!("ferryman-cache-{}", uuid::Uuid::new_v4()));
+        let reader = Cache::open(Some(root.clone())).unwrap();
+        let key = reader.key("model", "zh", "text", "scope");
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..24 {
+            let cache = Cache::open(Some(root.clone())).unwrap();
+            let key = key.clone();
+            tasks.spawn(async move {
+                cache.put(&key, &i.to_string().repeat(65536)).await;
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+            if let Some(value) = reader.get(&key).await {
+                assert!((0..24).any(|i| value == i.to_string().repeat(65536)));
+            }
+        }
+        assert!(reader.get(&key).await.is_some());
+        let mut entries = tokio::fs::read_dir(reader.path_of(&key).parent().unwrap())
+            .await
+            .unwrap();
+        let mut count = 0;
+        while entries.next_entry().await.unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 1);
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

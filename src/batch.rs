@@ -24,7 +24,8 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +33,7 @@ pub const BILINGUAL_OUTPUT_SUFFIX: &str = "bilingual";
 pub const TRANSLATED_OUTPUT_SUFFIX: &str = "translated";
 
 /// Knobs for a batch run, resolved from the CLI.
+#[derive(Clone)]
 pub struct BatchOpts {
     pub mode: OutputMode,
     pub in_place: bool,
@@ -143,7 +145,7 @@ async fn run_batch_impl(
         open: HashMap::new(),
         next_file_idx: 0,
         write_tasks: JoinSet::new(),
-        budget: None, // set below (borrowed mutably across open_file calls)
+        budget: None, // initialized from opts below
         pb,
         on_progress,
         progress: BatchProgress::default(),
@@ -153,38 +155,138 @@ async fn run_batch_impl(
         failed_files: Vec::new(),
         cancelled: false,
     };
-    // `budget` can't be set in the struct literal because open_file borrows
-    // &mut self (which includes budget) — initialize here.
+    // Carry the global segment budget through each sequential lazy parse.
     state.budget = state.opts.limit;
 
     let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-
+    let mut parsing = JoinSet::new();
     loop {
-        // Keep the pool full: dispatch units (opening files lazily) until the
-        // pool is at capacity or we run out of work.
+        if cancel.is_cancelled() {
+            state.cancelled = true;
+            break;
+        }
         while in_flight.len() < concurrency {
             match state.next_unit() {
                 Some(unit) => in_flight.push(engine.exec_unit(unit)),
                 None => break,
             }
         }
-        if in_flight.is_empty() {
-            break; // nothing pending, nothing in flight → done
+        // One lazy parse per batch, at most two across all Web/CLI batches.
+        // The HTTP drain remains polled while parsing or waiting for a permit.
+        if in_flight.len() < concurrency && parsing.is_empty() {
+            if let Some(input) = state.inputs.next() {
+                let fidx = state.next_file_idx;
+                state.next_file_idx += 1;
+                let opts = state.opts.clone();
+                let budget = state.budget;
+                parsing.spawn(async move {
+                    let path = input.clone();
+                    let result = run_parser(parser_limiter(), move || {
+                        prepare_file(opts, fidx, input, budget)
+                    })
+                    .await;
+                    (fidx, path, result)
+                });
+            }
+        }
+        if in_flight.is_empty() && parsing.is_empty() {
+            break;
         }
         tokio::select! {
-            // Poll cancel first so Ctrl-C is observed promptly.
             biased;
             _ = cancel.cancelled() => {
                 state.cancelled = true;
                 break;
             }
-            Some(done) = in_flight.next() => state.on_done(done),
+            Some(result) = parsing.join_next(), if !parsing.is_empty() => {
+                match result {
+                    Ok((fidx, _, Ok(Ok((file, budget))))) => {
+                        state.budget = budget;
+                        state.accept_file(fidx, file);
+                    }
+                    Ok((_, path, result)) => {
+                        let error = match result {
+                            Ok(Err(error)) => format!("{error:#}"),
+                            Err(error) => format!("parse task failed: {error}"),
+                            Ok(Ok(_)) => unreachable!(),
+                        };
+                        state.failed_files.push((path, error));
+                    }
+                    Err(error) => state.failed_files.push((PathBuf::new(), format!("parse task failed: {error}"))),
+                }
+            }
+            Some(done) = in_flight.next(), if !in_flight.is_empty() => state.on_done(done),
         }
     }
-    // `in_flight` drops here: any still-running HTTP futures are cancelled (a
-    // dropped reqwest future closes its connection), exactly like the old drain.
+    // Drop HTTP futures before waiting for partial writes. A parser already
+    // executing cannot be interrupted, but retains its global permit until it
+    // finishes; cancelled jobs cannot accumulate unbounded blocking work.
+    drop(in_flight);
+    drop(parsing);
 
     state.finish().await
+}
+
+fn parser_limiter() -> Arc<Semaphore> {
+    static LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMITER.get_or_init(|| Arc::new(Semaphore::new(2))).clone()
+}
+
+async fn run_parser<T: Send + 'static>(
+    limiter: Arc<Semaphore>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    let permit = limiter
+        .acquire_owned()
+        .await
+        .expect("parser limiter remains open");
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+}
+
+fn prepare_file(
+    opts: BatchOpts,
+    fidx: usize,
+    input: PathBuf,
+    mut budget: Option<usize>,
+) -> Result<(OpenFile, Option<usize>)> {
+    let doc = crate::format::open(&input, None)?;
+    let segments = doc.segments();
+    eprintln!(
+        "{}: {} block(s) [{}]",
+        input.display(),
+        segments.len(),
+        doc.format_name()
+    );
+    let strategy = match doc.strategy() {
+        Strategy::Independent => Strategy::Independent,
+        Strategy::Batched { .. } => Strategy::Batched {
+            batch_size: opts.batch_size,
+            context: opts.context,
+        },
+    };
+    let units = build_units(
+        fidx,
+        &segments,
+        strategy,
+        &mut budget,
+        opts.prompt_char_budget,
+    );
+    Ok((
+        OpenFile {
+            doc,
+            out_path: resolve_output(&input, opts.in_place, opts.output.as_deref(), opts.mode),
+            in_place: opts.in_place,
+            input,
+            pending: units.into_iter().collect(),
+            pairs: Vec::new(),
+            outstanding: 0,
+        },
+        budget,
+    ))
 }
 
 // ── queue state machine ─────────────────────────────────────────────────────
@@ -207,92 +309,28 @@ struct BatchState {
 }
 
 impl BatchState {
-    /// The next unit to dispatch, opening a new file lazily when no open file
-    /// has pending units. Returns `None` once all inputs are exhausted.
     fn next_unit(&mut self) -> Option<Unit> {
-        loop {
-            // 1. Pop a pending unit from any open file (keeps large files
-            //    draining before we open anything new).
-            for of in self.open.values_mut() {
-                if let Some(u) = of.pending.pop_front() {
-                    of.outstanding += 1;
-                    return Some(u);
-                }
-            }
-            // 2. No pending units anywhere → open the next input file.
-            let input = self.inputs.next()?;
-            let fidx = self.next_file_idx;
-            self.next_file_idx += 1;
-            match self.open_file(fidx, input) {
-                Ok(mut of) => {
-                    // The bar's total grows as we learn each file's segment count.
-                    let added = of.pending.iter().map(Unit::attempted).sum::<usize>();
-                    self.progress.total += added;
-                    if let Some(pb) = &self.pb {
-                        pb.inc_length(added as u64);
-                    }
-                    self.report_progress();
-                    if of.pending.is_empty() {
-                        // Zero translatable segments: write the passthrough now,
-                        // don't track it as an open file.
-                        self.spawn_write(of);
-                        continue;
-                    }
-                    let first = of.pending.pop_front();
-                    of.outstanding = 1; // first unit dispatched below
-                    self.open.insert(fidx, of);
-                    return first;
-                }
-                Err((input, msg)) => {
-                    eprintln!("error: open {}: {} — skipping", input.display(), msg);
-                    self.failed_files.push((input, msg));
-                    continue;
-                }
+        for file in self.open.values_mut() {
+            if let Some(unit) = file.pending.pop_front() {
+                file.outstanding += 1;
+                return Some(unit);
             }
         }
+        None
     }
 
-    /// Parse one file and build its units (respecting the global `--limit`).
-    fn open_file(&mut self, fidx: usize, input: PathBuf) -> Result<OpenFile, (PathBuf, String)> {
-        let doc = match crate::format::open(&input, None) {
-            Ok(d) => d,
-            Err(e) => return Err((input, format!("{e:#}"))),
-        };
-        let segments = doc.segments();
-        eprintln!(
-            "{}: {} block(s) [{}]",
-            input.display(),
-            segments.len(),
-            doc.format_name()
-        );
-        let strategy = match doc.strategy() {
-            Strategy::Independent => Strategy::Independent,
-            Strategy::Batched { .. } => Strategy::Batched {
-                batch_size: self.opts.batch_size,
-                context: self.opts.context,
-            },
-        };
-        let units = build_units(
-            fidx,
-            &segments,
-            strategy,
-            &mut self.budget,
-            self.opts.prompt_char_budget,
-        );
-        Ok(OpenFile {
-            doc,
-            out_path: resolve_output(
-                &input,
-                self.opts.in_place,
-                self.opts.output.as_deref(),
-                self.opts.mode,
-            ),
-            in_place: self.opts.in_place,
-            input,
-            pending: units.into_iter().collect(),
-            pairs: Vec::new(),
-            outstanding: 0,
-        })
+    fn accept_file(&mut self, fidx: usize, file: OpenFile) {
+        let added = file.pending.iter().map(Unit::attempted).sum::<usize>();
+        self.progress.total += added;
+        if let Some(pb) = &self.pb {
+            pb.inc_length(added as u64);
+        }
+        self.report_progress();
+        if file.pending.is_empty() {
+            self.spawn_write(file);
+        } else {
+            self.open.insert(fidx, file);
+        }
     }
 
     /// A unit finished: route its pairs, advance the bar, and write the file if
@@ -600,6 +638,150 @@ fn resolve_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn parser_does_not_block_runtime_and_keeps_permit_after_cancellation() {
+        let limiter = Arc::new(Semaphore::new(1));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let task_limiter = limiter.clone();
+        let task = tokio::spawn(run_parser(task_limiter, move || {
+            started.send(()).unwrap();
+            released
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(1), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+        // Aborting the async owner must not release a running parser's slot.
+        assert!(limiter.clone().try_acquire_owned().is_err());
+        release.send(()).unwrap();
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(1), limiter.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn lazy_parser_writes_passthrough_and_reports_bad_inputs() {
+        let root = std::env::temp_dir().join(format!("ferryman-parse-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let input = root.join("empty.txt");
+        std::fs::write(&input, "").unwrap();
+        let engine = Engine::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".into(),
+            "model".into(),
+            "zh".into(),
+            2,
+            None,
+        );
+        let opts = BatchOpts {
+            mode: OutputMode::Bilingual,
+            in_place: false,
+            output: None,
+            batch_size: 2,
+            context: 0,
+            limit: None,
+            prompt_char_budget: 0,
+        };
+        let summary = run_batch_impl(
+            &engine,
+            vec![root.join("missing.txt"), input.clone()],
+            opts,
+            CancellationToken::new(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(summary.failed_files.len(), 1);
+        assert_eq!(summary.ok_files, 1);
+        assert_eq!(
+            std::fs::read(suffixed_output_path(&input, OutputMode::Bilingual)).unwrap(),
+            b""
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lazy_parsing_translates_multiple_files_and_honors_cancellation() {
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(|| async {
+            axum::Json(serde_json::json!({"choices": [{"finish_reason": "stop", "message": {"content": "<c1>translated</c1>"}}]}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = std::env::temp_dir().join(format!("ferryman-batch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let inputs: Vec<_> = ["one.txt", "two.txt"].map(|name| root.join(name)).into();
+        for input in &inputs {
+            std::fs::write(input, "source text").unwrap();
+        }
+        let opts = BatchOpts {
+            mode: OutputMode::Bilingual,
+            in_place: false,
+            output: None,
+            batch_size: 1,
+            context: 0,
+            limit: None,
+            prompt_char_budget: 0,
+        };
+        let engine = Engine::new(
+            reqwest::Client::new(),
+            endpoint,
+            "model".into(),
+            "en".into(),
+            2,
+            None,
+        );
+        let summary = run_batch_impl(
+            &engine,
+            inputs.clone(),
+            opts.clone(),
+            CancellationToken::new(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            (summary.ok_files, summary.translated, summary.failed),
+            (2, 2, 0)
+        );
+        assert!(summary.failed_files.is_empty());
+        for input in &inputs {
+            assert!(
+                std::fs::read_to_string(suffixed_output_path(input, OutputMode::Bilingual))
+                    .unwrap()
+                    .contains("translated")
+            );
+        }
+        // With both parser slots occupied, cancellation must finish without
+        // waiting for the semaphore or touching an input file.
+        let permits = parser_limiter().acquire_many_owned(2).await.unwrap();
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            stop.cancel();
+        });
+        let summary = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_batch_impl(&engine, inputs, opts, cancel, None, None),
+        )
+        .await
+        .unwrap();
+        assert!(summary.cancelled);
+        assert_eq!(summary.ok_files, 0);
+        cancel_task.await.unwrap();
+        drop(permits);
+        server.abort();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn seg(id: usize, text: &str) -> Segment {
         Segment {

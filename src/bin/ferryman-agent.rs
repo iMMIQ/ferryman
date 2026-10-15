@@ -1400,8 +1400,16 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!(%listen, "Ferryman AI Pod agent listening");
+    let shutdown_controller = controller.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // Stop generation before draining HTTP connections: an SSE stream
+            // can remain open indefinitely while its vLLM process is alive.
+            if let Err(error) = shutdown_controller.stop(true).await {
+                warn!(%error, "could not stop vLLM during shutdown");
+            }
+        })
         .await?;
     if let Err(error) = controller.stop(true).await {
         warn!(%error, "could not stop vLLM during shutdown");

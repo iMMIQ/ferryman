@@ -362,8 +362,10 @@ export function useSubmission(
           s.result = `已加入 ${added} 个任务；提交时重新检查并跳过 ${skipped} 个文件。`;
       }
       if (!s.result) s.result = `已加入 ${added} 个任务，模型就绪后自动执行。`;
-      mountedAttempt = undefined;
-      persistAttempt();
+      if (captured.sourceMode === "mounted") {
+        mountedAttempt = undefined;
+        persistAttempt();
+      }
       await onSuccess(ids, s.result);
     } catch (error) {
       s.error =

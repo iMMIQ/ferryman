@@ -69,6 +69,9 @@ impl Drop for Agent {
 }
 impl Agent {
     async fn start(mode: &str, bytes: u64, free: u64) -> Self {
+        Self::start_with_endpoint(mode, bytes, free, "http://127.0.0.1:1").await
+    }
+    async fn start_with_endpoint(mode: &str, bytes: u64, free: u64, endpoint: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let r = root.path();
         let models = r.join("models/Hy-MT2-7B-FP8");
@@ -126,7 +129,7 @@ exec sleep 120
             .env("FERRYMAN_VLLM_BIN", r.join("vllm"))
             .env("FERRYMAN_VLLM_LD_PRELOAD", "")
             .env("FERRYMAN_START_TIMEOUT_SECONDS", "30")
-            .env("FERRYMAN_VLLM_ENDPOINT", "http://127.0.0.1:1")
+            .env("FERRYMAN_VLLM_ENDPOINT", endpoint)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if mode == "help" {
@@ -197,6 +200,87 @@ async fn gpu_memory_is_refreshed_after_failed_start() {
 }
 fn running(pid: &str) -> bool {
     fs::read_to_string(format!("/proc/{}/stat", pid.trim())).is_ok_and(|stat| !stat.contains(") Z"))
+}
+#[tokio::test]
+async fn shutdown_stops_vllm_before_draining_streams() {
+    use axum::{
+        body::Body,
+        routing::{get, post},
+        Router,
+    };
+    use std::sync::{Arc, Mutex};
+
+    // Keep the mock generation open for as long as the vLLM process is alive.
+    // Stopping vLLM closes the upstream stream, as it does in production.
+    let model_pid = Arc::new(Mutex::new(String::new()));
+    let stream_pid = model_pid.clone();
+    let upstream = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route(
+            "/v1/chat/completions",
+            post(move || {
+                let model_pid = stream_pid.clone();
+                async move {
+                    Body::from_stream(futures::stream::unfold(model_pid, |model_pid| async move {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        let alive = running(&model_pid.lock().unwrap());
+                        alive.then_some((Ok::<_, std::io::Error>("data: token\n\n"), model_pid))
+                    }))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let upstream_task = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let mut agent =
+        Agent::start_with_endpoint("shutdown", 4, 16 * 1024 * 1024 * 1024, &endpoint).await;
+    assert_eq!(agent.acquire().send().await.unwrap().status(), 202);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status: serde_json::Value = agent
+                .request("/runtime")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if status["state"] == "ready" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid = fs::read_to_string(agent.root.path().join("model.pid")).unwrap();
+    *model_pid.lock().unwrap() = pid.clone();
+    let mut response = agent
+        .post("/v1/chat/completions", serde_json::json!({"stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.chunk().await.unwrap().is_some());
+    let agent_pid = rustix::process::Pid::from_raw(agent.child.id() as i32).unwrap();
+    rustix::process::kill_process(agent_pid, rustix::process::Signal::TERM).unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(status) = agent.child.try_wait().unwrap() {
+                break status;
+            }
+            // Continue reading so downstream backpressure cannot stall shutdown.
+            tokio::select! {
+                _ = response.chunk() => {},
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+            }
+        }
+    })
+    .await
+    .expect("SIGTERM must stop vLLM and close ongoing generation streams");
+    assert!(status.success(), "agent must exit cleanly: {status}");
+    assert!(!running(&pid));
+    upstream_task.abort();
 }
 #[tokio::test]
 async fn exited_vllm_parent_does_not_leave_workers() {

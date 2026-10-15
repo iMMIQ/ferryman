@@ -874,3 +874,52 @@ test("mounted submission retries preserve their idempotency key", async ({
     assert(attempts[0].request_id);
     assert.equal(attempts[0].request_id, attempts[1].request_id);
   }));
+
+test("an unrelated upload preserves an unconfirmed mounted submission", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
+    await page
+      .locator('input[name="source"][value="mounted"]')
+      .check({ force: true });
+    await page.locator("#source-directory").click();
+    await page.locator('.folder-checkbox[data-entry-select="Books"]').click();
+    await page.locator("#select-current-folder").click();
+    await page
+      .locator('input[name="save_strategy"][value="sibling_overwrite"]')
+      .check({ force: true });
+    state.failSelection = true;
+    await page.locator("#submit-job").click();
+    await page.locator("#confirm-overwrite").check();
+    await page.locator("#confirm-submit").click();
+    await expect(page.locator("#submission-error")).toContainText("原提交结果");
+
+    await page
+      .locator('input[name="source"][value="upload"]')
+      .check({ force: true });
+    await page.locator("#file-input").setInputFiles({
+      name: "unrelated.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("unrelated"),
+    });
+    await page.locator("#submit-job").click();
+    await page.locator("#confirm-submit").click();
+    await expect(page.locator(".submission-success")).toContainText(
+      "已加入 1 个任务",
+    );
+
+    await page.locator('button[data-workspace="create"]').click();
+    await page
+      .locator('input[name="source"][value="mounted"]')
+      .check({ force: true });
+    state.failSelection = false;
+    await page.locator("#submit-job").click();
+    await page.locator("#confirm-overwrite").check();
+    await page.locator("#confirm-submit").click();
+    await expect(page.locator("#submit-job")).not.toBeDisabled();
+    const attempts = state.posts
+      .filter((post) => post.path === "/api/jobs/selection")
+      .map((post) => JSON.parse(post.body));
+    assert.equal(attempts.length, 2);
+    assert.equal(attempts[0].request_id, attempts[1].request_id);
+  }));

@@ -492,7 +492,9 @@ fn build_units(
             let mut i = 0;
             while i < segments.len() {
                 let want = batch_size.min(segments.len() - i);
-                let n = allow(budget, want);
+                // The prompt-size split below may emit fewer than `want`.
+                // Cap the candidate now and charge only the emitted cues.
+                let n = budget.map_or(want, |remaining| want.min(remaining));
                 if n == 0 {
                     break;
                 }
@@ -515,6 +517,7 @@ fn build_units(
                         }
                         sub_end += 1;
                     }
+                    allow(budget, sub_end - i);
                     units.push(Unit::Batch {
                         file,
                         ids: segments[i..sub_end].iter().map(|s| s.id).collect(),
@@ -529,6 +532,7 @@ fn build_units(
                     });
                     i = sub_end;
                 } else {
+                    allow(budget, n);
                     units.push(Unit::Batch {
                         file,
                         ids: segments[i..end].iter().map(|s| s.id).collect(),
@@ -927,6 +931,46 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn prompt_splits_only_consume_budget_for_emitted_segments() {
+        let segs: Vec<_> = (0..8).map(|i| seg(i, &"x".repeat(500))).collect();
+        let mut budget = Some(7);
+        // Each request fits two cues, while each count-sized candidate is
+        // larger. Splitting must not charge the omitted candidate cues.
+        let first = build_units(
+            0,
+            &segs[..5],
+            Strategy::Batched {
+                batch_size: 6,
+                context: 0,
+            },
+            &mut budget,
+            BATCH_PROMPT_OVERHEAD_CHARS + 2 * 516,
+        );
+        let ids: Vec<_> = first
+            .iter()
+            .flat_map(|unit| match unit {
+                Unit::Batch { ids, .. } => ids.clone(),
+                Unit::Single { .. } => panic!("expected Batch"),
+            })
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+        assert_eq!(budget, Some(2));
+
+        let second = build_units(
+            1,
+            &segs[5..],
+            Strategy::Batched {
+                batch_size: 6,
+                context: 0,
+            },
+            &mut budget,
+            BATCH_PROMPT_OVERHEAD_CHARS + 2 * 516,
+        );
+        assert_eq!(second.iter().map(Unit::attempted).sum::<usize>(), 2);
+        assert_eq!(budget, Some(0));
     }
 
     #[test]

@@ -97,6 +97,65 @@ async fn cancellation_and_claim_cannot_resurrect_a_job() {
 }
 
 #[tokio::test]
+async fn error_completion_preserves_cancellation_and_existing_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = state_at(temp.path()).await;
+    let entry = entry_at(temp.path(), JobStatus::StartingModel);
+    let id = entry.record.id;
+    tokio::fs::write(&entry.output, "previous partial result")
+        .await
+        .unwrap();
+    state.store.insert(entry.clone(), 100).await.unwrap();
+    state.active_jobs.write().await.insert(id, entry.clone());
+
+    let transition = lock_job(&state, id).await;
+    let worker = state.clone();
+    let completion = tokio::spawn(async move {
+        scheduler::finalize_failed_job(
+            &worker,
+            id,
+            &entry.output,
+            &anyhow::anyhow!("agent request failed"),
+        )
+        .await;
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state
+                .job_locks
+                .lock()
+                .await
+                .get(&id)
+                .unwrap()
+                .strong_count()
+                >= 2
+            {
+                break;
+            }
+            assert!(
+                !completion.is_finished(),
+                "error completion bypassed the cancellation transition lock"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The cancellation commits while error completion is waiting for the same
+    // transition lock, after its output metadata read has already finished.
+    mutate_job(&state, id, |job| job.status = JobStatus::Cancelled)
+        .await
+        .unwrap();
+    drop(transition);
+    completion.await.unwrap();
+
+    let row = state.store.get("alice".into(), id).await.unwrap().unwrap();
+    assert_eq!(row.record.status, JobStatus::Cancelled);
+    assert!(row.record.result_available);
+    assert!(row.record.error.is_none());
+}
+
+#[tokio::test]
 async fn save_commit_rejects_cancellation_and_preserves_state() {
     let temp = tempfile::tempdir().unwrap();
     let state = state_at(temp.path()).await;

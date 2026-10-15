@@ -5,7 +5,7 @@ use super::{claim_queued_job, mutate_job, AppState, JobStatus, MAX_ACTIVE_JOBS};
 use crate::runner::run_job;
 use ferryman::preset::Preset;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::warn;
@@ -18,25 +18,31 @@ async fn process_queued_job(state: AppState, id: Uuid) {
     let output = entry.output.clone();
     if let Err(error) = run_job(&state, entry).await {
         warn!(%id, %error, "job failed");
-        let cancelled = state
-            .active_jobs
-            .read()
-            .await
-            .get(&id)
-            .is_some_and(|entry| entry.record.status == JobStatus::Cancelled);
-        if !cancelled {
-            let available = tokio::fs::metadata(&output)
-                .await
-                .is_ok_and(|metadata| metadata.is_file());
-            mutate_job(&state, id, |job| {
-                job.status = JobStatus::Failed;
-                job.result_available = available;
-                job.error = Some(format!("{error:#}"));
-            })
-            .await;
-        }
+        finalize_failed_job(&state, id, &output, &error).await;
     }
     state.active_jobs.write().await.remove(&id);
+}
+
+pub(super) async fn finalize_failed_job(
+    state: &AppState,
+    id: Uuid,
+    output: &Path,
+    error: &anyhow::Error,
+) {
+    let available = tokio::fs::metadata(output)
+        .await
+        .is_ok_and(|metadata| metadata.is_file());
+    // Cancellation and error completion are competing terminal transitions.
+    // Recheck cancellation under its transition lock after the filesystem await.
+    let _transition = super::lock_job(state, id).await;
+    mutate_job(state, id, |job| {
+        job.result_available = available;
+        if job.status != JobStatus::Cancelled {
+            job.status = JobStatus::Failed;
+            job.error = Some(format!("{error:#}"));
+        }
+    })
+    .await;
 }
 
 fn can_dispatch_job<'a>(

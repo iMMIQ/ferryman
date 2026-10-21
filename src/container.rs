@@ -1,4 +1,4 @@
-//! Launch and tear down the vLLM Docker container that serves the model.
+//! Launch and tear down the orinfer Docker container that serves the model.
 //!
 //! [`ContainerGuard::launch`] starts the container and blocks until its
 //! `/health` endpoint is ready. When the guard is dropped (at the end of
@@ -12,33 +12,13 @@ use tokio::process::Command;
 
 pub struct ServeSpec {
     pub image: String,
-    /// Host directory containing the model files.
     pub host_model_dir: String,
-    /// Host directory persisted as the container's /root/.cache so the vLLM v1
-    /// / FlashInfer / Triton JIT kernels compiled on first launch are reused on
-    /// subsequent launches (avoids ~3-5 min of recompilation each cold start).
     pub host_cache_dir: String,
-    /// Path inside the container (also used as the served model id).
     pub container_model: String,
+    pub model: String,
     pub host_port: u16,
     pub container_name: String,
-    /// e.g. Some("awq_marlin") for AWQ; None lets vLLM auto-detect (FP8).
-    pub quantization: Option<String>,
-    pub dtype: String,
-    /// KV cache dtype passed as `--kv-cache-dtype` (e.g. "fp8", "auto").
-    pub kv_cache_dtype: String,
-    pub gpu_memory_utilization: f32,
-    /// Fixed KV cache capacity in bytes. This avoids UMA memory-profiler
-    /// variance from changing the cache size between launches.
-    pub kv_cache_memory_bytes: u64,
-    pub max_model_len: u32,
-    /// vLLM admission cap (`--max-num-seqs`); None = vLLM default (256).
-    /// 512 unlocks the 30B's throughput ceiling (short blocks).
-    pub max_num_seqs: Option<u32>,
-    /// If true, pass `--enforce-eager` (no torch.compile/CUDA graphs). The 7B
-    /// preset wants eager; the 30B preset wants graphs (faster, ~1 GiB capture).
-    pub enforce_eager: bool,
-    /// Seconds to wait for the server to become healthy.
+    pub concurrency: usize,
     pub health_timeout: u64,
 }
 
@@ -65,12 +45,11 @@ impl ContainerGuard {
             .await;
 
         let mount = format!("{}:{}:ro", spec.host_model_dir, spec.container_model);
-        // Persist the JIT/compile caches (FlashInfer, Triton, vLLM, inductor) so
-        // the ~60s+ FlashInfer fp8/sm87 kernel compile is done once, not per run.
+        // Execution packages are installed in the image; only runtime caches are writable.
         let cache_mount = format!("{}:/root/.cache", spec.host_cache_dir);
 
-        let mut args: Vec<String> = vec![
-            "run".into(),
+        let args = vec![
+            "run".to_string(),
             "-d".into(),
             "--runtime=nvidia".into(),
             "--name".into(),
@@ -79,60 +58,27 @@ impl ContainerGuard {
             mount,
             "-v".into(),
             cache_mount,
+            "-e".into(),
+            "ORINFER_EXECUTION_CACHE=/opt/orinfer/packages".into(),
             "-p".into(),
-            format!("{}:8000", spec.host_port),
-            "--shm-size".into(),
-            "512m".into(),
-            "-e".into(),
-            "VLLM_CONFIGURE_LOGGING=0".into(),
-            "-e".into(),
-            "VLLM_DO_NOT_TRACK=1".into(),
-            "-e".into(),
-            "VLLM_NO_USAGE_STATS=1".into(),
-            // Route Triton + Inductor caches under the persisted /root/.cache too.
-            "-e".into(),
-            "TRITON_CACHE_DIR=/root/.cache/triton".into(),
-            "-e".into(),
-            "TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor".into(),
+            format!("{}:8088", spec.host_port),
             "--entrypoint".into(),
-            "vllm".into(),
+            "/opt/orinfer/bin/orinfer".into(),
             spec.image.clone(),
             "serve".into(),
             spec.container_model.clone(),
-            "--host".into(),
-            "0.0.0.0".into(),
-            "--port".into(),
-            "8000".into(),
-            "--dtype".into(),
-            spec.dtype.clone(),
-            "--max-model-len".into(),
-            spec.max_model_len.to_string(),
-            "--gpu-memory-utilization".into(),
-            spec.gpu_memory_utilization.to_string(),
-            "--kv-cache-memory-bytes".into(),
-            spec.kv_cache_memory_bytes.to_string(),
-            "--kv-cache-dtype".into(),
-            spec.kv_cache_dtype.clone(),
-            "--enable-prefix-caching".into(),
+            "--model".into(),
+            spec.model.clone(),
+            "--listen".into(),
+            "0.0.0.0:8088".into(),
+            "--max-active-requests".into(),
+            spec.concurrency.to_string(),
+            "--prefix-cache-mib".into(),
+            "1024".into(),
         ];
-        // CUDA graphs are FASTER for the 30B-FP8 on this Jetson (measured 2.9x
-        // single-stream, +9% @c256, peak 1222 tok/s) and cost only ~1 GiB to
-        // capture. The 7B/quantized path stays eager. The preset decides; omitting
-        // --enforce-eager enables torch.compile + cudagraph.
-        if spec.enforce_eager {
-            args.push("--enforce-eager".into());
-        }
-        if let Some(mns) = spec.max_num_seqs {
-            args.push("--max-num-seqs".into());
-            args.push(mns.to_string());
-        }
-        if let Some(q) = &spec.quantization {
-            args.push("--quantization".into());
-            args.push(q.clone());
-        }
 
         eprintln!(
-            "starting vLLM container '{}' (image {}, model {})…",
+            "starting orinfer container '{}' (image {}, model {})…",
             spec.container_name, spec.image, spec.container_model
         );
         let out = Command::new("docker")
@@ -160,12 +106,12 @@ impl ContainerGuard {
                 .status()
                 .await;
             bail!(
-                "vLLM container '{}' did not become healthy within {}s",
+                "orinfer container '{}' did not become healthy within {}s",
                 spec.container_name,
                 spec.health_timeout
             );
         }
-        eprintln!("vLLM healthy at {}", endpoint);
+        eprintln!("orinfer healthy at {}", endpoint);
 
         Ok(guard)
     }

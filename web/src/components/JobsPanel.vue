@@ -199,7 +199,11 @@ async function remove() {
             </td>
             <td>
               <span class="model-chip">{{
-                item.preset === "7b-fp8" ? "7B" : "30B"
+                item.preset === "index-translate-2b"
+                  ? "2B"
+                  : item.preset === "index-translate-9b"
+                    ? "9B"
+                    : "35B"
               }}</span>
             </td>
             <td><StatusBadge :job="item" /></td>
@@ -230,7 +234,13 @@ async function remove() {
         <div class="card-meta">
           <span
             >{{ item.target }} ·
-            {{ item.preset === "7b-fp8" ? "7B" : "30B" }}</span
+            {{
+              item.preset === "index-translate-2b"
+                ? "2B"
+                : item.preset === "index-translate-9b"
+                  ? "9B"
+                  : "35B"
+            }}</span
           ><StatusBadge :job="item" />
         </div>
         <p v-if="item.error" class="job-error-summary">{{ item.error }}</p>

@@ -1,4 +1,4 @@
-//! The vLLM sender — translates one self-contained [`Unit`] per call.
+//! The orinfer sender — translates one self-contained [`Unit`] per call.
 //!
 //! The engine is deliberately minimal: [`Engine::exec_unit`] takes a [`Unit`]
 //! (an Independent segment, or a Batched slice with its own in-file context),
@@ -9,7 +9,7 @@
 //! Everything above one unit — the shared concurrency pool, lazy file opening,
 //! progressive writing, Ctrl-C, the progress bar — lives in [`crate::batch`],
 //! the queue layer. That split keeps the engine free of any notion of files,
-//! formats, or strategies: it only knows how to send one chunk of text to vLLM.
+//! formats, or strategies: it only knows how to send one chunk of text to orinfer.
 
 use crate::cache::Cache;
 use crate::format::SegmentId;
@@ -153,7 +153,7 @@ impl Engine {
 
     /// Share an aggregate request budget with other engines. The Web scheduler
     /// uses one limiter per model preset so concurrent jobs cannot multiply the
-    /// configured vLLM concurrency.
+    /// configured orinfer concurrency.
     pub fn with_request_limiter(mut self, limiter: Arc<Semaphore>) -> Self {
         self.request_limiter = Some(limiter);
         self
@@ -374,7 +374,7 @@ mod tests {
         );
     }
 
-    /// A partial-cache batch must send only the missing cues to vLLM and reuse
+    /// A partial-cache batch must send only the missing cues to orinfer and reuse
     /// the cached translations for the rest — a rerun after a half-failed
     /// batch must not re-translate (or re-bill) the cues that already landed.
     #[tokio::test]

@@ -61,7 +61,7 @@ export function useRuntime() {
     error: "",
     pending: {} as Record<string, boolean>,
     source: "auto",
-    preset: "7b-fp8" as Preset,
+    preset: "index-translate-2b" as Preset,
   });
   async function refresh() {
     await Promise.all([runtime.refetch(), catalog.refetch()]);

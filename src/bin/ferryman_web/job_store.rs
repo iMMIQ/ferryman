@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone)]
 pub(crate) struct JobStore {
@@ -57,6 +57,8 @@ impl JobStore {
                     connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
                 if version == 0 {
                     create_schema(connection)?;
+                } else if version == 1 {
+                    migrate_index_presets(connection)?;
                 } else if version != SCHEMA_VERSION {
                     anyhow::bail!(
                         "unsupported job database schema {version}; expected {SCHEMA_VERSION}"
@@ -485,7 +487,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
             overwrite INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
-            CHECK (preset IN ('7b-fp8', '30b-fp8')),
+            CHECK (preset IN ('index-translate-2b', 'index-translate-9b', 'index-translate-35b', '7b-fp8', '30b-fp8')),
             CHECK (output_mode IN ('bilingual', 'replace')),
             CHECK (status IN ('queued', 'starting_model', 'translating', 'writing', 'completed', 'failed', 'cancelled')),
             CHECK (source_storage IS NULL OR source_storage IN ('documents', 'remote_fs')),
@@ -495,9 +497,31 @@ fn create_schema(connection: &Connection) -> Result<()> {
          CREATE INDEX jobs_status_created_idx ON jobs(status, created_at, id);
          CREATE INDEX jobs_owner_status_created_idx
             ON jobs(owner, status, created_at DESC, id DESC);
-         PRAGMA user_version=1;
+         PRAGMA user_version=2;
          COMMIT;",
     )?;
+    Ok(())
+}
+
+fn migrate_index_presets(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let original: String = transaction.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'",
+        [],
+        |row| row.get(0),
+    )?;
+    let schema = format!("CREATE TABLE jobs_v2 {}", &original[original.find('(').context("invalid jobs schema")?..])
+        .replace("CHECK (preset IN ('7b-fp8', '30b-fp8'))", "CHECK (preset IN ('index-translate-2b', 'index-translate-9b', 'index-translate-35b', '7b-fp8', '30b-fp8'))");
+    transaction.execute_batch(&schema)?;
+    transaction.execute_batch("INSERT INTO jobs_v2 SELECT * FROM jobs;
+        UPDATE jobs_v2 SET preset=CASE preset WHEN '7b-fp8' THEN 'index-translate-2b' WHEN '30b-fp8' THEN 'index-translate-35b' ELSE preset END;
+        DROP TABLE jobs;
+        ALTER TABLE jobs_v2 RENAME TO jobs;
+        CREATE INDEX jobs_owner_created_idx ON jobs(owner, created_at DESC, id DESC);
+        CREATE INDEX jobs_status_created_idx ON jobs(status, created_at, id);
+        CREATE INDEX jobs_owner_status_created_idx ON jobs(owner, status, created_at DESC, id DESC);
+        PRAGMA user_version=2;")?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -570,8 +594,9 @@ fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<JobEntry> {
     };
     let preset_value: String = row.get("preset")?;
     let preset = match preset_value.as_str() {
-        "7b-fp8" => Preset::SevenBFp8,
-        "30b-fp8" => Preset::ThirtyBFp8,
+        "index-translate-2b" | "7b-fp8" => Preset::Index2B,
+        "index-translate-35b" | "30b-fp8" => Preset::Index35B,
+        "index-translate-9b" => Preset::Index9B,
         _ => return Err(parse_error(3, format!("invalid preset {preset_value}"))),
     };
     let mode_value: String = row.get("output_mode")?;
@@ -679,7 +704,7 @@ mod tests {
             record: JobRecord {
                 id,
                 filename: "notes.txt".to_string(),
-                preset: Preset::SevenBFp8,
+                preset: Preset::Index2B,
                 target: "中文".to_string(),
                 mode: OutputMode::Bilingual,
                 status,
@@ -704,6 +729,63 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ferryman-store-test-{}", Uuid::new_v4()));
         let store = JobStore::open(root.join("jobs.sqlite3")).await.unwrap();
         (root, store)
+    }
+
+    #[tokio::test]
+    async fn migrates_legacy_model_presets_and_accepts_all_index_sizes() {
+        let (root, store) = test_store().await;
+        let small = Uuid::new_v4();
+        let large = Uuid::new_v4();
+        store
+            .insert(test_entry("alice", small, 10, JobStatus::Queued), 10)
+            .await
+            .unwrap();
+        let mut entry = test_entry("alice", large, 11, JobStatus::Completed);
+        entry.record.preset = Preset::Index35B;
+        store.insert(entry, 10).await.unwrap();
+        store.call(|connection| {
+            connection.execute_batch("UPDATE jobs SET preset=CASE preset WHEN 'index-translate-2b' THEN '7b-fp8' ELSE '30b-fp8' END;")?;
+            let schema: String = connection.query_row("SELECT sql FROM sqlite_master WHERE name='jobs'", [], |row| row.get(0))?;
+            let legacy = schema.replace("CREATE TABLE jobs", "CREATE TABLE legacy_jobs")
+                .replace("CHECK (preset IN ('index-translate-2b', 'index-translate-9b', 'index-translate-35b', '7b-fp8', '30b-fp8'))", "CHECK (preset IN ('7b-fp8', '30b-fp8'))");
+            connection.execute_batch(&legacy)?;
+            connection.execute_batch("INSERT INTO legacy_jobs SELECT * FROM jobs; DROP TABLE jobs; ALTER TABLE legacy_jobs RENAME TO jobs; PRAGMA user_version=1;")?;
+            Ok(())
+        }).await.unwrap();
+        drop(store);
+        let store = JobStore::open(root.join("jobs.sqlite3")).await.unwrap();
+        assert_eq!(
+            store
+                .get("alice".into(), small)
+                .await
+                .unwrap()
+                .unwrap()
+                .record
+                .preset,
+            Preset::Index2B
+        );
+        assert_eq!(
+            store
+                .get("alice".into(), large)
+                .await
+                .unwrap()
+                .unwrap()
+                .record
+                .preset,
+            Preset::Index35B
+        );
+        let mut entry = test_entry("alice", Uuid::new_v4(), 12, JobStatus::Queued);
+        entry.record.preset = Preset::Index9B;
+        store.insert(entry, 10).await.unwrap();
+        assert_eq!(
+            store
+                .list_page("alice".into(), None, None, 50)
+                .await
+                .unwrap()
+                .total,
+            3
+        );
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[tokio::test]

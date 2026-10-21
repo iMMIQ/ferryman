@@ -191,7 +191,7 @@ impl ModelManager {
                 cache_root,
                 client,
                 models: RwLock::new(
-                    [Preset::SevenBFp8, Preset::ThirtyBFp8]
+                    Preset::ALL
                         .into_iter()
                         .map(|preset| (preset, initial_status(preset, ModelPhase::Verifying, 0)))
                         .collect(),
@@ -211,7 +211,7 @@ impl ModelManager {
 
     pub async fn rescan(&self) {
         let mut statuses = HashMap::new();
-        for preset in [Preset::SevenBFp8, Preset::ThirtyBFp8] {
+        for preset in Preset::ALL {
             statuses.insert(preset, self.scan_model(preset).await);
         }
         *self.inner.models.write().await = statuses;
@@ -219,7 +219,7 @@ impl ModelManager {
 
     pub async fn catalog(&self) -> ModelCatalog {
         let models = self.inner.models.read().await;
-        let values = [Preset::SevenBFp8, Preset::ThirtyBFp8]
+        let values = Preset::ALL
             .into_iter()
             .filter_map(|preset| models.get(&preset).cloned())
             .collect();
@@ -406,7 +406,8 @@ impl ModelManager {
 
     async fn scan_model(&self, preset: Preset) -> ModelStatus {
         let model_path = self.inner.model_root.join(preset.config().model_dir_name);
-        match validate_model_directory(model_path.clone()).await {
+        match validate_model_directory(model_path.clone(), preset.config().execution_package).await
+        {
             Ok(bytes) => initial_status(preset, ModelPhase::Ready, bytes),
             Err(_) => {
                 let partial = self.incomplete_downloaded_bytes(preset).await;
@@ -462,7 +463,11 @@ impl ModelManager {
                     // The new manifest replaces any stale/corrupt installation
                     // receipt before validating the freshly verified download.
                     self.write_marker(preset, source, &files).await?;
-                    let bytes = validate_model_directory(model_path.clone()).await?;
+                    let bytes = validate_model_directory(
+                        model_path.clone(),
+                        preset.config().execution_package,
+                    )
+                    .await?;
                     self.update_model(preset, |status| {
                         status.state = ModelPhase::Ready;
                         status.downloaded_bytes = bytes;
@@ -869,11 +874,7 @@ impl ModelManager {
         source: SourceId,
         cancel: CancellationToken,
     ) -> SourceBenchmark {
-        let shard = if preset == Preset::SevenBFp8 {
-            "model-00002-of-00002.safetensors"
-        } else {
-            "model-00000-of-00051.safetensors"
-        };
+        let shard = preset.config().benchmark_shard;
         let url = match source_file_url(source, preset, shard) {
             Ok(url) => url,
             Err(error) => return benchmark_error(source, error),
@@ -1033,11 +1034,25 @@ fn content_range_starts_at(headers: &header::HeaderMap, offset: u64) -> bool {
         .is_some_and(|value| value.starts_with(&format!("bytes {offset}-")))
 }
 
+fn safe_relative_file(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
 fn is_runtime_file(path: &str) -> bool {
-    !path.contains('/')
-        && (path.ends_with(".safetensors")
-            || path.ends_with(".json")
-            || path == "chat_template.jinja")
+    safe_relative_file(path)
+        && ((path.starts_with("cache/weights/")
+            && (path.ends_with(".safetensors") || path.ends_with(".json")))
+            || path == "cache/model.json"
+            || (!path.contains('/')
+                && (path.ends_with(".json")
+                    || matches!(
+                        path,
+                        "chat_template.jinja" | "merges.txt" | "vocab.json" | "LICENSE"
+                    ))))
 }
 
 fn recommended_source(results: &[SourceBenchmark]) -> Option<SourceId> {
@@ -1122,12 +1137,16 @@ fn validate_shard(path: &std::path::Path) -> Result<safetensors::tensor::Metadat
     Ok(metadata)
 }
 
-async fn validate_model_directory(path: PathBuf) -> Result<u64, String> {
+async fn validate_model_directory(
+    path: PathBuf,
+    expected_package: &'static str,
+) -> Result<u64, String> {
     tokio::task::spawn_blocking(move || -> Result<u64, String> {
         for required in [
             "config.json",
             "tokenizer.json",
-            "model.safetensors.index.json",
+            "cache/model.json",
+            "cache/weights/model.safetensors.index.json",
         ] {
             let metadata =
                 fs::metadata(path.join(required)).map_err(|_| format!("missing {required}"))?;
@@ -1143,7 +1162,14 @@ async fn validate_model_directory(path: PathBuf) -> Result<u64, String> {
                 return Err(format!("invalid {name}"));
             }
         }
-        let index = fs::read(path.join("model.safetensors.index.json"))
+        let descriptor: Value = serde_json::from_slice(
+            &fs::read(path.join("cache/model.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if descriptor["execution_package"].as_str() != Some(expected_package) {
+            return Err("model execution package does not match orinfer 0.2.0 preset".into());
+        }
+        let index = fs::read(path.join("cache/weights/model.safetensors.index.json"))
             .map_err(|error| format!("read model index: {error}"))?;
         let value: Value = serde_json::from_slice(&index)
             .map_err(|error| format!("parse model index: {error}"))?;
@@ -1167,7 +1193,7 @@ async fn validate_model_directory(path: PathBuf) -> Result<u64, String> {
             if shard.contains(['/', '\\']) || !shard.ends_with(".safetensors") {
                 return Err("invalid model shard path".into());
             }
-            let metadata = validate_shard(&path.join(shard))
+            let metadata = validate_shard(&path.join("cache/weights").join(shard))
                 .map_err(|e| format!("invalid model shard {shard}: {e}"))?;
             for (name, location) in weights {
                 if location.as_str() == Some(shard) && metadata.info(name).is_none() {
@@ -1185,7 +1211,7 @@ async fn validate_model_directory(path: PathBuf) -> Result<u64, String> {
             let files: Vec<RemoteFile> =
                 serde_json::from_value(value["files"].clone()).map_err(|e| e.to_string())?;
             for remote in files {
-                if remote.path.contains(['/', '\\']) {
+                if !safe_relative_file(&remote.path) {
                     return Err("invalid installed file path".into());
                 }
                 let file_path = path.join(&remote.path);
@@ -1296,8 +1322,8 @@ mod tests {
             ModelManager::initialize(root.path().join("models"), root.path().join("cache"))
                 .await
                 .unwrap();
-        let preset = Preset::SevenBFp8;
-        assert_eq!(manager.catalog().await.models.len(), 2);
+        let preset = Preset::Index2B;
+        assert_eq!(manager.catalog().await.models.len(), 3);
         assert_eq!(manager.status(preset).await.state, ModelPhase::Verifying);
         assert!(!manager.is_ready(preset).await);
         manager
@@ -1309,6 +1335,31 @@ mod tests {
         manager.rescan().await;
         assert_eq!(manager.status(preset).await.state, ModelPhase::Absent);
         assert!(manager.delete_model(preset).await.is_ok());
+    }
+
+    #[test]
+    fn downloads_quantized_model_layout_and_rejects_unsafe_paths() {
+        for path in [
+            "cache/model.json",
+            "cache/weights/model.safetensors",
+            "cache/weights/runtime.safetensors",
+            "cache/weights/model.safetensors.index.json",
+            "tokenizer.json",
+            "chat_template.jinja",
+            "merges.txt",
+        ] {
+            assert!(is_runtime_file(path), "{path}");
+        }
+        for path in [
+            "/config.json",
+            "../config.json",
+            "cache/../config.json",
+            "cache//weights/model.safetensors",
+            "cache/weights/../../config.json",
+            "cache/packages/lib/model.so",
+        ] {
+            assert!(!is_runtime_file(path), "{path}");
+        }
     }
 
     #[test]
@@ -1340,36 +1391,66 @@ mod tests {
     async fn validates_complete_model_structure() {
         let root =
             std::env::temp_dir().join(format!("ferryman-model-test-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join("cache/weights")).unwrap();
+        fs::write(root.join("cache/model.json"), serde_json::to_vec(&serde_json::json!({"execution_package": Preset::Index2B.config().execution_package})).unwrap()).unwrap();
         fs::write(root.join("config.json"), br#"{"model_type":"test"}"#).unwrap();
         fs::write(root.join("tokenizer.json"), br#"{"model":{}}"#).unwrap();
-        fs::write(root.join("model.safetensors"), b"weights").unwrap();
+        fs::write(root.join("cache/weights/model.safetensors"), b"weights").unwrap();
         fs::write(
-            root.join("model.safetensors.index.json"),
+            root.join("cache/weights/model.safetensors.index.json"),
             br#"{"weight_map":{"model.layer":"model.safetensors"}}"#,
         )
         .unwrap();
-        assert!(validate_model_directory(root.clone()).await.is_err());
+        assert!(
+            validate_model_directory(root.clone(), Preset::Index2B.config().execution_package)
+                .await
+                .is_err()
+        );
         let data = [0u8; 4];
         let tensor =
             safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![1], &data).unwrap();
         let bytes = safetensors::tensor::serialize([("model.layer", tensor)], None).unwrap();
-        fs::write(root.join("model.safetensors"), &bytes).unwrap();
-        assert!(validate_model_directory(root.clone()).await.is_ok());
-        fs::write(root.join("model.safetensors"), &bytes[..bytes.len() - 1]).unwrap();
-        assert!(validate_model_directory(root.clone()).await.is_err());
-        fs::write(root.join("model.safetensors"), &bytes).unwrap();
-        let marker = serde_json::json!({"files":[{"path":"model.safetensors","size":bytes.len(),"sha256":hex::encode(Sha256::digest(&bytes))}]});
+        fs::write(root.join("cache/weights/model.safetensors"), &bytes).unwrap();
+        assert!(
+            validate_model_directory(root.clone(), Preset::Index2B.config().execution_package)
+                .await
+                .is_ok()
+        );
+        fs::write(
+            root.join("cache/weights/model.safetensors"),
+            &bytes[..bytes.len() - 1],
+        )
+        .unwrap();
+        assert!(
+            validate_model_directory(root.clone(), Preset::Index2B.config().execution_package)
+                .await
+                .is_err()
+        );
+        fs::write(root.join("cache/weights/model.safetensors"), &bytes).unwrap();
+        let marker = serde_json::json!({"files":[{"path":"cache/weights/model.safetensors","size":bytes.len(),"sha256":hex::encode(Sha256::digest(&bytes))}]});
         fs::write(
             root.join(".ferryman-model.json"),
             serde_json::to_vec(&marker).unwrap(),
         )
         .unwrap();
-        assert!(validate_model_directory(root.clone()).await.is_ok());
+        assert!(
+            validate_model_directory(root.clone(), Preset::Index2B.config().execution_package)
+                .await
+                .is_ok()
+        );
+        assert!(
+            validate_model_directory(root.clone(), Preset::Index9B.config().execution_package)
+                .await
+                .is_err()
+        );
         let mut changed = bytes;
         *changed.last_mut().unwrap() = 1;
-        fs::write(root.join("model.safetensors"), changed).unwrap();
-        assert!(validate_model_directory(root.clone()).await.is_err());
+        fs::write(root.join("cache/weights/model.safetensors"), changed).unwrap();
+        assert!(
+            validate_model_directory(root.clone(), Preset::Index2B.config().execution_package)
+                .await
+                .is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -15,3 +15,7 @@
 !vite.config.ts
 !web/
 !web/**
+
+!scripts/
+!scripts/bundle-orinfer.py
+!scripts/orinfer-release.json

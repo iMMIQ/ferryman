@@ -41,7 +41,7 @@ const defaultJobs = () =>
     },
   ].map((j) => ({
     ...j,
-    preset: "7b-fp8",
+    preset: "index-translate-2b",
     target: "中文",
     mode: "bilingual",
     created_at: 1789990000,
@@ -156,7 +156,7 @@ async function withPage(
     } else if (u.pathname === "/api/runtime")
       data = {
         state: "ready",
-        preset: "7b-fp8",
+        preset: "index-translate-2b",
         active_requests: 12,
         leases: 2,
       };
@@ -164,12 +164,16 @@ async function withPage(
       data = {
         models: [
           {
-            preset: "7b-fp8",
+            preset: "index-translate-2b",
             state: "ready",
             downloaded_bytes: 8e9,
             expected_bytes: 8e9,
           },
-          { preset: "30b-fp8", state: "absent", expected_bytes: 32e9 },
+          {
+            preset: "index-translate-35b",
+            state: "absent",
+            expected_bytes: 32e9,
+          },
         ],
         available_bytes: 91e9,
         benchmark: { state: "idle", results: [] },
@@ -703,7 +707,7 @@ test("runtime mutation invalidates an older poll and refreshes the final state",
         await route.fulfill({
           json: {
             state: snapshot,
-            preset: "7b-fp8",
+            preset: "index-translate-2b",
             active_requests: 0,
             leases: 0,
           },
@@ -742,7 +746,9 @@ test("design layouts preserve drafts and separate recent tasks from filters", as
       },
     ]);
     await page.locator("#target-language").fill("日语");
-    await page.locator("#translation-preset").selectOption("30b-fp8");
+    await page
+      .locator("#translation-preset")
+      .selectOption("index-translate-35b");
     await expect(page.locator(".model-availability")).toContainText("未下载");
     await shot(page, "desktop-create");
     await page.locator('button[data-workspace="jobs"]').click();
@@ -751,7 +757,9 @@ test("design layouts preserve drafts and separate recent tasks from filters", as
     await page.locator('button[data-workspace="create"]').click();
     await expect(page.locator("#upload-list li")).toHaveCount(2);
     await expect(page.locator("#target-language")).toHaveValue("日语");
-    await expect(page.locator("#translation-preset")).toHaveValue("30b-fp8");
+    await expect(page.locator("#translation-preset")).toHaveValue(
+      "index-translate-35b",
+    );
     await expect(page.locator(".compact .job-card")).toHaveCount(3);
     await page.setViewportSize({ width: 390, height: 844 });
     await page.locator('button[data-workspace="models"]').click();

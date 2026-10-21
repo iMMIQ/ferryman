@@ -4,8 +4,9 @@ export const storageNames: Record<Storage, string> = {
   remote_fs: "网盘挂载",
 };
 export const modelNames = {
-  "7b-fp8": "Hy-MT2 7B FP8",
-  "30b-fp8": "Hy-MT2 30B FP8",
+  "index-translate-2b": "Index 2B E8P Q4A8",
+  "index-translate-9b": "Index 9B E8P Q4A8",
+  "index-translate-35b": "Index 35B-A3B E8P Q4A8",
 };
 export const modelStates: Record<string, string> = {
   absent: "未下载",

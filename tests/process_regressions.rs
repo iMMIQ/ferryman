@@ -37,7 +37,14 @@ fn unhealthy_cli_container_is_removed() {
             ),
         )
         .env("FIXTURE_ROOT", root.path())
-        .args(["--serve", "--health-timeout", "0", "--input"])
+        .args([
+            "--serve",
+            "--host-port",
+            "0",
+            "--health-timeout",
+            "0",
+            "--input",
+        ])
         .arg(root.path().join("source.txt"))
         .output()
         .unwrap();
@@ -52,7 +59,7 @@ struct Agent {
 }
 impl Drop for Agent {
     fn drop(&mut self) {
-        for file in ["model.pid", "help.pid"] {
+        for file in ["model.pid"] {
             if let Ok(pid) = fs::read_to_string(self.root.path().join(file)) {
                 if let Ok(pid) = pid.trim().parse::<i32>() {
                     if let Some(pid) = rustix::process::Pid::from_raw(pid) {
@@ -68,41 +75,36 @@ impl Drop for Agent {
     }
 }
 impl Agent {
-    async fn start(mode: &str, bytes: u64, free: u64) -> Self {
-        Self::start_with_endpoint(mode, bytes, free, "http://127.0.0.1:1").await
+    async fn start(mode: &str) -> Self {
+        Self::start_with_endpoint(mode, "http://127.0.0.1:1").await
     }
-    async fn start_with_endpoint(mode: &str, bytes: u64, free: u64, endpoint: &str) -> Self {
+    async fn start_with_endpoint(mode: &str, endpoint: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let r = root.path();
-        let models = r.join("models/Hy-MT2-7B-FP8");
-        fs::create_dir_all(&models).unwrap();
+        let models = r.join("models/Index-Translate-2B-Orinfer-E8P-Q4A8");
+        fs::create_dir_all(models.join("cache/weights")).unwrap();
+        fs::write(models.join("cache/model.json"), serde_json::to_vec(&serde_json::json!({"execution_package": ferryman::preset::Preset::Index2B.config().execution_package})).unwrap()).unwrap();
         fs::write(models.join("config.json"), r#"{"model_type":"fixture"}"#).unwrap();
         fs::write(models.join("tokenizer.json"), r#"{"model":{}}"#).unwrap();
         fs::write(
-            models.join("model.safetensors.index.json"),
+            models.join("cache/weights/model.safetensors.index.json"),
             r#"{"weight_map":{"weight":"weights.safetensors"}}"#,
         )
         .unwrap();
+        let bytes = 4;
         let header = format!(
             r#"{{"weight":{{"dtype":"U8","shape":[{bytes}],"data_offsets":[0,{bytes}]}}}}"#
         );
         use std::io::Write;
-        let mut file = fs::File::create(models.join("weights.safetensors")).unwrap();
+        let mut file = fs::File::create(models.join("cache/weights/weights.safetensors")).unwrap();
         file.write_all(&(header.len() as u64).to_le_bytes())
             .unwrap();
         file.write_all(header.as_bytes()).unwrap();
         file.set_len(bytes + 8 + header.len() as u64).unwrap();
-        fs::write(r.join("free"), free.to_string()).unwrap();
         executable(
-            &r.join("python3"),
-            "#!/bin/sh\nprintf '17179869184 '; cat \"$FIXTURE_ROOT/free\"\n",
-        );
-        executable(
-            &r.join("vllm"),
+            &r.join("orinfer"),
             r#"#!/bin/sh
-case "$2" in
--h|--help=CacheConfig) echo $$ > "$FIXTURE_ROOT/help.pid"; exec sleep 120;;
-esac
+printf '%s\n' "$@" > "$FIXTURE_ROOT/args"
 echo $$ > "$FIXTURE_ROOT/model.pid"
 if [ "$FIXTURE_MODE" = orphan ]; then
   sleep 120 & echo $! > "$FIXTURE_ROOT/worker.pid"
@@ -126,17 +128,11 @@ exec sleep 120
             .env("FERRYMAN_AGENT_TOKEN", "isolated-regression-token")
             .env("FERRYMAN_MODEL_ROOT", r.join("models"))
             .env("FERRYMAN_CACHE_ROOT", r.join("cache"))
-            .env("FERRYMAN_VLLM_BIN", r.join("vllm"))
-            .env("FERRYMAN_VLLM_LD_PRELOAD", "")
+            .env("FERRYMAN_ORINFER_BIN", r.join("orinfer"))
             .env("FERRYMAN_START_TIMEOUT_SECONDS", "30")
-            .env("FERRYMAN_VLLM_ENDPOINT", endpoint)
+            .env("FERRYMAN_ORINFER_ENDPOINT", endpoint)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if mode == "help" {
-            command.env_remove("FERRYMAN_VLLM_KV_CACHE_FLAG");
-        } else {
-            command.env("FERRYMAN_VLLM_KV_CACHE_FLAG", "0");
-        }
         let child = command.spawn().unwrap();
         let agent = Self {
             child,
@@ -146,8 +142,12 @@ exec sleep 120
         };
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if agent.request("/healthz").send().await.is_ok() {
-                    break;
+                if let Ok(response) = agent.request("/models").send().await {
+                    if let Ok(catalog) = response.json::<serde_json::Value>().await {
+                        if catalog["models"][0]["state"] == "ready" {
+                            break;
+                        }
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -170,7 +170,7 @@ exec sleep 120
     fn acquire(&self) -> reqwest::RequestBuilder {
         self.post(
             "/runtime/acquire",
-            serde_json::json!({"preset":"7b-fp8","lease_id":"test"}),
+            serde_json::json!({"preset":"index-translate-2b","lease_id":"test"}),
         )
     }
     async fn stop(&self) {
@@ -184,25 +184,39 @@ exec sleep 120
     }
 }
 #[tokio::test]
-async fn gpu_memory_is_refreshed_after_failed_start() {
-    let agent = Agent::start("memory", 8 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024).await;
-    assert_eq!(agent.acquire().send().await.unwrap().status(), 409);
-    fs::write(
-        agent.root.path().join("free"),
-        (16u64 * 1024 * 1024 * 1024).to_string(),
-    )
+async fn launch_uses_orinfer_model_alias_and_endpoint() {
+    let agent = Agent::start("launch").await;
+    assert_eq!(agent.acquire().send().await.unwrap().status(), 202);
+    let args = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(args) = fs::read_to_string(agent.root.path().join("args")) {
+                break args;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
     .unwrap();
-    let response = agent.acquire().send().await.unwrap();
-    let status = response.status();
-    let body = response.text().await.unwrap();
-    assert_eq!(status, 202, "{body}");
+    assert!(args.contains("--model\nindex-translate-2b"), "{args}");
+    assert!(args.contains("--listen\n127.0.0.1:1"), "{args}");
+    assert!(!args.contains("--gpu-memory-utilization"), "{args}");
     agent.stop().await;
 }
+
+#[tokio::test]
+async fn inference_rejects_public_listeners() {
+    let agent = Agent::start_with_endpoint("private", "http://0.0.0.0:18088").await;
+    let response = agent.acquire().send().await.unwrap();
+    assert_eq!(response.status(), 409);
+    assert!(response.text().await.unwrap().contains("private loopback"));
+    assert!(!agent.root.path().join("model.pid").exists());
+}
+
 fn running(pid: &str) -> bool {
     fs::read_to_string(format!("/proc/{}/stat", pid.trim())).is_ok_and(|stat| !stat.contains(") Z"))
 }
 #[tokio::test]
-async fn shutdown_stops_vllm_before_draining_streams() {
+async fn shutdown_stops_orinfer_before_draining_streams() {
     use axum::{
         body::Body,
         routing::{get, post},
@@ -210,8 +224,8 @@ async fn shutdown_stops_vllm_before_draining_streams() {
     };
     use std::sync::{Arc, Mutex};
 
-    // Keep the mock generation open for as long as the vLLM process is alive.
-    // Stopping vLLM closes the upstream stream, as it does in production.
+    // Keep the mock generation open for as long as the orinfer process is alive.
+    // Stopping orinfer closes the upstream stream, as it does in production.
     let model_pid = Arc::new(Mutex::new(String::new()));
     let stream_pid = model_pid.clone();
     let upstream = Router::new()
@@ -232,8 +246,7 @@ async fn shutdown_stops_vllm_before_draining_streams() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let upstream_task = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-    let mut agent =
-        Agent::start_with_endpoint("shutdown", 4, 16 * 1024 * 1024 * 1024, &endpoint).await;
+    let mut agent = Agent::start_with_endpoint("shutdown", &endpoint).await;
     assert_eq!(agent.acquire().send().await.unwrap().status(), 202);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -277,14 +290,14 @@ async fn shutdown_stops_vllm_before_draining_streams() {
         }
     })
     .await
-    .expect("SIGTERM must stop vLLM and close ongoing generation streams");
+    .expect("SIGTERM must stop orinfer and close ongoing generation streams");
     assert!(status.success(), "agent must exit cleanly: {status}");
     assert!(!running(&pid));
     upstream_task.abort();
 }
 #[tokio::test]
-async fn exited_vllm_parent_does_not_leave_workers() {
-    let agent = Agent::start("orphan", 4, 16 * 1024 * 1024 * 1024).await;
+async fn exited_orinfer_parent_does_not_leave_workers() {
+    let agent = Agent::start("orphan").await;
     assert_eq!(agent.acquire().send().await.unwrap().status(), 202);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -313,31 +326,4 @@ async fn exited_vllm_parent_does_not_leave_workers() {
     })
     .await
     .unwrap();
-}
-#[tokio::test]
-async fn hung_capability_probe_has_a_deadline_and_releases_control() {
-    let agent = Agent::start("help", 4, 16 * 1024 * 1024 * 1024).await;
-    let acquire = tokio::spawn(agent.acquire().send());
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !agent.root.path().join("help.pid").exists() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(18), agent.stop())
-        .await
-        .unwrap();
-    acquire.await.unwrap().unwrap();
-    let pid = fs::read_to_string(agent.root.path().join("help.pid")).unwrap();
-    assert!(!running(&pid));
-    let status: serde_json::Value = agent
-        .request("/runtime")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(status["state"], "stopped");
 }

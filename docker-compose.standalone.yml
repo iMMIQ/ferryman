@@ -51,12 +51,11 @@ services:
       retries: 3
 
   agent:
+    platform: linux/arm64
     build:
       context: .
       dockerfile: docker/Dockerfile
       target: agent
-      args:
-        VLLM_BASE_IMAGE: ${VLLM_BASE_IMAGE:-docker.io/catdogai/lzc-aipod-vllm:agxorin-cu126-src-18f658bb3185-20260703@sha256:079f2ab5a3f19da5fbdf930476fed73625c3d47085407280fbee48c4293279be}
     image: ferryman-agent:standalone
     restart: unless-stopped
     shm_size: 512m
@@ -65,25 +64,16 @@ services:
       FERRYMAN_AGENT_LISTEN: 0.0.0.0:8090
       FERRYMAN_AGENT_TOKEN: ${FERRYMAN_AGENT_TOKEN:?set FERRYMAN_AGENT_TOKEN in .env}
       FERRYMAN_MODEL_ROOT: /models
-      FERRYMAN_CACHE_ROOT: /root/.cache
+      FERRYMAN_ORINFER_ENDPOINT: http://127.0.0.1:18088
+      FERRYMAN_CACHE_ROOT: /root/.cache/ferryman
       FERRYMAN_IDLE_TIMEOUT_SECONDS: "600"
-      # The default matches the Jetson base image; set FERRYMAN_VLLM_LD_PRELOAD=
-      # (empty) in .env when running a non-Jetson vLLM image.
-      FERRYMAN_VLLM_LD_PRELOAD: ${FERRYMAN_VLLM_LD_PRELOAD-/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1}
-      # vLLM memory flags derive from the probed GPU + weights on disk; this
-      # only forces the --kv-cache-memory-bytes flag off (0) or on (1).
-      FERRYMAN_VLLM_KV_CACHE_FLAG: ${FERRYMAN_VLLM_KV_CACHE_FLAG-}
-      VLLM_CONFIGURE_LOGGING: "0"
-      VLLM_DO_NOT_TRACK: "1"
-      VLLM_NO_USAGE_STATS: "1"
-      TRITON_CACHE_DIR: /root/.cache/triton
-      TORCHINDUCTOR_CACHE_DIR: /root/.cache/torchinductor
+      ORINFER_EXECUTION_CACHE: /opt/orinfer/packages
       RUST_LOG: info
     volumes:
       - ${FERRYMAN_MODELS_DIR:-./models}:/models
       - ${FERRYMAN_AGENT_CACHE_DIR:-./agent-cache}:/root/.cache
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz')\""]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8090/healthz"]
       interval: 30s
       timeout: 5s
       start_period: 10s

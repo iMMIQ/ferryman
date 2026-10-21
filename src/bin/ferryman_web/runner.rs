@@ -404,7 +404,7 @@ mod tests {
             record: JobRecord {
                 id: Uuid::new_v4(),
                 filename: "notes.txt".to_string(),
-                preset: Preset::SevenBFp8,
+                preset: Preset::Index2B,
                 target: "中文".to_string(),
                 mode: OutputMode::Bilingual,
                 status: JobStatus::Writing,
@@ -477,7 +477,7 @@ mod tests {
             record: JobRecord {
                 id: Uuid::new_v4(),
                 filename: "notes.txt".to_string(),
-                preset: Preset::SevenBFp8,
+                preset: Preset::Index2B,
                 target: "中文".to_string(),
                 mode: OutputMode::Bilingual,
                 status: JobStatus::Writing,

@@ -29,7 +29,7 @@ export function useSubmission(
     files: [] as File[],
     sources: [] as Source[],
     save: null as Source | null,
-    preset: "7b-fp8" as Preset,
+    preset: "index-translate-2b" as Preset,
     target: "中文",
     mode: "bilingual" as "bilingual" | "replace",
     strategy: "sibling_suffix" as RequestData["save_strategy"],

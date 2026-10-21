@@ -10,7 +10,7 @@ async fn state_at(base: &FsPath) -> AppState {
         job_locks: Arc::default(),
         queue: mpsc::channel(100).0,
         request_limiters: Arc::new(HashMap::from([(
-            Preset::SevenBFp8,
+            Preset::Index2B,
             Arc::new(Semaphore::new(1)),
         )])),
         translation_client: reqwest::Client::new(),
@@ -42,7 +42,7 @@ fn entry_at(base: &FsPath, status: JobStatus) -> JobEntry {
         record: JobRecord {
             id: Uuid::new_v4(),
             filename: "x.txt".into(),
-            preset: Preset::SevenBFp8,
+            preset: Preset::Index2B,
             target: "中文".into(),
             mode: OutputMode::Bilingual,
             status,
@@ -295,7 +295,7 @@ async fn batch_api_replays_original_jobs_after_sources_change() {
     let payload = serde_json::json!({
         "request_id": Uuid::new_v4(),
         "sources": [{"storage": "documents", "path": "Books"}],
-        "save_strategy": "sibling_suffix", "preset": "7b-fp8",
+        "save_strategy": "sibling_suffix", "preset": "index-translate-2b",
         "target": "中文", "mode": "bilingual"
     });
     let mut responses = Vec::new();

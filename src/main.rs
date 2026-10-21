@@ -1,5 +1,5 @@
 //! ferryman — translate documents into bilingual (original + translation)
-//! output via a vLLM-served model. EPUB, DOCX, PDF, SRT, VTT, ASS, LRC, TXT
+//! output via a orinfer-served model. EPUB, DOCX, PDF, SRT, VTT, ASS, LRC, TXT
 //! and MD ship today — plug a new format into `src/format/` and it just works.
 //!
 //! The original formatting is preserved byte-for-byte (via lol_html for EPUB;
@@ -29,7 +29,7 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(
     name = "ferryman",
-    about = "Translate a document into a bilingual side-by-side output via vLLM (EPUB, DOCX, PDF, SRT, VTT, ASS, LRC, TXT, MD)"
+    about = "Translate a document into a bilingual side-by-side output via orinfer (EPUB, DOCX, PDF, SRT, VTT, ASS, LRC, TXT, MD)"
 )]
 struct Cli {
     /// Input file or directory. A file is translated directly (format
@@ -60,8 +60,8 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = OutputMode::Bilingual)]
     mode: OutputMode,
 
-    /// vLLM OpenAI-compatible endpoint (used when --serve is NOT set).
-    #[arg(long, default_value = "http://localhost:8001")]
+    /// orinfer OpenAI-compatible endpoint (used when --serve is NOT set).
+    #[arg(long, default_value = "http://127.0.0.1:8088")]
     endpoint: String,
 
     /// Target language (full name, e.g. 中文 / English / 日本語).
@@ -99,12 +99,8 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_REQUEST_TIMEOUT_SECONDS)]
     timeout: u64,
 
-    /// Model preset: bundles the model path + the optimal vLLM serve config for
-    /// this Jetson. `7b-fp8` = Hy-MT2-7B-FP8 (light/fast, the original default);
-    /// `30b-fp8` = Hy-MT2-30B-A3B-FP8 (higher quality; CUDA graphs on,
-    /// max-num-seqs 512, util 0.55 — measured ~1222 tok/s peak). Every flag below
-    /// overrides the preset, so you can still tweak any single knob.
-    #[arg(long, value_enum, default_value_t = Preset::SevenBFp8)]
+    /// Quantized Index translation model.
+    #[arg(long, value_enum, default_value_t = Preset::Index2B)]
     preset: Preset,
 
     /// Served model id (OpenAI `model` field) when NOT --serve. Defaults to the
@@ -113,15 +109,12 @@ struct Cli {
     model: Option<String>,
 
     // --- container management (self-hosted model deployment) ---
-    /// Launch & manage the vLLM container ourselves (shut it down afterwards).
+    /// Launch & manage the orinfer container ourselves (shut it down afterwards).
     #[arg(long)]
     serve: bool,
 
     /// Docker image to run when --serve.
-    #[arg(
-        long,
-        default_value = "docker.io/catdogai/lzc-aipod-vllm:agxorin-cu126-src-18f658bb3185-20260703"
-    )]
+    #[arg(long, default_value = "ferryman-agent:standalone")]
     image: String,
 
     /// Host directory holding the model files (mounted into the container).
@@ -129,67 +122,28 @@ struct Cli {
     #[arg(long)]
     host_model_dir: Option<String>,
 
-    /// Host directory persisted as the container's JIT/compile cache. The cu126
-    /// image's v1 engine JIT-compiles FlashInfer/Triton kernels on first launch
-    /// (~2.5-5 min); persisting them reuses the compiled kernels on later launches.
-    /// Defaults to `$MODEL_ROOT/vllm-cache` (same root as the presets).
+    /// Host directory for runtime caches (defaults to $MODEL_ROOT/orinfer-cache).
     #[arg(long)]
     host_cache_dir: Option<String>,
 
-    /// Model path inside the container; also the served model id.
+    /// Model path inside the container.
     /// Defaults to the preset's model.
     #[arg(long)]
     serve_model: Option<String>,
 
     /// Container name (removed on exit).
-    #[arg(long, default_value = "ferryman-vllm")]
+    #[arg(long, default_value = "ferryman-orinfer")]
     container_name: String,
 
-    /// Host port to map to the container's 8000.
-    #[arg(long, default_value_t = 8001)]
+    /// Host port to map to the container's 8088.
+    #[arg(long, default_value_t = 8088)]
     host_port: u16,
 
-    /// Quantization method, e.g. `awq_marlin`. Omit to let vLLM auto-detect (FP8).
-    #[arg(long)]
-    quantization: Option<String>,
-
-    /// Compute dtype (default: float16 for 7b, auto→bf16 for 30b).
-    #[arg(long)]
-    vllm_dtype: Option<String>,
-
-    /// KV cache dtype. `fp8` halves KV-cache memory and boosts decode throughput;
-    /// `auto` uses the model's native dtype. (default: fp8)
-    #[arg(long)]
-    kv_cache_dtype: Option<String>,
-
-    /// gpu-memory-utilization (default: 0.30 for 7b, 0.55 for 30b).
-    #[arg(long)]
-    gpu_memory_utilization: Option<f32>,
-
-    /// Fixed KV cache size in bytes (default: 8 GiB for 7b, 3 GiB for 30b).
-    /// This takes precedence over gpu-memory-utilization for KV cache sizing.
-    #[arg(long)]
-    kv_cache_memory_bytes: Option<u64>,
-
-    /// max-model-len (default: 8192 for 7b, 4096 for 30b).
-    #[arg(long)]
-    max_model_len: Option<u32>,
-
-    /// max-num-seqs, vLLM's admission cap (default: 512 for both presets).
-    #[arg(long)]
-    max_num_seqs: Option<u32>,
-
-    /// Force eager mode (disable torch.compile + CUDA graphs). Both presets
-    /// leave this off — graphs are faster on this Jetson. Set only to A/B test
-    /// eager. (README documents this as "omit --enforce-eager" for graphs-on.)
-    #[arg(long)]
-    enforce_eager: bool,
-
-    /// Max concurrent translation requests (default: 256 for 7b, 128 for 30b).
+    /// Max concurrent translation requests (default: 32).
     #[arg(long)]
     concurrency: Option<usize>,
 
-    /// Seconds to wait for the container to become healthy (cold start ~2.5-5 min).
+    /// Seconds to wait for the container to become healthy.
     #[arg(long, default_value_t = 600)]
     health_timeout: u64,
 }
@@ -234,56 +188,25 @@ async fn main() -> Result<()> {
     let host_cache_dir = cli
         .host_cache_dir
         .clone()
-        .unwrap_or_else(|| format!("{}/vllm-cache", model_root()));
+        .unwrap_or_else(|| format!("{}/orinfer-cache", model_root()));
     let serve_model = cli
         .serve_model
         .clone()
-        .unwrap_or_else(|| p.serve_model.to_string());
-    let dtype = cli
-        .vllm_dtype
+        .unwrap_or_else(|| format!("/models/{}", p.model_dir_name));
+    let model = cli
+        .model
         .clone()
-        .unwrap_or_else(|| p.dtype.to_string());
-    let kv_cache_dtype = cli
-        .kv_cache_dtype
-        .clone()
-        .unwrap_or_else(|| p.kv_cache_dtype.to_string());
-    let gpu_memory_utilization = cli
-        .gpu_memory_utilization
-        .unwrap_or(p.gpu_memory_utilization);
-    let kv_cache_memory_bytes = cli.kv_cache_memory_bytes.unwrap_or(p.kv_cache_memory_bytes);
-    let max_model_len = cli.max_model_len.unwrap_or(p.max_model_len);
-    let max_num_seqs = cli.max_num_seqs.or(p.max_num_seqs);
-    let enforce_eager = cli.enforce_eager || p.enforce_eager;
+        .unwrap_or_else(|| cli.preset.api_model().to_string());
     let concurrency = cli.concurrency.unwrap_or(p.concurrency);
-
-    eprintln!(
-        "preset: {:?} | model {} | concurrency {} | {} KV | KV bytes {} | util {} | max-model-len {} | graphs {}",
-        cli.preset,
-        serve_model,
-        concurrency,
-        kv_cache_dtype,
-        kv_cache_memory_bytes,
-        gpu_memory_utilization,
-        max_model_len,
-        if enforce_eager { "off (eager)" } else { "on" }
-    );
-
-    // Optionally launch (and on exit tear down) the vLLM container ourselves.
     let spec = container::ServeSpec {
         image: cli.image.clone(),
-        host_model_dir: host_model_dir.clone(),
-        host_cache_dir: host_cache_dir.clone(),
-        container_model: serve_model.clone(),
+        host_model_dir,
+        host_cache_dir,
+        container_model: serve_model,
+        model: model.clone(),
         host_port: cli.host_port,
         container_name: cli.container_name.clone(),
-        quantization: cli.quantization.clone(),
-        dtype: dtype.clone(),
-        kv_cache_dtype: kv_cache_dtype.clone(),
-        gpu_memory_utilization,
-        kv_cache_memory_bytes,
-        max_model_len,
-        max_num_seqs,
-        enforce_eager,
+        concurrency,
         health_timeout: cli.health_timeout,
     };
     // Guard stays alive until the end of main → container removed after translation
@@ -297,12 +220,6 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|g| g.endpoint().to_string())
         .unwrap_or_else(|| cli.endpoint.clone());
-    let model = if cli.serve {
-        serve_model.clone()
-    } else {
-        cli.model.clone().unwrap_or_else(|| serve_model.clone())
-    };
-
     let client = build_translation_client(Duration::from_secs(cli.timeout), None)?;
     let cache = if settings.cache_enabled {
         let dir = cli.cache_dir.clone().unwrap_or_else(default_cache_dir);

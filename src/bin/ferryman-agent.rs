@@ -7,7 +7,7 @@ use axum::{Json, Router};
 #[cfg(test)]
 use ferryman::auth::hmac_token;
 use ferryman::auth::{hash_token, verify_pairing_proof};
-use ferryman::preset::{Preset, PresetConfig};
+use ferryman::preset::Preset;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::env;
@@ -24,8 +24,6 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-#[path = "ferryman_agent/gpu_profile.rs"]
-mod gpu_profile;
 #[path = "ferryman_agent/model_manager.rs"]
 mod model_manager;
 
@@ -38,7 +36,7 @@ struct AppState {
     client: reqwest::Client,
     stream_client: reqwest::Client,
     auth: AgentAuth,
-    vllm_endpoint: Arc<str>,
+    orinfer_endpoint: Arc<str>,
 }
 
 #[derive(Clone)]
@@ -263,26 +261,10 @@ enum RuntimeCommand {
         reply: oneshot::Sender<Result<RuntimeStatus, String>>,
     },
     Touch,
-    VllmLog {
+    OrinferLog {
         pid: u32,
         line: String,
     },
-}
-
-/// GPU memory probe state; `Unavailable` keeps the fixed preset values.
-#[derive(Clone, Copy)]
-enum GpuProbe {
-    Pending,
-    Known(gpu_profile::GpuMemory),
-    Unavailable,
-}
-
-/// Probe state for vLLM `--kv-cache-memory-bytes` support; the reference
-/// Jetson build accepts the flag, other builds may not.
-#[derive(Clone, Copy)]
-enum KvFlagProbe {
-    Pending,
-    Known(bool),
 }
 
 struct RuntimeManager {
@@ -301,12 +283,9 @@ struct RuntimeManager {
     started_at: Option<Instant>,
     idle_timeout: Duration,
     start_timeout: Duration,
-    vllm_bin: String,
-    vllm_ld_preload: Option<String>,
-    gpu_probe: GpuProbe,
-    kv_flag_probe: KvFlagProbe,
+    orinfer_bin: String,
     model_root: String,
-    vllm_endpoint: String,
+    orinfer_endpoint: String,
     client: reqwest::Client,
     last_error: Option<String>,
     startup_stage: Option<StartupStage>,
@@ -317,8 +296,8 @@ struct RuntimeManager {
 
 const MAX_RECENT_LOGS: usize = 40;
 const MAX_LOG_LINE_CHARS: usize = 600;
-const EXPECTED_STARTUP_SECONDS: u64 = 360;
-/// While Ready, probe vLLM's `/health` this often. The process-exit poll in
+const EXPECTED_STARTUP_SECONDS: u64 = 15;
+/// While Ready, probe orinfer's `/health` this often. The process-exit poll in
 /// `on_tick` catches a crash; this catches a *wedge* — the process alive but
 /// the server wedged (GPU stuck, deadlocked event loop) — where every proxied
 /// request would otherwise burn its full 190 s timeout against a corpse.
@@ -344,10 +323,9 @@ impl Controller {
     fn spawn(
         idle_timeout: Duration,
         start_timeout: Duration,
-        vllm_bin: String,
-        vllm_ld_preload: Option<String>,
+        orinfer_bin: String,
         model_root: String,
-        vllm_endpoint: String,
+        orinfer_endpoint: String,
         client: reqwest::Client,
     ) -> Self {
         let active_requests = Arc::new(AtomicUsize::new(0));
@@ -384,12 +362,9 @@ impl Controller {
             started_at: None,
             idle_timeout,
             start_timeout,
-            vllm_bin,
-            vllm_ld_preload,
-            gpu_probe: GpuProbe::Pending,
-            kv_flag_probe: KvFlagProbe::Pending,
+            orinfer_bin,
             model_root,
-            vllm_endpoint,
+            orinfer_endpoint,
             client,
             last_error: None,
             startup_stage: None,
@@ -491,7 +466,7 @@ impl RuntimeManager {
                 self.last_activity = Instant::now();
                 self.publish();
             }
-            RuntimeCommand::VllmLog { pid, line } => {
+            RuntimeCommand::OrinferLog { pid, line } => {
                 if self.child.as_ref().and_then(Child::id) != Some(pid) {
                     return;
                 }
@@ -558,61 +533,6 @@ impl RuntimeManager {
         message
     }
 
-    /// Sizes the vLLM launch from the GPU that is actually present. Probes are
-    /// refreshed before every launch; when the hardware cannot be probed the
-    /// fixed preset values stay in effect.
-    async fn size_launch(
-        &mut self,
-        model_path: &str,
-        cfg: &PresetConfig,
-    ) -> Result<gpu_profile::LaunchProfile, String> {
-        {
-            self.gpu_probe = match gpu_profile::detect_gpu_memory().await {
-                Some(memory) => GpuProbe::Known(memory),
-                None => {
-                    warn!("GPU memory probe unavailable; fixed preset values stay in effect");
-                    GpuProbe::Unavailable
-                }
-            };
-        }
-        let kv_flag_supported = match env::var("FERRYMAN_VLLM_KV_CACHE_FLAG").as_deref() {
-            Ok("0") => false,
-            Ok("1") => true,
-            _ => match self.kv_flag_probe {
-                KvFlagProbe::Known(value) => value,
-                KvFlagProbe::Pending => {
-                    let value = gpu_profile::detect_kv_flag_supported(&self.vllm_bin)
-                        .await
-                        .unwrap_or(true);
-                    self.kv_flag_probe = KvFlagProbe::Known(value);
-                    value
-                }
-            },
-        };
-        match (
-            self.gpu_probe,
-            gpu_profile::weights_bytes(FsPath::new(model_path)).await,
-        ) {
-            (GpuProbe::Known(memory), Some(weights)) => {
-                let launch =
-                    gpu_profile::derive_launch_profile(cfg, weights, &memory, kv_flag_supported)?;
-                info!(
-                    utilization = launch.gpu_memory_utilization,
-                    kv_cache_bytes = ?launch.kv_cache_memory_bytes,
-                    weights_bytes = weights,
-                    total_bytes = memory.total,
-                    free_bytes = memory.free,
-                    "sized vLLM launch from GPU memory"
-                );
-                Ok(launch)
-            }
-            _ => Ok(gpu_profile::LaunchProfile {
-                gpu_memory_utilization: cfg.gpu_memory_utilization,
-                kv_cache_memory_bytes: kv_flag_supported.then_some(cfg.kv_cache_memory_bytes),
-            }),
-        }
-    }
-
     async fn start_child(&mut self, preset: Preset) -> Result<(), String> {
         let cfg = preset.config();
         let model_path = format!(
@@ -620,6 +540,7 @@ impl RuntimeManager {
             self.model_root.trim_end_matches('/'),
             cfg.model_dir_name
         );
+
         if !FsPath::new(&model_path).exists() {
             let message = format!("model directory not found: {model_path}");
             return Err(self.fail_start(preset, message));
@@ -629,53 +550,48 @@ impl RuntimeManager {
         self.preset = Some(preset);
         self.started_at = Some(Instant::now());
         self.publish();
-        let probe_timeout = self.start_timeout.min(Duration::from_secs(15));
-        let launch = tokio::time::timeout(probe_timeout, self.size_launch(&model_path, &cfg))
-            .await
-            .map_err(|_| self.fail_start(preset, "GPU/vLLM capability probe timed out".into()))?
-            .map_err(|message| self.fail_start(preset, message))?;
-
-        let mut command = Command::new(&self.vllm_bin);
+        let listen = reqwest::Url::parse(&self.orinfer_endpoint).map_err(|error| {
+            self.fail_start(preset, format!("invalid orinfer endpoint: {error}"))
+        })?;
+        let host = listen
+            .host_str()
+            .unwrap_or("127.0.0.1")
+            .trim_matches(['[', ']']);
+        if listen.scheme() != "http"
+            || !(host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback()))
+        {
+            return Err(self.fail_start(
+                preset,
+                "orinfer must listen on a private loopback address".into(),
+            ));
+        }
+        let host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        let mut command = Command::new(&self.orinfer_bin);
         command
             .arg("serve")
             .arg(&model_path)
-            .args(["--served-model-name", preset.api_model()])
-            .args(["--host", "127.0.0.1", "--port", "8001"])
-            .args(["--dtype", cfg.dtype])
-            .args(["--kv-cache-dtype", cfg.kv_cache_dtype])
+            .args(["--model", preset.api_model()])
             .args([
-                "--gpu-memory-utilization",
-                &launch.gpu_memory_utilization.to_string(),
-            ]);
-        if let Some(kv_bytes) = launch.kv_cache_memory_bytes {
-            command.args(["--kv-cache-memory-bytes", &kv_bytes.to_string()]);
-        }
-        command
-            .args(["--max-model-len", &cfg.max_model_len.to_string()])
-            .arg("--enable-prefix-caching")
+                "--listen",
+                &format!("{host}:{}", listen.port_or_known_default().unwrap_or(18088)),
+            ])
+            .args(["--max-active-requests", &cfg.concurrency.to_string()])
+            .args(["--prefix-cache-mib", "1024"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if let Some(max_num_seqs) = cfg.max_num_seqs {
-            command.args(["--max-num-seqs", &max_num_seqs.to_string()]);
-        }
-        if cfg.enforce_eager {
-            command.arg("--enforce-eager");
-        }
-        // The Jetson image resolves the NVIDIA aarch64 libcuda only through an
-        // explicit preload; FERRYMAN_VLLM_LD_PRELOAD overrides it, and an empty
-        // value clears it for non-Jetson base images.
-        command.env(
-            "LD_PRELOAD",
-            self.vllm_ld_preload
-                .as_deref()
-                .unwrap_or("/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1"),
-        );
         command.process_group(0);
 
         let mut child = command
             .spawn()
-            .map_err(|error| self.fail_start(preset, format!("start vLLM: {error}")))?;
+            .map_err(|error| self.fail_start(preset, format!("start orinfer: {error}")))?;
         let pid = child.id().unwrap_or_default();
         if let Some(stdout) = child.stdout.take() {
             tokio::spawn(pipe_logs(stdout, pid, "stdout", self.commands.clone()));
@@ -684,7 +600,7 @@ impl RuntimeManager {
             tokio::spawn(pipe_logs(stderr, pid, "stderr", self.commands.clone()));
         }
 
-        info!(%preset, pid, "vLLM process started");
+        info!(%preset, pid, "orinfer process started");
         self.process_group = rustix::process::Pid::from_raw(pid as i32);
         self.child = Some(child);
         self.phase = RuntimePhase::Starting;
@@ -709,6 +625,11 @@ impl RuntimeManager {
             self.phase = RuntimePhase::Stopped;
             self.preset = None;
             self.last_error = None;
+            self.started_at = None;
+            self.startup_stage = None;
+            self.startup_progress = 0;
+            self.startup_elapsed_seconds = None;
+            self.recent_logs.clear();
             self.publish();
             return Ok(());
         };
@@ -736,7 +657,7 @@ impl RuntimeManager {
         if let Some(pid) = group {
             let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         }
-        info!(pid, "vLLM process stopped");
+        info!(pid, "orinfer process stopped");
         self.phase = RuntimePhase::Stopped;
         self.preset = None;
         self.last_error = None;
@@ -761,7 +682,7 @@ impl RuntimeManager {
                     }
                     self.child = None;
                     self.phase = RuntimePhase::Failed;
-                    self.last_error = Some(format!("vLLM exited with {status}"));
+                    self.last_error = Some(format!("orinfer exited with {status}"));
                     self.startup_elapsed_seconds =
                         self.started_at.map(|started| started.elapsed().as_secs());
                     self.started_at = None;
@@ -772,7 +693,7 @@ impl RuntimeManager {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    warn!(%error, "could not poll vLLM process");
+                    warn!(%error, "could not poll orinfer process");
                 }
             }
         }
@@ -783,7 +704,7 @@ impl RuntimeManager {
             self.last_health_check = Instant::now();
             let health = self
                 .client
-                .get(format!("{}/health", self.vllm_endpoint))
+                .get(format!("{}/health", self.orinfer_endpoint))
                 .timeout(Duration::from_secs(2))
                 .send()
                 .await;
@@ -796,7 +717,7 @@ impl RuntimeManager {
                 self.started_at = None;
                 self.startup_stage = Some(StartupStage::Ready);
                 self.startup_progress = 100;
-                info!(preset = ?self.preset, "vLLM is ready");
+                info!(preset = ?self.preset, "orinfer is ready");
                 self.publish();
             }
         }
@@ -811,7 +732,7 @@ impl RuntimeManager {
             self.last_health_check = Instant::now();
             let health = self
                 .client
-                .get(format!("{}/health", self.vllm_endpoint))
+                .get(format!("{}/health", self.orinfer_endpoint))
                 .timeout(READY_PROBE_TIMEOUT)
                 .send()
                 .await;
@@ -822,7 +743,7 @@ impl RuntimeManager {
                 warn!(
                     failures = self.ready_probe_failures,
                     limit = READY_PROBE_FAILURE_LIMIT,
-                    "vLLM health probe failed while ready"
+                    "orinfer health probe failed while ready"
                 );
                 if self.ready_probe_failures >= READY_PROBE_FAILURE_LIMIT {
                     let preset = self.preset;
@@ -836,11 +757,11 @@ impl RuntimeManager {
                     self.startup_elapsed_seconds = startup_elapsed_seconds;
                     self.recent_logs = recent_logs;
                     self.last_error = Some(format!(
-                        "vLLM health check failed {} consecutive times while ready",
+                        "orinfer health check failed {} consecutive times while ready",
                         self.ready_probe_failures
                     ));
                     self.ready_probe_failures = 0;
-                    error!(preset = ?self.preset, "vLLM wedged while ready; runtime failed");
+                    error!(preset = ?self.preset, "orinfer wedged while ready; runtime failed");
                     self.publish();
                     return;
                 }
@@ -866,7 +787,7 @@ impl RuntimeManager {
             self.startup_elapsed_seconds = startup_elapsed_seconds;
             self.recent_logs = recent_logs;
             self.last_error = Some(format!(
-                "vLLM did not become ready within {} seconds",
+                "orinfer did not become ready within {} seconds",
                 self.start_timeout.as_secs()
             ));
             self.publish();
@@ -898,7 +819,7 @@ impl RuntimeManager {
             self.recent_logs.pop_front();
         }
         self.recent_logs.push_back(line.clone());
-        info!(target = "vllm", "{line}");
+        info!(target = "orinfer", "{line}");
 
         if self.phase == RuntimePhase::Starting {
             if let Some((stage, progress)) = parse_startup_signal(&line) {
@@ -965,7 +886,7 @@ async fn pipe_logs<R>(
             Ok(0) => break,
             Ok(count) => count,
             Err(error) => {
-                warn!(%error, stream, "could not read vLLM log stream");
+                warn!(%error, stream, "could not read orinfer log stream");
                 break;
             }
         };
@@ -975,7 +896,7 @@ async fn pipe_logs<R>(
                     let line = String::from_utf8_lossy(&pending).into_owned();
                     pending.clear();
                     if commands
-                        .send(RuntimeCommand::VllmLog { pid, line })
+                        .send(RuntimeCommand::OrinferLog { pid, line })
                         .await
                         .is_err()
                     {
@@ -988,7 +909,7 @@ async fn pipe_logs<R>(
                     let line = String::from_utf8_lossy(&pending).into_owned();
                     pending.clear();
                     if commands
-                        .send(RuntimeCommand::VllmLog { pid, line })
+                        .send(RuntimeCommand::OrinferLog { pid, line })
                         .await
                         .is_err()
                     {
@@ -1000,7 +921,9 @@ async fn pipe_logs<R>(
     }
     if !pending.is_empty() {
         let line = String::from_utf8_lossy(&pending).into_owned();
-        let _ = commands.send(RuntimeCommand::VllmLog { pid, line }).await;
+        let _ = commands
+            .send(RuntimeCommand::OrinferLog { pid, line })
+            .await;
     }
 }
 
@@ -1050,7 +973,7 @@ fn parse_startup_signal(line: &str) -> Option<(StartupStage, u8)> {
     }
     if lower.contains("application startup complete")
         || lower.contains("uvicorn running")
-        || lower.contains("starting vllm api server")
+        || lower.contains("starting orinfer api server")
         || lower.contains("available routes")
     {
         return Some((StartupStage::StartingServer, 98));
@@ -1118,7 +1041,9 @@ async fn runtime_status(State(state): State<AppState>) -> Response {
 }
 
 async fn model_catalog(State(state): State<AppState>) -> Response {
-    Json(state.models.catalog().await).into_response()
+    let catalog = state.models.catalog().await;
+
+    Json(catalog).into_response()
 }
 
 async fn start_model_download(
@@ -1271,18 +1196,18 @@ async fn proxy_chat(State(state): State<AppState>, body: Bytes) -> Response {
         &state.client
     };
     let request = match client
-        .post(format!("{}/v1/chat/completions", state.vllm_endpoint))
+        .post(format!("{}/v1/chat/completions", state.orinfer_endpoint))
         .header(header::CONTENT_TYPE, "application/json")
         .body(body)
         .build()
     {
         Ok(request) => request,
         Err(error) => {
-            error!(%error, "build vLLM request");
+            error!(%error, "build orinfer request");
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorBody {
-                    error: format!("build vLLM request: {error}"),
+                    error: format!("build orinfer request: {error}"),
                 }),
             )
                 .into_response();
@@ -1326,7 +1251,7 @@ async fn proxy_chat(State(state): State<AppState>, body: Bytes) -> Response {
                     Err(error) => (
                         StatusCode::BAD_GATEWAY,
                         Json(ErrorBody {
-                            error: format!("read vLLM response: {error}"),
+                            error: format!("read orinfer response: {error}"),
                         }),
                     )
                         .into_response(),
@@ -1336,7 +1261,7 @@ async fn proxy_chat(State(state): State<AppState>, body: Bytes) -> Response {
         Err(error) => (
             StatusCode::BAD_GATEWAY,
             Json(ErrorBody {
-                error: format!("vLLM request failed: {error}"),
+                error: format!("orinfer request failed: {error}"),
             }),
         )
             .into_response(),
@@ -1367,22 +1292,20 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(600)
         .max(30);
-    let vllm_bin = env::var("FERRYMAN_VLLM_BIN").unwrap_or_else(|_| "vllm".into());
-    let vllm_ld_preload = env::var("FERRYMAN_VLLM_LD_PRELOAD").ok();
+    let orinfer_bin = env::var("FERRYMAN_ORINFER_BIN").unwrap_or_else(|_| "orinfer".into());
     let model_root = env::var("FERRYMAN_MODEL_ROOT").unwrap_or_else(|_| "/models".into());
     let cache_root = env::var("FERRYMAN_CACHE_ROOT").unwrap_or_else(|_| "/root/.cache".into());
-    let vllm_endpoint =
-        env::var("FERRYMAN_VLLM_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:8001".into());
+    let orinfer_endpoint =
+        env::var("FERRYMAN_ORINFER_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:18088".into());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(190))
         .build()?;
     let controller = Controller::spawn(
         Duration::from_secs(idle_timeout),
         Duration::from_secs(start_timeout),
-        vllm_bin,
-        vllm_ld_preload,
+        orinfer_bin,
         model_root.clone(),
-        vllm_endpoint.clone(),
+        orinfer_endpoint.clone(),
         client.clone(),
     );
     let models = ModelManager::new_background(model_root.into(), cache_root.into())
@@ -1394,7 +1317,7 @@ async fn main() -> anyhow::Result<()> {
         client,
         stream_client: streaming_client()?,
         auth,
-        vllm_endpoint: Arc::from(vllm_endpoint),
+        orinfer_endpoint: Arc::from(orinfer_endpoint),
     };
     let app = agent_router(state);
 
@@ -1405,14 +1328,14 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
             // Stop generation before draining HTTP connections: an SSE stream
-            // can remain open indefinitely while its vLLM process is alive.
+            // can remain open indefinitely while its orinfer process is alive.
             if let Err(error) = shutdown_controller.stop(true).await {
-                warn!(%error, "could not stop vLLM during shutdown");
+                warn!(%error, "could not stop orinfer during shutdown");
             }
         })
         .await?;
     if let Err(error) = controller.stop(true).await {
-        warn!(%error, "could not stop vLLM during shutdown");
+        warn!(%error, "could not stop orinfer during shutdown");
     }
     Ok(())
 }
@@ -1494,7 +1417,7 @@ mod tests {
         let (commands, _receiver) = mpsc::channel(8);
         let (_, status) = watch::channel(RuntimeStatus {
             state: RuntimePhase::Ready,
-            preset: Some(Preset::SevenBFp8),
+            preset: Some(Preset::Index2B),
             pid: None,
             active_requests: 0,
             leases: 0,
@@ -1525,7 +1448,7 @@ mod tests {
             auth: AgentAuth::load(Some("stream-regression-token".into()), None)
                 .await
                 .unwrap(),
-            vllm_endpoint: Arc::from(endpoint),
+            orinfer_endpoint: Arc::from(endpoint),
         };
         let response = proxy_chat(
             State(state.clone()),
@@ -1632,7 +1555,7 @@ mod tests {
             client: reqwest::Client::new(),
             stream_client: reqwest::Client::new(),
             auth: AgentAuth::load(Some(token.into()), None).await.unwrap(),
-            vllm_endpoint: Arc::from("http://127.0.0.1:1"),
+            orinfer_endpoint: Arc::from("http://127.0.0.1:1"),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -1642,8 +1565,8 @@ mod tests {
         for path in [
             "/runtime/acquire",
             "/runtime/stop",
-            "/models/7b-fp8/download",
-            "/models/7b-fp8/pause",
+            "/models/index-translate-2b/download",
+            "/models/index-translate-2b/pause",
             "/model-sources/benchmark",
             "/v1/chat/completions",
         ] {

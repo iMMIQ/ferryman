@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Standalone only. Lazycat keeps its native buildscript / embedded-image flow.
-ARG VLLM_BASE_IMAGE=docker.io/catdogai/lzc-aipod-vllm:agxorin-cu126-src-18f658bb3185-20260703@sha256:079f2ab5a3f19da5fbdf930476fed73625c3d47085407280fbee48c4293279be
+# Runtime uses the CUDA driver supplied by the NVIDIA container runtime.
 
 FROM node:22.16.0-bookworm-slim@sha256:048ed02c5fd52e86fda6fbd2f6a76cf0d4492fd6c6fee9e2c463ed5108da0e34 AS frontend
 WORKDIR /frontend
@@ -46,15 +46,24 @@ ENV FERRYMAN_WEB_LISTEN=0.0.0.0:8080 \
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/ferryman-web"]
 
-FROM ${VLLM_BASE_IMAGE} AS agent
+# Orinfer publishes aarch64 binaries; execution packages are installed at build time.
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS orinfer-bundle
+RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates qemu-user libc6-arm64-cross libgcc-s1-arm64-cross && rm -rf /var/lib/apt/lists/*
+COPY scripts/bundle-orinfer.py scripts/orinfer-release.json /build/
+RUN python3 /build/bundle-orinfer.py /opt/orinfer
+
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS agent
 COPY --from=agent-binary /out/ferryman-agent /usr/local/bin/ferryman-agent
-ENV FERRYMAN_AGENT_LISTEN=0.0.0.0:8090 \
+COPY --from=orinfer-bundle /opt/orinfer /opt/orinfer
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
+ENV PATH=/opt/orinfer/bin:$PATH \
+    ORINFER_EXECUTION_CACHE=/opt/orinfer/packages \
+    FERRYMAN_AGENT_LISTEN=0.0.0.0:8090 \
     FERRYMAN_MODEL_ROOT=/models \
+    FERRYMAN_ORINFER_ENDPOINT=http://127.0.0.1:18088 \
     FERRYMAN_IDLE_TIMEOUT_SECONDS=600 \
-    RUST_LOG=info \
-    LD_PRELOAD= \
-    VLLM_CONFIGURE_LOGGING=0 \
-    VLLM_DO_NOT_TRACK=1 \
-    VLLM_NO_USAGE_STATS=1
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    RUST_LOG=info
 EXPOSE 8090
 ENTRYPOINT ["/usr/local/bin/ferryman-agent"]

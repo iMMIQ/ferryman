@@ -5,14 +5,22 @@ Ferryman has two independent Lazycat delivery products:
 | Product | Compilation target | Contents | Execution location |
 | --- | --- | --- | --- |
 | Web LPK | `x86_64-unknown-linux-gnu` | scratch image with Web, assets, fonts, CA certificates and glibc runtime | MicroServer |
-| AI Pod resource LPK | `aarch64-unknown-linux-gnu` | `agxorin/docker-compose.yml`, Agent executable, `config/aipod.yml` | AGX Orin AI Pod |
+| AI Pod resource LPK | `aarch64-unknown-linux-gnu` | Compose, Agent, Orinfer 0.2.0 engine release, three installed Index execution packages, `config/aipod.yml` | AGX Orin AI Pod |
 
 The Agent resource package requires **LZCOS 1.5.2 or newer**. Thor is not supported
-by this release: it needs its own tested CUDA/vLLM environment and `thor/` compose.
-The large vLLM image and model weights are not embedded in either LPK. The AI Pod
-pulls the digest-pinned image; models and caches use the platform's persistent
-data/cache directories. Agent `/healthz` means the controller is available, not
-that an on-demand model is already loaded.
+by this release. The AI Pod uses a digest-pinned Debian runtime and the host's
+NVIDIA CUDA driver. `FERRYMAN_RUNTIME_IMAGE` can select an already verified local
+image for offline deployment; its default remains the pinned Debian release. The engine and Index 2B/9B/35B execution packages are bundled
+in the resource LPK; weights are downloaded separately into
+`${LZC_AGENT_DATA_DIR}/models`. Agent `/healthz` reports controller availability.
+
+`bundle-orinfer.py` verifies the four archives against `orinfer-release.json`,
+extracts the engine and runs `orinfer package install` during the build. Runtime
+reads `/opt/orinfer/packages` directly from the read-only resource. The bundle
+retains release archives, sources, licenses and checksums. Set
+`ORINFER_RELEASE_DIR=/path/to/orinfer/artifacts/releases/v0.2.0` to use local
+release assets; otherwise the builder downloads the exact GitHub release assets.
+On x86 builders, `qemu-aarch64` and `/usr/aarch64-linux-gnu` run the ARM64 installer.
 
 ## Build prerequisites
 
@@ -25,7 +33,7 @@ On Ubuntu 22.04 (the release CI environment):
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y gcc-x86-64-linux-gnu gcc-aarch64-linux-gnu \
+sudo apt-get install -y gcc-x86-64-linux-gnu gcc-aarch64-linux-gnu qemu-user \
   fonts-noto-cjk fonts-noto-core fonts-dejavu-core ca-certificates
 python3 -m pip install -r scripts/requirements-build.txt
 nvm install
@@ -38,7 +46,7 @@ The Web build resolves runtime libraries using the selected compiler's
 are explicit Debian/Ubuntu package paths; all
 seven fonts and their licenses are required. Missing runtime inputs fail before
 compilation. Agent builds using a newer host/sysroot are rejected if they require
-glibc symbols newer than the pinned vLLM runtime's glibc 2.35.
+glibc symbols newer than the release baseline glibc 2.35.
 
 Toolchains, lockfiles and container base digests are pinned. Host apt packages
 are not snapshot-pinned, so this is **not a bit-for-bit reproducible build**.
@@ -110,11 +118,11 @@ docker buildx build -f docker/Dockerfile --target web --load -t ferryman-web:che
 python3 scripts/smoke-image.py web ferryman-web:check
 ```
 
-The default Agent image is AGX Orin-specific. Non-Jetson standalone deployments
-must select a compatible `VLLM_BASE_IMAGE` and configure `FERRYMAN_VLLM_LD_PRELOAD`
-as described in the README. Updating a base digest is a deliberate dependency
-update requiring a fresh runtime smoke test; GPU base changes also require a
-real model load/inference test. Do not substitute a newer vLLM tag automatically.
+The Agent image targets ARM64 AGX Orin / SM87. Its build installs the same
+fixed engine and execution packages as the AI Pod LPK. Ferryman starts and
+stops its own model child process, which listens on container loopback
+`127.0.0.1:18088`. The deployment publishes no inference port and never connects
+to a host inference service. Model downloads persist under `/models`.
 
 ## Measure changes
 

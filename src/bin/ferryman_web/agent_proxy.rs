@@ -464,7 +464,7 @@ mod tests {
 
         acquire_agent_with_retry(
             &config,
-            Preset::SevenBFp8,
+            Preset::Index2B,
             "job-test",
             &CancellationToken::new(),
         )
@@ -495,7 +495,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            wait_for_agent(&config, Preset::SevenBFp8, "job-test", &cancel),
+            wait_for_agent(&config, Preset::Index2B, "job-test", &cancel),
         )
         .await
         .expect("cancellation should not wait for an HTTP timeout");

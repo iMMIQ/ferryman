@@ -1,10 +1,10 @@
-//! vLLM (OpenAI-compatible) translation client.
+//! Orinfer OpenAI-compatible translation client.
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-pub(crate) const TRANSLATION_CACHE_VERSION: &str = "v2-complete-context";
+pub(crate) const TRANSLATION_CACHE_VERSION: &str = "v3-index-orinfer";
 
 #[derive(Serialize)]
 struct ChatReq<'a> {
@@ -14,11 +14,8 @@ struct ChatReq<'a> {
     top_p: f32,
     top_k: i32,
     repetition_penalty: f32,
-    // Omitted → vLLM defaults to `max_model_len - prompt_len` (computed server-side
-    // with its tokenizer). A fixed value can't be safe across presets: the 30B
-    // preset's context is 4096, so a fixed max_tokens of 4096 leaves zero room for
-    // the prompt and every request fails with HTTP 400. Letting vLLM derive it
-    // fits any context length / input language without truncating short of it.
+    enable_thinking: bool,
+    // Orinfer derives the output budget from the remaining context (up to 8192 tokens).
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
 }
@@ -45,8 +42,7 @@ struct RespMsg {
     content: Option<String>,
 }
 
-/// Translate `text` into `target_lang` using the official Hy-MT2 "Default
-/// Translation" prompt and recommended sampling params (for the 7B model).
+/// Translate `text` into `target_lang` with Index translation models.
 ///
 /// Retries a few times on transient HTTP / parse errors. A segment longer
 /// than the model's whole context window is split in half at a language
@@ -94,10 +90,11 @@ async fn translate_single(
             role: "user",
             content: prompt,
         }],
-        temperature: 0.7,
-        top_p: 0.6,
-        top_k: 20,
-        repetition_penalty: 1.05,
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        repetition_penalty: 1.0,
+        enable_thinking: false,
         max_tokens: None,
     };
 
@@ -334,6 +331,7 @@ struct SliceOutcome {
 fn is_context_overflow(err: &str) -> bool {
     const PATTERNS: &[&str] = &[
         "context length",
+        "context_length_exceeded",
         "input prompt",
         "context window",
         "token limit",
@@ -502,20 +500,12 @@ async fn translate_one_batch(
             role: "user",
             content: prompt,
         }],
-        temperature: 0.7,
-        top_p: 0.6,
-        top_k: 20,
-        repetition_penalty: 1.05,
-        // Omitted on purpose — same rationale as the Single `translate()` path
-        // (see the `ChatReq.max_tokens` note above). A fixed cap is unsafe here:
-        // TXT novels batch 25 long paragraphs whose prompt alone can exceed 2048
-        // tokens, so a `max_tokens` of 2048 overflows the 30B preset's 4096
-        // context and vLLM 400s the whole request, dropping all 25 cues. Letting
-        // vLLM derive `max_model_len - prompt_len` fits any input that fits the
-        // window at all; a prompt that still overflows the whole window is
-        // recovered by `translate_split` halving the batch. The runaway risk a
-        // cap once guarded is already handled by `sanitize_for_model` (collapsing
-        // repetitive char runs) plus the server-side context limit.
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        repetition_penalty: 1.0,
+        enable_thinking: false,
+        // Use the server context budget; length responses trigger bounded splitting.
         max_tokens: None,
     };
 
@@ -582,12 +572,7 @@ async fn translate_one_batch(
 
 /// Build a delimiter-tagged prompt for a subtitle batch.
 ///
-/// Wraps each cue in a unique `<cN>…</cN>` tag and instructs the model to
-/// preserve the tags exactly — this is Hy-MT2's **trained** "Delimiters" format
-/// (see the model card's Delimiters template), so the model keeps a strict 1:1
-/// count and placement. An earlier `#N` numbered-list format drifted badly on
-/// messy ASR input (the model decorated markers as `#14>` / `#19>content`,
-/// breaking alignment 0/3); the tagged format is 3/3 on the same batch.
+/// Wrap each segment in a unique tag so output can be aligned and retried.
 ///
 /// Up to `context` preceding cues ride along as an untagged `Context:` section
 /// for fluency (not translated, not parsed).
@@ -623,7 +608,7 @@ fn build_batch_prompt(cues: &[&str], context: &[&str], target: &str) -> String {
 /// Collapse any run of more than `CAP` identical characters down to `CAP`.
 ///
 /// ASR artifacts — a sustained vowel transcribed as 100+ copies of one char,
-/// or a stutter jam — make Hy-MT2 loop on the same token without emitting EOS
+/// or a stutter jam — make the model loop on the same token without emitting EOS
 /// (a 177×`あ` cue ran the decoder to the `max_tokens` cap, ~106s, before it
 /// stopped). Trimming the run keeps the cue meaningful (a drawn-out sound stays
 /// drawn-out, just bounded) and the model terminates normally. Applied only to

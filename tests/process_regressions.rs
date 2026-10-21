@@ -75,6 +75,47 @@ impl Drop for Agent {
     }
 }
 impl Agent {
+    async fn batch_lease(&self) {
+        assert_eq!(
+            self.post(
+                "/runtime/acquire",
+                serde_json::json!({
+                    "preset":"index-translate-2b", "lease_id":"test", "mode":"batch"
+                })
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            202
+        );
+    }
+
+    fn jsonl_engine(&self) -> ferryman::engine::Engine {
+        let client = ferryman::engine::build_translation_client(
+            Duration::from_secs(10),
+            Some("isolated-regression-token"),
+        )
+        .unwrap();
+        ferryman::engine::Engine::new(
+            client.clone(),
+            self.origin.clone(),
+            "index-translate-2b".into(),
+            "中文".into(),
+            32,
+            None,
+        )
+        .with_checkpoint(ferryman::cache::Cache::open(Some(
+            self.root.path().join("checkpoint"),
+        )))
+        .with_jsonl(ferryman::jsonl::JsonlBackend {
+            client,
+            endpoint: self.origin.clone(),
+            preset: ferryman::preset::Preset::Index2B,
+            lease_id: "test".into(),
+        })
+    }
+
     async fn start(mode: &str) -> Self {
         Self::start_with_endpoint(mode, "http://127.0.0.1:1").await
     }
@@ -106,6 +147,9 @@ impl Agent {
             r#"#!/bin/sh
 printf '%s\n' "$@" > "$FIXTURE_ROOT/args"
 echo $$ > "$FIXTURE_ROOT/model.pid"
+if [ "$FIXTURE_MODE" = jsonl ]; then
+  exec python3 "$FIXTURE_ORINFER" "$@"
+fi
 if [ "$FIXTURE_MODE" = orphan ]; then
   sleep 120 & echo $! > "$FIXTURE_ROOT/worker.pid"
   exit 7
@@ -124,6 +168,10 @@ exec sleep 120
             )
             .env("FIXTURE_ROOT", r)
             .env("FIXTURE_MODE", mode)
+            .env(
+                "FIXTURE_ORINFER",
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_orinfer.py"),
+            )
             .env("FERRYMAN_AGENT_LISTEN", address.to_string())
             .env("FERRYMAN_AGENT_TOKEN", "isolated-regression-token")
             .env("FERRYMAN_MODEL_ROOT", r.join("models"))
@@ -182,6 +230,372 @@ exec sleep 120
             .status()
             .is_success());
     }
+}
+
+#[tokio::test]
+async fn jsonl_preserves_alignment_checkpoints_and_recovers_truncated_batches() {
+    use ferryman::engine::Unit;
+    use tokio_util::sync::CancellationToken;
+    let agent = Agent::start("jsonl").await;
+    agent.batch_lease().await;
+    assert!(
+        !agent.root.path().join("model.pid").exists(),
+        "batch lease must not load an HTTP model"
+    );
+    let engine = agent.jsonl_engine();
+    let units = vec![
+        Unit::Single {
+            file: 0,
+            id: 0,
+            text: "First paragraph.".into(),
+        },
+        Unit::Single {
+            file: 0,
+            id: 1,
+            text: "Second paragraph.".into(),
+        },
+        Unit::Batch {
+            file: 0,
+            ids: vec![2, 3],
+            cues: vec!["<truncate>Third.".into(), "Fourth.".into()],
+            context: vec!["Read-only context".into()],
+        },
+    ];
+    let mut results = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        engine.exec_jsonl_units(units.clone(), CancellationToken::new(), |done| {
+            results.extend(done.pairs)
+        }),
+    )
+    .await
+    .unwrap();
+    results.sort();
+    assert_eq!(
+        results,
+        vec![
+            (0, "译文:First paragraph.".into()),
+            (1, "译文:Second paragraph.".into()),
+            (2, "译文:<truncate>Third.".into()),
+            (3, "译文:Fourth.".into())
+        ]
+    );
+    let runs = fs::read_to_string(agent.root.path().join("runs.jsonl")).unwrap();
+    let runs: Vec<serde_json::Value> = runs
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        runs[0]["requests"].as_array().unwrap().len(),
+        3,
+        "document requests should share one input file"
+    );
+    assert!(
+        runs.len() >= 2,
+        "truncated rows must generate a new recovery round"
+    );
+    let invocations = runs.len();
+    engine
+        .exec_jsonl_units(units, CancellationToken::new(), |_| {})
+        .await;
+    assert_eq!(
+        fs::read_to_string(agent.root.path().join("runs.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        invocations,
+        "checkpoint hits must bypass inference"
+    );
+    let status: serde_json::Value = agent
+        .request("/runtime")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(status["pid"].is_null());
+    assert_eq!(status["active_requests"], 0);
+    let batches = agent.root.path().join("cache/batches");
+    assert_eq!(
+        fs::read_dir(batches).unwrap().count(),
+        0,
+        "spooled document contents must be removed"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_jsonl_reaps_the_model_and_preserves_completed_units() {
+    use ferryman::engine::Unit;
+    use tokio_util::sync::CancellationToken;
+    let agent = Agent::start("jsonl").await;
+    agent.batch_lease().await;
+    let engine = agent.jsonl_engine();
+    let cancel = CancellationToken::new();
+    let mut results = Vec::new();
+    // The fixture completes in reverse order, then blocks on the first row.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        engine.exec_jsonl_units(
+            vec![
+                Unit::Single {
+                    file: 0,
+                    id: 0,
+                    text: "<delay>pending".into(),
+                },
+                Unit::Single {
+                    file: 0,
+                    id: 1,
+                    text: "Completed.".into(),
+                },
+            ],
+            cancel.clone(),
+            |done| {
+                results.extend(done.pairs);
+                cancel.cancel();
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(results, vec![(1, "译文:Completed.".into())]);
+    let status: serde_json::Value = agent
+        .request("/runtime")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(status["pid"].is_null());
+    assert_eq!(status["active_requests"], 0);
+    assert_eq!(
+        fs::read_dir(agent.root.path().join("cache/batches"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn jsonl_document_pipeline_writes_each_file_in_source_order() {
+    use ferryman::batch::{run_batch_controlled, BatchOpts};
+    use ferryman::format::OutputMode;
+    use std::sync::Arc;
+    let agent = Agent::start("jsonl").await;
+    agent.batch_lease().await;
+    let first = agent.root.path().join("first.txt");
+    let second = agent.root.path().join("second.txt");
+    fs::write(&first, "Alpha.\nBeta.\n").unwrap();
+    fs::write(&second, "Gamma.\nDelta.\n").unwrap();
+    let engine = agent.jsonl_engine();
+    let summary = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_batch_controlled(
+            &engine,
+            vec![first, second],
+            BatchOpts {
+                mode: OutputMode::Replace,
+                in_place: false,
+                output: None,
+                batch_size: 1,
+                context: 1,
+                limit: None,
+                prompt_char_budget: 0,
+            },
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(|_| {}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.ok_files, 2);
+    assert_eq!(summary.translated, 4);
+    assert_eq!(summary.failed, 0);
+    assert!(summary.failed_files.is_empty());
+    for (file, left, right) in [
+        ("first.translated.txt", "Alpha.", "Beta."),
+        ("second.translated.txt", "Gamma.", "Delta."),
+    ] {
+        let output = fs::read_to_string(agent.root.path().join(file)).unwrap();
+        assert!(
+            output.find(&format!("译文:{left}")).unwrap()
+                < output.find(&format!("译文:{right}")).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn jsonl_submit_is_idempotent_and_requires_a_batch_lease() {
+    let agent = Agent::start("jsonl").await;
+    let path = format!("/batch/jobs/{}", uuid::Uuid::new_v4());
+    let body = serde_json::json!({"preset":"index-translate-2b", "lease_id":"test", "requests":[{
+        "custom_id":"one", "body":{"model":"index-translate-2b", "enable_thinking":false, "messages":[{"role":"user","content":"<delay>"}]}
+    }]});
+    assert_eq!(
+        agent
+            .post(&path, body.clone())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    agent.batch_lease().await;
+    assert_eq!(
+        agent
+            .post(&path, body.clone())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    assert_eq!(
+        agent
+            .post(&path, body.clone())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    let mut changed = body.clone();
+    changed["requests"][0]["body"]["messages"][0]["content"] = "different".into();
+    assert_eq!(
+        agent.post(&path, changed).send().await.unwrap().status(),
+        400
+    );
+    // A manual online load must not replace an active batch reservation.
+    assert_eq!(agent.acquire().send().await.unwrap().status(), 409);
+    let response = agent
+        .client
+        .delete(format!("{}{path}", agent.origin))
+        .bearer_auth("isolated-regression-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    assert_eq!(
+        agent.post(&path, body).send().await.unwrap().status(),
+        400,
+        "a delayed submit must not resurrect a cancelled job"
+    );
+}
+
+#[tokio::test]
+async fn jsonl_agent_restart_resumes_committed_rows_without_repeating_them() {
+    let mut agent = Agent::start("jsonl").await;
+    agent.batch_lease().await;
+    let id = uuid::Uuid::new_v4();
+    let path = format!("/batch/jobs/{id}");
+    let body = serde_json::json!({"preset":"index-translate-2b", "lease_id":"test", "requests":[
+        {"custom_id":"pending", "body":{"model":"index-translate-2b", "enable_thinking":false,"messages":[{"role":"user","content":"<resume-delay>"}]}},
+        {"custom_id":"done", "body":{"model":"index-translate-2b", "enable_thinking":false,"messages":[{"role":"user","content":"Complete."}]}}
+    ]});
+    assert_eq!(
+        agent
+            .post(&path, body.clone())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let page: serde_json::Value = agent
+                .request(&path)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if page["outputs"]
+                .as_array()
+                .is_some_and(|outputs| !outputs.is_empty())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Recreate the Agent with its persistent cache, as an AI Pod restart does.
+    let pid = fs::read_to_string(agent.root.path().join("model.pid"))
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    agent.child.kill().unwrap();
+    agent.child.wait().unwrap();
+    rustix::process::kill_process_group(
+        rustix::process::Pid::from_raw(pid).unwrap(),
+        rustix::process::Signal::KILL,
+    )
+    .unwrap();
+    let root = agent.root.path();
+    agent.child = Command::new(env!("CARGO_BIN_EXE_ferryman-agent"))
+        .env(
+            "FERRYMAN_AGENT_LISTEN",
+            agent.origin.trim_start_matches("http://"),
+        )
+        .env("FERRYMAN_AGENT_TOKEN", "isolated-regression-token")
+        .env("FERRYMAN_MODEL_ROOT", root.join("models"))
+        .env("FERRYMAN_CACHE_ROOT", root.join("cache"))
+        .env("FERRYMAN_ORINFER_BIN", root.join("orinfer"))
+        .env("FIXTURE_ROOT", root)
+        .env("FIXTURE_MODE", "jsonl")
+        .env(
+            "FIXTURE_ORINFER",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_orinfer.py"),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(response) = agent.post("/runtime/acquire", serde_json::json!({"preset":"index-translate-2b", "lease_id":"test", "mode":"batch"})).send().await {
+                if response.status() == 202 { break; }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(agent.post(&path, body).send().await.unwrap().status(), 202);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let page: serde_json::Value = agent
+                .request(&path)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if page["state"] == "completed" {
+                assert_eq!(
+                    page["outputs"].as_array().unwrap().len(),
+                    2,
+                    "resume must append only the unfinished row"
+                );
+                break;
+            }
+            assert_ne!(page["state"], "failed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let runs = fs::read_to_string(root.join("runs.jsonl")).unwrap();
+    let last: serde_json::Value = serde_json::from_str(runs.lines().last().unwrap()).unwrap();
+    assert!(last["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|arg| arg == "--resume"));
 }
 #[tokio::test]
 async fn launch_uses_orinfer_model_alias_and_endpoint() {

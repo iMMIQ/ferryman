@@ -4,6 +4,84 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+pub(crate) enum ChatClient<'a> {
+    Http(&'a reqwest::Client),
+    Jsonl(&'a crate::jsonl::JsonlSender),
+}
+
+impl ChatClient<'_> {
+    async fn post(&self, url: &str, body: &ChatReq<'_>) -> ChatAttempt {
+        match self {
+            Self::Http(client) => post_chat_once(client, url, body).await,
+            Self::Jsonl(sender) => {
+                let output = match sender
+                    .chat(serde_json::to_value(body).expect("serialize chat request"))
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(error) => {
+                        return ChatAttempt::Transient {
+                            error: error.to_string(),
+                            retry_after: None,
+                        }
+                    }
+                };
+                if !output["error"].is_null() {
+                    let error = output["error"].to_string();
+                    // Orinfer row validation errors use an error envelope rather
+                    // than HTTP 4xx; context errors still invoke our splitter.
+                    return if is_context_overflow(&error) {
+                        ChatAttempt::Fatal {
+                            overflow: true,
+                            error,
+                        }
+                    } else {
+                        // Orinfer uses request_failed for both validation and
+                        // worker errors. Retry the latter within our usual cap.
+                        ChatAttempt::Transient {
+                            error,
+                            retry_after: None,
+                        }
+                    };
+                }
+                let response = &output["response"];
+                let status = response["status_code"].as_u64().unwrap_or(500);
+                if !(200..300).contains(&status) {
+                    let error = response["body"].to_string();
+                    return if status == 429 || status >= 500 {
+                        ChatAttempt::Transient {
+                            error,
+                            retry_after: None,
+                        }
+                    } else {
+                        ChatAttempt::Fatal {
+                            overflow: is_context_overflow(&error),
+                            error,
+                        }
+                    };
+                }
+                parse_chat_response(response["body"].clone())
+            }
+        }
+    }
+}
+
+fn parse_chat_response(value: serde_json::Value) -> ChatAttempt {
+    match serde_json::from_value::<ChatResp>(value) {
+        Ok(parsed) => match parsed.choices.into_iter().next() {
+            Some(choice) => validate_choice(choice),
+            None => ChatAttempt::Transient {
+                error: "empty choices".into(),
+                retry_after: None,
+            },
+        },
+        Err(error) => ChatAttempt::Transient {
+            error: format!("parse json: {error}"),
+            retry_after: None,
+        },
+    }
+}
+
 pub(crate) const TRANSLATION_CACHE_VERSION: &str = "v3-index-orinfer";
 
 #[derive(Serialize)]
@@ -56,6 +134,23 @@ pub async fn translate(
     text: &str,
     target_lang: &str,
 ) -> Result<String> {
+    translate_using(
+        &ChatClient::Http(client),
+        endpoint,
+        model,
+        text,
+        target_lang,
+    )
+    .await
+}
+
+pub(crate) async fn translate_using(
+    client: &ChatClient<'_>,
+    endpoint: &str,
+    model: &str,
+    text: &str,
+    target_lang: &str,
+) -> Result<String> {
     translate_single(client, endpoint, model, text, target_lang, 0).await
 }
 
@@ -68,7 +163,7 @@ const SINGLE_MAX_SPLIT_DEPTH: u32 = 6;
 const SINGLE_MIN_SPLIT_CHARS: usize = 64;
 
 async fn translate_single(
-    client: &reqwest::Client,
+    client: &ChatClient<'_>,
     endpoint: &str,
     model: &str,
     text: &str,
@@ -106,7 +201,7 @@ async fn translate_single(
         if attempt > 0 {
             backoff(attempt, retry_after).await;
         }
-        match post_chat_once(client, &url, &body).await {
+        match client.post(&url, &body).await {
             ChatAttempt::Success(content) => return Ok(content.trim().to_string()),
             ChatAttempt::Transient {
                 error,
@@ -233,6 +328,25 @@ pub async fn translate_batch(
     context: &[&str],
     target_lang: &str,
 ) -> Vec<Option<String>> {
+    translate_batch_using(
+        &ChatClient::Http(client),
+        endpoint,
+        model,
+        cues,
+        context,
+        target_lang,
+    )
+    .await
+}
+
+pub(crate) async fn translate_batch_using(
+    client: &ChatClient<'_>,
+    endpoint: &str,
+    model: &str,
+    cues: &[&str],
+    context: &[&str],
+    target_lang: &str,
+) -> Vec<Option<String>> {
     translate_split(client, endpoint, model, cues, context, target_lang).await
 }
 
@@ -249,7 +363,7 @@ pub async fn translate_batch(
 /// A lone oversized or truncated cue falls back to the bounded single-text
 /// splitter. Failed recovery leaves that cue untranslated.
 async fn translate_split(
-    client: &reqwest::Client,
+    client: &ChatClient<'_>,
     endpoint: &str,
     model: &str,
     cues: &[&str],
@@ -300,9 +414,11 @@ async fn translate_split(
     } else if overflow && cues.len() == 1 {
         // Recover a single oversized/truncated cue using the bounded text
         // splitter. Never accept a partial tagged response as a translation.
-        vec![translate(client, endpoint, model, cues[0], target_lang)
-            .await
-            .ok()]
+        vec![
+            translate_using(client, endpoint, model, cues[0], target_lang)
+                .await
+                .ok(),
+        ]
     } else {
         // Complete, or ≤1 cue missing (a degenerate cue the model refused — kept
         // original; already warned by `translate_one_batch` if it dropped all).
@@ -486,7 +602,7 @@ async fn post_chat_once(client: &reqwest::Client, url: &str, body: &ChatReq<'_>)
 /// [`translate_split`] can react by splitting; never warns on overflow (the
 /// caller handles it).
 async fn translate_one_batch(
-    client: &reqwest::Client,
+    client: &ChatClient<'_>,
     endpoint: &str,
     model: &str,
     cues: &[&str],
@@ -521,7 +637,7 @@ async fn translate_one_batch(
         if attempt > 0 {
             backoff(attempt, retry_after).await;
         }
-        match post_chat_once(client, &url, &body).await {
+        match client.post(&url, &body).await {
             ChatAttempt::Success(content) => {
                 let parsed = parse_tagged(&content, cues.len());
                 let count = parsed.iter().filter(|x| x.is_some()).count();

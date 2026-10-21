@@ -70,11 +70,12 @@ pub(super) struct RuntimeStartRequest {
     preset: Preset,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Serialize)]
 struct AgentAcquireRequest {
     preset: Preset,
     lease_id: String,
     ttl_seconds: u64,
+    mode: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -256,6 +257,7 @@ pub(crate) async fn acquire_agent(config: &Config, preset: Preset, lease_id: &st
         preset,
         lease_id: lease_id.to_string(),
         ttl_seconds: 120,
+        mode: "batch",
     };
     let request = config
         .client
@@ -280,6 +282,7 @@ async fn try_acquire_agent(config: &Config, preset: Preset, lease_id: &str) -> A
         preset,
         lease_id: lease_id.to_string(),
         ttl_seconds: 120,
+        mode: "batch",
     };
     let request = config
         .client
@@ -301,6 +304,9 @@ async fn try_acquire_agent(config: &Config, preset: Preset, lease_id: &str) -> A
     if status.is_server_error()
         || status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
+        // Manual/online leases and another preset can temporarily own the GPU.
+        // Batch jobs wait cancellably until those reservations are released.
+        || status == StatusCode::CONFLICT
     {
         AgentAcquireAttempt::Retry(format!("agent acquire failed ({status}): {message}"))
     } else {
@@ -440,10 +446,10 @@ mod tests {
             post(move || {
                 let handler_calls = handler_calls.clone();
                 async move {
-                    if handler_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                        (StatusCode::SERVICE_UNAVAILABLE, "agent is starting")
-                    } else {
-                        (StatusCode::OK, "ready")
+                    match handler_calls.fetch_add(1, Ordering::SeqCst) {
+                        0 => (StatusCode::SERVICE_UNAVAILABLE, "agent is starting"),
+                        1 => (StatusCode::CONFLICT, "online model has an active lease"),
+                        _ => (StatusCode::OK, "ready"),
                     }
                 }
             }),
@@ -470,7 +476,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         server.abort();
     }
 

@@ -158,6 +158,49 @@ async fn run_batch_impl(
     // Carry the global segment budget through each sequential lazy parse.
     state.budget = state.opts.limit;
 
+    if engine.uses_jsonl() {
+        // Freeze one document's requests at a time. Retain only this file's IR;
+        // Orinfer plans its complete request set and returns rows as they finish.
+        while let Some(input) = state.inputs.next() {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let fidx = state.next_file_idx;
+            state.next_file_idx += 1;
+            let opts = state.opts.clone();
+            let budget = state.budget;
+            let path = input.clone();
+            let prepared = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                result = run_parser(parser_limiter(), move || prepare_file(opts, fidx, input, budget)) => result,
+            };
+            match prepared {
+                Ok(Ok((file, budget))) => {
+                    state.budget = budget;
+                    state.accept_file(fidx, file);
+                    let mut units = Vec::new();
+                    while let Some(unit) = state.next_unit() {
+                        units.push(unit);
+                    }
+                    engine
+                        .exec_jsonl_units(units, cancel.clone(), |done| state.on_done(done))
+                        .await;
+                }
+                result => {
+                    let error = match result {
+                        Ok(Err(error)) => format!("{error:#}"),
+                        Err(error) => format!("parse task failed: {error}"),
+                        Ok(Ok(_)) => unreachable!(),
+                    };
+                    state.failed_files.push((path, error));
+                }
+            }
+        }
+        state.cancelled = cancel.is_cancelled();
+        return state.finish().await;
+    }
+
     let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
     let mut parsing = JoinSet::new();
     loop {

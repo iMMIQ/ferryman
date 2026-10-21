@@ -52,6 +52,7 @@ pub struct Engine {
     cache: Option<Cache>,
     checkpoint: Option<Cache>,
     request_limiter: Option<Arc<Semaphore>>,
+    jsonl: Option<crate::jsonl::JsonlBackend>,
 }
 
 /// One self-contained unit of translation work. The caller ([`crate::batch`])
@@ -120,7 +121,56 @@ impl Engine {
             cache,
             checkpoint: None,
             request_limiter: None,
+            jsonl: None,
         }
+    }
+
+    pub fn with_jsonl(mut self, backend: crate::jsonl::JsonlBackend) -> Self {
+        self.jsonl = Some(backend);
+        self
+    }
+
+    pub fn uses_jsonl(&self) -> bool {
+        self.jsonl.is_some()
+    }
+
+    /// One immutable input file per round; retry/split requests form later
+    /// rounds. Completion callbacks keep existing progressive writes intact.
+    pub async fn exec_jsonl_units(
+        &self,
+        units: Vec<Unit>,
+        cancel: tokio_util::sync::CancellationToken,
+        mut on_done: impl FnMut(UnitDone),
+    ) {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let session_cancel = cancel.child_token();
+        let _cancel_on_drop = session_cancel.clone().drop_guard();
+        let (sender, worker) = self
+            .jsonl
+            .as_ref()
+            .expect("JSONL backend")
+            .start(session_cancel.clone(), units.len());
+        let mut pending: FuturesUnordered<_> = units
+            .into_iter()
+            .map(|unit| {
+                let sender = &sender;
+                async move {
+                    let unit_sender = sender.for_unit();
+                    self.exec_unit_using(unit, &translate::ChatClient::Jsonl(&unit_sender))
+                        .await
+                }
+            })
+            .collect();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                done = pending.next() => match done { Some(done) => on_done(done), None => break },
+            }
+        }
+        drop(pending);
+        session_cancel.cancel();
+        let _ = worker.await;
     }
 
     /// Job-local progress survives retries even when shared caching is off.
@@ -182,7 +232,11 @@ impl Engine {
     /// is logged and counted (empty `pairs`), never bubbled, so one bad unit
     /// can't abort the batch.
     pub async fn exec_unit(&self, unit: Unit) -> UnitDone {
-        let client = &self.client;
+        self.exec_unit_using(unit, &translate::ChatClient::Http(&self.client))
+            .await
+    }
+
+    async fn exec_unit_using(&self, unit: Unit, client: &translate::ChatClient<'_>) -> UnitDone {
         let endpoint = &self.endpoint;
         let model = &self.model;
         let target = &self.target;
@@ -205,8 +259,12 @@ impl Engine {
                         };
                     }
                 }
-                let _request_permit = self.acquire_request_permit().await;
-                match translate::translate(client, endpoint, model, &text, target).await {
+                let _request_permit = if matches!(client, translate::ChatClient::Http(_)) {
+                    self.acquire_request_permit().await
+                } else {
+                    None
+                };
+                match translate::translate_using(client, endpoint, model, &text, target).await {
                     Ok(tr) => {
                         // Put before returning: even if the future is dropped
                         // right after (Ctrl-C between completion and drain),
@@ -293,8 +351,12 @@ impl Engine {
                 // succeeded.
                 let miss_idx: Vec<usize> = (0..n).filter(|&idx| results[idx].is_none()).collect();
                 let miss_cues: Vec<&str> = miss_idx.iter().map(|&idx| cue_refs[idx]).collect();
-                let _request_permit = self.acquire_request_permit().await;
-                let trs = translate::translate_batch(
+                let _request_permit = if matches!(client, translate::ChatClient::Http(_)) {
+                    self.acquire_request_permit().await
+                } else {
+                    None
+                };
+                let trs = translate::translate_batch_using(
                     client, endpoint, model, &miss_cues, &ctx_refs, target,
                 )
                 .await;

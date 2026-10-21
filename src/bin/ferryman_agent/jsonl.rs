@@ -1,12 +1,25 @@
 //! Authenticated, bounded spool for the Agent-owned Orinfer batch child.
-use super::*;
-use axum::extract::Query;
-use ferryman::jsonl::{
-    BatchPage, BatchPhase, BatchSubmission, MAX_BATCH_BYTES, MAX_BATCH_REQUESTS,
+use super::{AppState, ErrorBody};
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
 };
-use std::collections::HashSet;
+use ferryman::agent_protocol::{
+    BatchPage, BatchPhase, BatchSubmission, MAX_BATCH_BYTES, MAX_BATCH_LINE_BYTES,
+    MAX_BATCH_REQUESTS,
+};
+use ferryman::preset::Preset;
+use serde::Deserialize;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -113,7 +126,7 @@ impl BatchJobs {
                 }),
             )?;
             anyhow::ensure!(
-                input.len() - offset <= 32 * 1024 * 1024,
+                input.len() - offset <= MAX_BATCH_LINE_BYTES,
                 "JSONL line exceeds 32 MiB"
             );
             input.push(b'\n');
@@ -203,7 +216,7 @@ pub(super) async fn poll(
     *job.last_access.lock().unwrap() = Instant::now();
     match read_page(&job, query.cursor).await {
         Ok(page) => Json(page).into_response(),
-        Err(error) => failure(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        Err(error) => failure(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
     }
 }
 

@@ -9,10 +9,6 @@ async fn state_at(base: &FsPath) -> AppState {
         cancellations: Arc::new(Mutex::new(HashMap::new())),
         job_locks: Arc::default(),
         queue: mpsc::channel(100).0,
-        request_limiters: Arc::new(HashMap::from([(
-            Preset::Index2B,
-            Arc::new(Semaphore::new(1)),
-        )])),
         translation_client: reqwest::Client::new(),
         config: Arc::new(Config {
             data_dir: base.join("data"),

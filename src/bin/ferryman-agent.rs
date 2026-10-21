@@ -4,6 +4,10 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use ferryman::agent_protocol::{
+    AcquireRequest, BatchPhase, ExecutionMode, PairChallenge, PairRequest, RuntimePhase,
+    RuntimeStatus, StartupStage,
+};
 #[cfg(test)]
 use ferryman::auth::hmac_token;
 use ferryman::auth::{hash_token, verify_pairing_proof};
@@ -12,13 +16,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::path::{Path as FsPath, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
@@ -28,8 +31,11 @@ use tracing_subscriber::EnvFilter;
 mod jsonl;
 #[path = "ferryman_agent/model_manager.rs"]
 mod model_manager;
-use ferryman::jsonl::BatchPhase;
+#[path = "ferryman_agent/process.rs"]
+mod process;
+
 use jsonl::{BatchJob, BatchJobs};
+use process::ModelProcess;
 
 use model_manager::{DownloadRequest, ModelManager, ModelPhase};
 
@@ -180,71 +186,27 @@ impl Drop for ActiveRequestGuard {
     }
 }
 
+struct ActiveBatch {
+    job: Arc<BatchJob>,
+    _activity: ActiveRequestGuard,
+}
+impl std::ops::Deref for ActiveBatch {
+    type Target = BatchJob;
+    fn deref(&self) -> &Self::Target {
+        &self.job
+    }
+}
+impl ActiveBatch {
+    fn finish(self) -> Arc<BatchJob> {
+        self.job
+    }
+}
+
 #[derive(Clone)]
 struct Controller {
     commands: mpsc::Sender<RuntimeCommand>,
     status: watch::Receiver<RuntimeStatus>,
     active_requests: Arc<AtomicUsize>,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[derive(ts_rs::TS)]
-enum RuntimePhase {
-    Stopped,
-    Starting,
-    Ready,
-    Stopping,
-    Failed,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[derive(ts_rs::TS)]
-enum StartupStage {
-    StartingProcess,
-    LoadingWeights,
-    CompilingKernels,
-    CapturingGraphs,
-    StartingServer,
-    Ready,
-    Failed,
-}
-
-#[derive(Clone, Debug, Serialize, ts_rs::TS)]
-struct RuntimeStatus {
-    state: RuntimePhase,
-    execution_mode: ExecutionMode,
-    preset: Option<Preset>,
-    pid: Option<u32>,
-    active_requests: usize,
-    leases: usize,
-    idle_timeout_seconds: u64,
-    updated_at: u64,
-    last_error: Option<String>,
-    startup_stage: Option<StartupStage>,
-    startup_progress: u8,
-    startup_elapsed_seconds: Option<u64>,
-    estimated_remaining_seconds: Option<u64>,
-    recent_logs: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, ts_rs::TS)]
-#[serde(rename_all = "snake_case")]
-enum ExecutionMode {
-    #[default]
-    Serve,
-    Batch,
-}
-
-#[derive(Deserialize)]
-struct AcquireRequest {
-    preset: Preset,
-    lease_id: String,
-    #[serde(default = "default_lease_ttl")]
-    ttl_seconds: u64,
-    #[serde(default)]
-    mode: ExecutionMode,
 }
 
 #[derive(Deserialize)]
@@ -303,10 +265,9 @@ struct RuntimeManager {
     active_requests: Arc<AtomicUsize>,
     phase: RuntimePhase,
     preset: Option<Preset>,
-    child: Option<Child>,
+    child: Option<ModelProcess>,
     mode: ExecutionMode,
-    batch: Option<Arc<BatchJob>>,
-    process_group: Option<rustix::process::Pid>,
+    batch: Option<ActiveBatch>,
     leases: HashMap<String, Lease>,
     last_activity: Instant,
     last_health_check: Instant,
@@ -338,10 +299,6 @@ const READY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// load; ~90 s of sustained failure means it is really gone.
 const READY_PROBE_FAILURE_LIMIT: u32 = 3;
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn default_lease_ttl() -> u64 {
-    120
-}
 
 fn now_epoch_seconds() -> u64 {
     SystemTime::now()
@@ -388,7 +345,6 @@ impl Controller {
             child: None,
             mode: ExecutionMode::Serve,
             batch: None,
-            process_group: None,
             leases: HashMap::new(),
             last_activity: Instant::now(),
             last_health_check: Instant::now() - Duration::from_secs(10),
@@ -420,68 +376,52 @@ impl Controller {
         status
     }
 
-    async fn acquire(&self, request: AcquireRequest) -> Result<RuntimeStatus, String> {
+    async fn request<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<T>) -> RuntimeCommand,
+    ) -> Result<T, String> {
         let (reply, result) = oneshot::channel();
         self.commands
-            .send(RuntimeCommand::Acquire { request, reply })
+            .send(command(reply))
             .await
-            .map_err(|_| "runtime manager is unavailable".to_string())?;
+            .map_err(|_| "runtime manager is unavailable")?;
         result
             .await
-            .map_err(|_| "runtime manager stopped before replying".to_string())?
+            .map_err(|_| "runtime manager stopped before replying".into())
+    }
+
+    async fn acquire(&self, request: AcquireRequest) -> Result<RuntimeStatus, String> {
+        self.request(|reply| RuntimeCommand::Acquire { request, reply })
+            .await?
     }
 
     async fn release(&self, lease_id: String) -> Result<RuntimeStatus, String> {
-        let (reply, result) = oneshot::channel();
-        self.commands
-            .send(RuntimeCommand::Release { lease_id, reply })
+        self.request(|reply| RuntimeCommand::Release { lease_id, reply })
             .await
-            .map_err(|_| "runtime manager is unavailable".to_string())?;
-        result
-            .await
-            .map_err(|_| "runtime manager stopped before replying".to_string())
     }
 
     async fn stop(&self, force: bool) -> Result<RuntimeStatus, String> {
-        let (reply, result) = oneshot::channel();
-        self.commands
-            .send(RuntimeCommand::Stop { force, reply })
-            .await
-            .map_err(|_| "runtime manager is unavailable".to_string())?;
-        result
-            .await
-            .map_err(|_| "runtime manager stopped before replying".to_string())?
+        self.request(|reply| RuntimeCommand::Stop { force, reply })
+            .await?
     }
 
     async fn check_batch_lease(&self, preset: Preset, lease_id: &str) -> Result<(), String> {
-        let (reply, result) = oneshot::channel();
-        self.commands
-            .send(RuntimeCommand::CheckBatchLease {
-                preset,
-                lease_id: lease_id.into(),
-                reply,
-            })
-            .await
-            .map_err(|_| "runtime unavailable")?;
-        result.await.map_err(|_| "runtime stopped")?
+        self.request(|reply| RuntimeCommand::CheckBatchLease {
+            preset,
+            lease_id: lease_id.into(),
+            reply,
+        })
+        .await?
     }
 
     async fn start_batch(&self, job: Arc<BatchJob>) -> Result<(), String> {
-        let (reply, result) = oneshot::channel();
-        self.commands
-            .send(RuntimeCommand::StartBatch { job, reply })
-            .await
-            .map_err(|_| "runtime unavailable")?;
-        result.await.map_err(|_| "runtime stopped")?
+        self.request(|reply| RuntimeCommand::StartBatch { job, reply })
+            .await?
     }
 
     async fn cancel_batch(&self, id: uuid::Uuid) -> Result<(), String> {
-        let (reply, result) = oneshot::channel();
-        self.commands
-            .send(RuntimeCommand::CancelBatch { id, reply })
-            .await
-            .map_err(|_| "runtime unavailable")?;
-        result.await.map_err(|_| "runtime stopped")?
+        self.request(|reply| RuntimeCommand::CancelBatch { id, reply })
+            .await?
     }
 
     async fn touch(&self) {
@@ -513,6 +453,37 @@ impl RuntimeManager {
         self.publish();
     }
 
+    fn orinfer_command(&self, mode: ExecutionMode, preset: Preset) -> Command {
+        let mut command = Command::new(&self.orinfer_bin);
+        command
+            .arg(match mode {
+                ExecutionMode::Serve => "serve",
+                ExecutionMode::Batch => "batch",
+            })
+            .arg(FsPath::new(&self.model_root).join(preset.config().model_dir_name))
+            .args(["--model", preset.api_model()])
+            .args([
+                "--max-active-requests",
+                &preset.config().concurrency.to_string(),
+            ])
+            .args(["--prefix-cache-mib", "1024"]);
+        command
+    }
+
+    fn spawn_child(&mut self, command: &mut Command) -> Result<u32, String> {
+        let mut child =
+            ModelProcess::spawn(command).map_err(|error| format!("start Orinfer: {error}"))?;
+        let pid = child.id();
+        if let Some(stdout) = child.stdout() {
+            tokio::spawn(pipe_logs(stdout, pid, "stdout", self.commands.clone()));
+        }
+        if let Some(stderr) = child.stderr() {
+            tokio::spawn(pipe_logs(stderr, pid, "stderr", self.commands.clone()));
+        }
+        self.child = Some(child);
+        Ok(pid)
+    }
+
     async fn start_batch(&mut self, job: Arc<BatchJob>) -> Result<(), String> {
         self.prune_leases();
         self.check_batch_lease(job.preset, &job.lease_id)?;
@@ -529,32 +500,18 @@ impl RuntimeManager {
         if self.child.is_some() {
             return Err("another JSONL job is running".into());
         }
-        let model = FsPath::new(&self.model_root).join(job.preset.config().model_dir_name);
-        let mut command = Command::new(&self.orinfer_bin);
+        let mut command = self.orinfer_command(ExecutionMode::Batch, job.preset);
         command
-            .arg("batch")
-            .arg(model)
-            .args(["--model", job.preset.api_model()])
             .arg("--input")
             .arg(job.directory.join("input.jsonl"))
             .arg("--output")
             .arg(job.directory.join("output.jsonl"))
-            .args(["--scheduler-policy", "throughput", "--batch-order", "auto"])
-            .args([
-                "--max-active-requests",
-                &job.preset.config().concurrency.to_string(),
-            ])
-            .args(["--prefix-cache-mib", "1024"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0);
+            .args(["--scheduler-policy", "throughput", "--batch-order", "auto"]);
         if job.directory.join("output.jsonl.meta.json").exists() {
             command.arg("--resume");
         }
-        let mut child = match command.spawn() {
-            Ok(child) => child,
+        let pid = match self.spawn_child(&mut command) {
+            Ok(pid) => pid,
             Err(error) => {
                 *job.status.write().await = (
                     BatchPhase::Failed,
@@ -563,17 +520,10 @@ impl RuntimeManager {
                 return Ok(());
             }
         };
-        let pid = child.id().unwrap_or_default();
-        if let Some(stdout) = child.stdout.take() {
-            tokio::spawn(pipe_logs(stdout, pid, "stdout", self.commands.clone()));
-        }
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(pipe_logs(stderr, pid, "stderr", self.commands.clone()));
-        }
-        self.process_group = rustix::process::Pid::from_raw(pid as i32);
-        self.child = Some(child);
-        self.batch = Some(job.clone());
-        self.active_requests.fetch_add(1, Ordering::AcqRel);
+        self.batch = Some(ActiveBatch {
+            job: job.clone(),
+            _activity: ActiveRequestGuard::new(self.active_requests.clone()),
+        });
         self.recent_logs.clear();
         self.last_activity = Instant::now();
         *job.status.write().await = (BatchPhase::Running, None);
@@ -656,7 +606,7 @@ impl RuntimeManager {
                 self.publish();
             }
             RuntimeCommand::OrinferLog { pid, line } => {
-                if self.child.as_ref().and_then(Child::id) != Some(pid) {
+                if self.child.as_ref().map(ModelProcess::id) != Some(pid) {
                     return;
                 }
                 self.push_log(line);
@@ -730,15 +680,10 @@ impl RuntimeManager {
     }
 
     async fn start_child(&mut self, preset: Preset) -> Result<(), String> {
-        let cfg = preset.config();
-        let model_path = format!(
-            "{}/{}",
-            self.model_root.trim_end_matches('/'),
-            cfg.model_dir_name
-        );
+        let model_path = FsPath::new(&self.model_root).join(preset.config().model_dir_name);
 
-        if !FsPath::new(&model_path).exists() {
-            let message = format!("model directory not found: {model_path}");
+        if !model_path.exists() {
+            let message = format!("model directory not found: {}", model_path.display());
             return Err(self.fail_start(preset, message));
         }
 
@@ -769,36 +714,15 @@ impl RuntimeManager {
         } else {
             host.to_string()
         };
-        let mut command = Command::new(&self.orinfer_bin);
-        command
-            .arg("serve")
-            .arg(&model_path)
-            .args(["--model", preset.api_model()])
-            .args([
-                "--listen",
-                &format!("{host}:{}", listen.port_or_known_default().unwrap_or(18088)),
-            ])
-            .args(["--max-active-requests", &cfg.concurrency.to_string()])
-            .args(["--prefix-cache-mib", "1024"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        command.process_group(0);
-
-        let mut child = command
-            .spawn()
-            .map_err(|error| self.fail_start(preset, format!("start orinfer: {error}")))?;
-        let pid = child.id().unwrap_or_default();
-        if let Some(stdout) = child.stdout.take() {
-            tokio::spawn(pipe_logs(stdout, pid, "stdout", self.commands.clone()));
-        }
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(pipe_logs(stderr, pid, "stderr", self.commands.clone()));
-        }
-
+        let mut command = self.orinfer_command(ExecutionMode::Serve, preset);
+        command.args([
+            "--listen",
+            &format!("{host}:{}", listen.port_or_known_default().unwrap_or(18088)),
+        ]);
+        let pid = self
+            .spawn_child(&mut command)
+            .map_err(|error| self.fail_start(preset, error))?;
         info!(%preset, pid, "orinfer process started");
-        self.process_group = rustix::process::Pid::from_raw(pid as i32);
-        self.child = Some(child);
         self.phase = RuntimePhase::Starting;
         self.preset = Some(preset);
         self.last_error = None;
@@ -813,51 +737,22 @@ impl RuntimeManager {
     }
 
     async fn stop_child(&mut self, force: bool) -> Result<(), String> {
-        if let Some(job) = self.batch.take() {
-            self.active_requests.fetch_sub(1, Ordering::AcqRel);
+        if let Some(job) = self.batch.take().map(ActiveBatch::finish) {
             *job.status.write().await = (BatchPhase::Cancelled, Some("batch cancelled".into()));
         }
-        let group = self.process_group.take();
-        let Some(mut child) = self.child.take() else {
-            if let Some(pid) = group {
-                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-            }
-            self.phase = RuntimePhase::Stopped;
-            self.preset = None;
-            self.last_error = None;
-            self.started_at = None;
-            self.startup_stage = None;
-            self.startup_progress = 0;
-            self.startup_elapsed_seconds = None;
-            self.recent_logs.clear();
+        let result = if let Some(child) = self.child.take() {
+            self.phase = RuntimePhase::Stopping;
             self.publish();
-            return Ok(());
+            let pid = child.id();
+            let result = child
+                .stop(force)
+                .await
+                .map_err(|error| format!("stop Orinfer: {error}"));
+            info!(pid, "orinfer process stopped");
+            result
+        } else {
+            Ok(())
         };
-        self.phase = RuntimePhase::Stopping;
-        self.publish();
-        let pid = child.id().unwrap_or_default();
-        if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
-            let signal = if force {
-                rustix::process::Signal::KILL
-            } else {
-                rustix::process::Signal::TERM
-            };
-            let _ = rustix::process::kill_process_group(pid, signal);
-        }
-        if tokio::time::timeout(Duration::from_secs(20), child.wait())
-            .await
-            .is_err()
-        {
-            if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
-                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-            }
-            let _ = child.wait().await;
-        }
-        // The parent may exit before its workers; always reap the remaining group.
-        if let Some(pid) = group {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-        }
-        info!(pid, "orinfer process stopped");
         self.phase = RuntimePhase::Stopped;
         self.preset = None;
         self.last_error = None;
@@ -868,7 +763,26 @@ impl RuntimeManager {
         self.recent_logs.clear();
         self.last_activity = Instant::now();
         self.publish();
-        Ok(())
+        result
+    }
+
+    async fn fail_runtime(&mut self, message: String, progress: u8) {
+        let preset = self.preset;
+        let logs = self.recent_logs.clone();
+        let elapsed = self
+            .started_at
+            .map(|started| started.elapsed().as_secs())
+            .or(self.startup_elapsed_seconds);
+        let _ = self.stop_child(true).await;
+        self.phase = RuntimePhase::Failed;
+        self.preset = preset;
+        self.leases.clear();
+        self.startup_stage = Some(StartupStage::Failed);
+        self.startup_progress = progress;
+        self.startup_elapsed_seconds = elapsed;
+        self.recent_logs = logs;
+        self.last_error = Some(message);
+        self.publish();
     }
 
     async fn on_tick(&mut self) {
@@ -876,13 +790,8 @@ impl RuntimeManager {
         if let Some(child) = self.child.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    if let Some(pid) = self.process_group.take() {
-                        let _ =
-                            rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-                    }
                     self.child = None;
-                    if let Some(job) = self.batch.take() {
-                        self.active_requests.fetch_sub(1, Ordering::AcqRel);
+                    if let Some(job) = self.batch.take().map(ActiveBatch::finish) {
                         *job.status.write().await = if status.success() {
                             (BatchPhase::Completed, None)
                         } else {
@@ -904,14 +813,11 @@ impl RuntimeManager {
                         self.publish();
                         return;
                     }
-                    self.phase = RuntimePhase::Failed;
-                    self.last_error = Some(format!("orinfer exited with {status}"));
-                    self.startup_elapsed_seconds =
-                        self.started_at.map(|started| started.elapsed().as_secs());
-                    self.started_at = None;
-                    self.startup_stage = Some(StartupStage::Failed);
-                    self.leases.clear();
-                    self.publish();
+                    self.fail_runtime(
+                        format!("orinfer exited with {status}"),
+                        self.startup_progress,
+                    )
+                    .await;
                     return;
                 }
                 Ok(None) => {}
@@ -986,23 +892,16 @@ impl RuntimeManager {
                     "orinfer health probe failed while ready"
                 );
                 if self.ready_probe_failures >= READY_PROBE_FAILURE_LIMIT {
-                    let preset = self.preset;
-                    let recent_logs = self.recent_logs.clone();
-                    let startup_elapsed_seconds = self.startup_elapsed_seconds;
-                    let _ = self.stop_child(true).await;
-                    self.phase = RuntimePhase::Failed;
-                    self.preset = preset;
-                    self.leases.clear();
-                    self.startup_stage = Some(StartupStage::Failed);
-                    self.startup_elapsed_seconds = startup_elapsed_seconds;
-                    self.recent_logs = recent_logs;
-                    self.last_error = Some(format!(
-                        "orinfer health check failed {} consecutive times while ready",
-                        self.ready_probe_failures
-                    ));
+                    self.fail_runtime(
+                        format!(
+                            "orinfer health check failed {} consecutive times while ready",
+                            self.ready_probe_failures
+                        ),
+                        0,
+                    )
+                    .await;
                     self.ready_probe_failures = 0;
                     error!(preset = ?self.preset, "orinfer wedged while ready; runtime failed");
-                    self.publish();
                     return;
                 }
             }
@@ -1013,24 +912,14 @@ impl RuntimeManager {
                 .started_at
                 .is_some_and(|started| started.elapsed() >= self.start_timeout)
         {
-            let preset = self.preset;
-            let recent_logs = self.recent_logs.clone();
-            let startup_progress = self.startup_progress;
-            let startup_elapsed_seconds =
-                self.started_at.map(|started| started.elapsed().as_secs());
-            let _ = self.stop_child(true).await;
-            self.phase = RuntimePhase::Failed;
-            self.preset = preset;
-            self.leases.clear();
-            self.startup_stage = Some(StartupStage::Failed);
-            self.startup_progress = startup_progress;
-            self.startup_elapsed_seconds = startup_elapsed_seconds;
-            self.recent_logs = recent_logs;
-            self.last_error = Some(format!(
-                "orinfer did not become ready within {} seconds",
-                self.start_timeout.as_secs()
-            ));
-            self.publish();
+            self.fail_runtime(
+                format!(
+                    "orinfer did not become ready within {} seconds",
+                    self.start_timeout.as_secs()
+                ),
+                self.startup_progress,
+            )
+            .await;
             return;
         }
 
@@ -1095,7 +984,7 @@ impl RuntimeManager {
             state: self.phase,
             execution_mode: self.mode,
             preset: self.preset,
-            pid: self.child.as_ref().and_then(Child::id),
+            pid: self.child.as_ref().map(ModelProcess::id),
             active_requests: self.active_requests.load(Ordering::Relaxed),
             leases: self.leases.len(),
             idle_timeout_seconds: self.idle_timeout.as_secs(),
@@ -1249,18 +1138,6 @@ fn unauthorized_response() -> Response {
 
 async fn healthz() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
-}
-
-#[derive(Serialize)]
-struct PairChallenge {
-    nonce: String,
-}
-
-#[derive(Deserialize)]
-struct PairRequest {
-    nonce: String,
-    token: String,
-    proof: String,
 }
 
 async fn pair_challenge(State(state): State<AppState>) -> Response {

@@ -21,7 +21,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -70,7 +70,6 @@ struct AppState {
     cancellations: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
     job_locks: Arc<Mutex<HashMap<Uuid, std::sync::Weak<Mutex<()>>>>>,
     queue: mpsc::Sender<Uuid>,
-    request_limiters: Arc<HashMap<Preset, Arc<Semaphore>>>,
     translation_client: reqwest::Client,
     config: Arc<Config>,
     persister: JobPersister,
@@ -741,16 +740,6 @@ async fn main() -> Result<()> {
         job_locks: Arc::default(),
         queue,
         persister,
-        request_limiters: Arc::new(HashMap::from([
-            (
-                Preset::Index2B,
-                Arc::new(Semaphore::new(Preset::Index2B.config().concurrency)),
-            ),
-            (
-                Preset::Index35B,
-                Arc::new(Semaphore::new(Preset::Index35B.config().concurrency)),
-            ),
-        ])),
         translation_client,
         config: runtime_config,
     };
@@ -879,7 +868,6 @@ mod tests {
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             job_locks: Arc::default(),
             queue: mpsc::channel(1).0,
-            request_limiters: Arc::new(HashMap::new()),
             translation_client: reqwest::Client::new(),
             config: Arc::new(Config {
                 data_dir: base.join("data"),

@@ -6,30 +6,34 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use ferryman::agent_protocol::{AcquireRequest, ExecutionMode, RuntimePhase, RuntimeStatus};
+use ferryman::agent_protocol::{PairChallenge, PairRequest};
 use ferryman::auth::hmac_token;
+use ferryman::http_client::is_transient_status;
 use ferryman::preset::Preset;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 async fn pair_agent_once(config: &Config) -> Result<()> {
-    let challenge: serde_json::Value = config
+    let challenge: PairChallenge = config
         .client
         .get(format!("{}/pair/challenge", config.agent_url))
         .send()
         .await?
         .json()
         .await?;
-    let nonce = challenge
-        .get("nonce")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("agent pairing challenge missing nonce"))?;
-    let proof = hmac_token(&config.agent_token, nonce);
+    let nonce = challenge.nonce;
+    let proof = hmac_token(&config.agent_token, &nonce);
     let response = config
         .client
         .post(format!("{}/pair", config.agent_url))
-        .json(&serde_json::json!({"nonce": nonce, "token": config.agent_token, "proof": proof}))
+        .json(&PairRequest {
+            nonce,
+            token: config.agent_token.clone(),
+            proof,
+        })
         .send()
         .await?;
     if !response.status().is_success() {
@@ -68,21 +72,6 @@ async fn send_agent(
 #[derive(Deserialize)]
 pub(super) struct RuntimeStartRequest {
     preset: Preset,
-}
-
-#[derive(Serialize)]
-struct AgentAcquireRequest {
-    preset: Preset,
-    lease_id: String,
-    ttl_seconds: u64,
-    mode: &'static str,
-}
-
-#[derive(Deserialize)]
-struct AgentRuntime {
-    state: String,
-    preset: Option<Preset>,
-    last_error: Option<String>,
 }
 
 async fn agent_json(
@@ -215,10 +204,11 @@ pub(super) async fn runtime_start(
     Json(request): Json<RuntimeStartRequest>,
 ) -> Response {
     let owner = identity.owner.clone();
-    let body = serde_json::json!({
-        "preset": request.preset,
-        "lease_id": format!("manual-{owner}"),
-        "ttl_seconds": 3600
+    let body = serde_json::json!(AcquireRequest {
+        preset: request.preset,
+        lease_id: format!("manual-{owner}"),
+        ttl_seconds: 3600,
+        mode: ExecutionMode::Serve,
     });
     match agent_json(
         &state.config,
@@ -252,19 +242,16 @@ pub(super) async fn runtime_stop(
     }
 }
 
-pub(crate) async fn acquire_agent(config: &Config, preset: Preset, lease_id: &str) -> Result<()> {
-    let request = AgentAcquireRequest {
-        preset,
-        lease_id: lease_id.to_string(),
-        ttl_seconds: 120,
-        mode: "batch",
-    };
-    let request = config
+fn acquire_request(config: &Config, preset: Preset, lease_id: &str) -> reqwest::RequestBuilder {
+    config
         .client
         .post(format!("{}/runtime/acquire", config.agent_url))
         .bearer_auth(&config.agent_token)
-        .json(&request);
-    let response = send_agent(config, request).await?;
+        .json(&AcquireRequest::new(preset, lease_id, ExecutionMode::Batch))
+}
+
+pub(crate) async fn acquire_agent(config: &Config, preset: Preset, lease_id: &str) -> Result<()> {
+    let response = send_agent(config, acquire_request(config, preset, lease_id)).await?;
     if !response.status().is_success() {
         anyhow::bail!("agent acquire failed: {}", response.text().await?);
     }
@@ -278,17 +265,7 @@ enum AgentAcquireAttempt {
 }
 
 async fn try_acquire_agent(config: &Config, preset: Preset, lease_id: &str) -> AgentAcquireAttempt {
-    let request = AgentAcquireRequest {
-        preset,
-        lease_id: lease_id.to_string(),
-        ttl_seconds: 120,
-        mode: "batch",
-    };
-    let request = config
-        .client
-        .post(format!("{}/runtime/acquire", config.agent_url))
-        .bearer_auth(&config.agent_token)
-        .json(&request);
+    let request = acquire_request(config, preset, lease_id);
     let response = match send_agent(config, request).await {
         Ok(response) => response,
         Err(error) => return AgentAcquireAttempt::Retry(error.to_string()),
@@ -301,9 +278,7 @@ async fn try_acquire_agent(config: &Config, preset: Preset, lease_id: &str) -> A
         .text()
         .await
         .unwrap_or_else(|error| format!("invalid agent response: {error}"));
-    if status.is_server_error()
-        || status == StatusCode::REQUEST_TIMEOUT
-        || status == StatusCode::TOO_MANY_REQUESTS
+    if is_transient_status(status)
         // Manual/online leases and another preset can temporarily own the GPU.
         // Batch jobs wait cancellably until those reservations are released.
         || status == StatusCode::CONFLICT
@@ -384,17 +359,14 @@ pub(crate) async fn wait_for_agent(
                 .text()
                 .await
                 .unwrap_or_else(|error| format!("invalid agent response: {error}"));
-            if status.is_server_error()
-                || status == StatusCode::REQUEST_TIMEOUT
-                || status == StatusCode::TOO_MANY_REQUESTS
-            {
+            if is_transient_status(status) {
                 warn!(%status, %message, "agent runtime temporarily unavailable");
                 poll_delay = (poll_delay * 2).min(Duration::from_secs(30));
                 continue;
             }
             anyhow::bail!("agent runtime failed ({status}): {message}");
         }
-        let runtime = match response.json::<AgentRuntime>().await {
+        let runtime = match response.json::<RuntimeStatus>().await {
             Ok(runtime) => runtime,
             Err(error) => {
                 warn!(%error, "invalid agent runtime response");
@@ -403,10 +375,10 @@ pub(crate) async fn wait_for_agent(
             }
         };
         poll_delay = Duration::from_secs(2);
-        if runtime.state == "ready" && runtime.preset == Some(preset) {
+        if runtime.state == RuntimePhase::Ready && runtime.preset == Some(preset) {
             return Ok(());
         }
-        if runtime.state == "failed" {
+        if runtime.state == RuntimePhase::Failed {
             startup_failures += 1;
             let message = runtime.last_error.unwrap_or_else(|| "unknown error".into());
             if startup_failures >= MAX_MODEL_START_ATTEMPTS {

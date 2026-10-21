@@ -1,24 +1,15 @@
-//! The orinfer sender — translates one self-contained [`Unit`] per call.
+//! Cached translation of format-independent units through HTTP or JSONL.
 //!
-//! The engine is deliberately minimal: [`Engine::exec_unit`] takes a [`Unit`]
-//! (an Independent segment, or a Batched slice with its own in-file context),
-//! consults the cache, calls `translate`/`translate_batch`, caches the wins, and
-//! returns a [`UnitDone`]. It never errors (a unit failure is logged and counted
-//! as empty `pairs`), so one bad unit can't abort a batch.
-//!
-//! Everything above one unit — the shared concurrency pool, lazy file opening,
-//! progressive writing, Ctrl-C, the progress bar — lives in [`crate::batch`],
-//! the queue layer. That split keeps the engine free of any notion of files,
-//! formats, or strategies: it only knows how to send one chunk of text to orinfer.
+//! Both transports share the same cache/checkpoint path and prompt recovery.
+//! JSONL prepares bounded windows of units; file parsing, progress and writing
+//! belong to [`crate::batch`]. Model lifecycle belongs to the AI Pod Agent.
 
 use crate::cache::Cache;
 use crate::format::SegmentId;
 use crate::translate;
 use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub fn build_translation_client(
     timeout: Duration,
@@ -51,8 +42,12 @@ pub struct Engine {
     concurrency: usize,
     cache: Option<Cache>,
     checkpoint: Option<Cache>,
-    request_limiter: Option<Arc<Semaphore>>,
-    jsonl: Option<crate::jsonl::JsonlBackend>,
+    backend: Backend,
+}
+
+enum Backend {
+    Http,
+    Jsonl(crate::jsonl::JsonlBackend),
 }
 
 /// One self-contained unit of translation work. The caller ([`crate::batch`])
@@ -120,23 +115,64 @@ impl Engine {
             concurrency,
             cache,
             checkpoint: None,
-            request_limiter: None,
-            jsonl: None,
+            backend: Backend::Http,
         }
     }
 
-    pub fn with_jsonl(mut self, backend: crate::jsonl::JsonlBackend) -> Self {
-        self.jsonl = Some(backend);
-        self
+    /// Model identity, concurrency and transport share a single Agent config.
+    pub fn for_agent(
+        client: reqwest::Client,
+        endpoint: String,
+        preset: crate::preset::Preset,
+        target: String,
+        cache: Option<Cache>,
+        lease_id: String,
+    ) -> Self {
+        let mut engine = Self::new(
+            client.clone(),
+            endpoint.clone(),
+            preset.api_model().into(),
+            target,
+            preset.config().concurrency,
+            cache,
+        );
+        engine.backend = Backend::Jsonl(crate::jsonl::JsonlBackend {
+            client,
+            endpoint,
+            preset,
+            lease_id,
+        });
+        engine
     }
 
     pub fn uses_jsonl(&self) -> bool {
-        self.jsonl.is_some()
+        matches!(self.backend, Backend::Jsonl(_))
+    }
+
+    /// Bound prepared requests as well as the files submitted to the Agent.
+    pub async fn exec_jsonl_units(
+        &self,
+        units: Vec<Unit>,
+        cancel: tokio_util::sync::CancellationToken,
+        mut on_done: impl FnMut(UnitDone),
+    ) {
+        let mut units = units.into_iter();
+        while !cancel.is_cancelled() {
+            let window: Vec<_> = units
+                .by_ref()
+                .take(crate::jsonl::MAX_BATCH_REQUESTS)
+                .collect();
+            if window.is_empty() {
+                break;
+            }
+            self.exec_jsonl_window(window, cancel.clone(), &mut on_done)
+                .await;
+        }
     }
 
     /// One immutable input file per round; retry/split requests form later
     /// rounds. Completion callbacks keep existing progressive writes intact.
-    pub async fn exec_jsonl_units(
+    async fn exec_jsonl_window(
         &self,
         units: Vec<Unit>,
         cancel: tokio_util::sync::CancellationToken,
@@ -145,11 +181,10 @@ impl Engine {
         use futures::stream::{FuturesUnordered, StreamExt};
         let session_cancel = cancel.child_token();
         let _cancel_on_drop = session_cancel.clone().drop_guard();
-        let (sender, worker) = self
-            .jsonl
-            .as_ref()
-            .expect("JSONL backend")
-            .start(session_cancel.clone(), units.len());
+        let Backend::Jsonl(backend) = &self.backend else {
+            unreachable!("JSONL execution needs an Agent backend");
+        };
+        let (sender, worker) = backend.start(session_cancel.clone(), units.len());
         let mut pending: FuturesUnordered<_> = units
             .into_iter()
             .map(|unit| {
@@ -201,30 +236,9 @@ impl Engine {
         }
     }
 
-    /// Share an aggregate request budget with other engines. The Web scheduler
-    /// uses one limiter per model preset so concurrent jobs cannot multiply the
-    /// configured orinfer concurrency.
-    pub fn with_request_limiter(mut self, limiter: Arc<Semaphore>) -> Self {
-        self.request_limiter = Some(limiter);
-        self
-    }
-
     /// The shared pool's in-flight cap (the queue layer sizes itself to this).
     pub fn concurrency(&self) -> usize {
         self.concurrency
-    }
-
-    async fn acquire_request_permit(&self) -> Option<OwnedSemaphorePermit> {
-        match &self.request_limiter {
-            Some(limiter) => Some(
-                limiter
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("translation request limiter must remain open"),
-            ),
-            None => None,
-        }
     }
 
     /// Translate one [`Unit`]: cache fast-path, then `translate`/`translate_batch`,
@@ -232,154 +246,101 @@ impl Engine {
     /// is logged and counted (empty `pairs`), never bubbled, so one bad unit
     /// can't abort the batch.
     pub async fn exec_unit(&self, unit: Unit) -> UnitDone {
-        self.exec_unit_using(unit, &translate::ChatClient::Http(&self.client))
-            .await
+        if self.uses_jsonl() {
+            let mut done = None;
+            self.exec_jsonl_units(
+                vec![unit],
+                tokio_util::sync::CancellationToken::new(),
+                |result| done = Some(result),
+            )
+            .await;
+            done.expect("an uncancelled unit always reports completion")
+        } else {
+            self.exec_unit_using(unit, &translate::ChatClient::Http(&self.client))
+                .await
+        }
     }
 
     async fn exec_unit_using(&self, unit: Unit, client: &translate::ChatClient<'_>) -> UnitDone {
-        let endpoint = &self.endpoint;
-        let model = &self.model;
-        let target = &self.target;
-        let cache = self.cache.as_ref().or(self.checkpoint.as_ref());
         let file = unit.file();
-
-        match unit {
-            // Independent: one segment per request, cache checked and filled
-            // around a single translate() call.
-            Unit::Single { id, text, .. } => {
-                let key = cache
-                    .as_ref()
-                    .map(|c| c.key(model, target, &text, &cache_scope(endpoint, &[], &[], None)));
-                if let (Some(_), Some(k)) = (cache.as_ref(), key.as_deref()) {
-                    if let Some(v) = self.cached(k).await {
-                        return UnitDone {
-                            file,
-                            attempted: 1,
-                            pairs: vec![(id, v)],
-                        };
-                    }
-                }
-                let _request_permit = if matches!(client, translate::ChatClient::Http(_)) {
-                    self.acquire_request_permit().await
-                } else {
-                    None
-                };
-                match translate::translate_using(client, endpoint, model, &text, target).await {
-                    Ok(tr) => {
-                        // Put before returning: even if the future is dropped
-                        // right after (Ctrl-C between completion and drain),
-                        // the next run finds the cache populated.
-                        if let (Some(_), Some(k)) = (cache.as_ref(), key.as_deref()) {
-                            self.remember(k, &tr).await;
-                        }
-                        UnitDone {
-                            file,
-                            attempted: 1,
-                            pairs: vec![(id, tr)],
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("warn: segment {} failed: {}", id, e);
-                        UnitDone {
-                            file,
-                            attempted: 1,
-                            pairs: vec![],
-                        }
-                    }
-                }
-            }
-
-            // Batched: N cues per request with read-only context. An all-cached
-            // fast path skips the HTTP round-trip; otherwise translate_batch
-            // returns one Option per cue (Some = done, None = the model
-            // skipped/failed that cue, kept original by the writer). A partial
-            // batch still yields every cue it could — one degenerate cue costs
-            // only itself.
+        let single = matches!(unit, Unit::Single { .. });
+        let (ids, cues, context) = match unit {
+            Unit::Single { id, text, .. } => (vec![id], vec![text], vec![]),
             Unit::Batch {
                 ids, cues, context, ..
-            } => {
-                let n = cues.len();
-                if n == 0 {
-                    return UnitDone {
-                        file,
-                        attempted: 0,
-                        pairs: vec![],
+            } => (ids, cues, context),
+        };
+        let attempted = cues.len();
+        let cue_refs: Vec<_> = cues.iter().map(String::as_str).collect();
+        let ctx_refs: Vec<_> = context.iter().map(String::as_str).collect();
+        let cache_enabled = self.cache.is_some() || self.checkpoint.is_some();
+        let keys: Vec<_> = cues
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                cache_enabled.then(|| {
+                    let scope = if single {
+                        cache_scope(&self.endpoint, &[], &[], None)
+                    } else {
+                        cache_scope(&self.endpoint, &cue_refs, &ctx_refs, Some(index))
                     };
-                }
-                let cue_refs: Vec<&str> = cues.iter().map(|s| s.as_str()).collect();
-                let ctx_refs: Vec<&str> = context.iter().map(|s| s.as_str()).collect();
-                // Per-cue cache keys (shared by the get fast-path and the put).
-                let keys: Vec<Option<String>> = cue_refs
-                    .iter()
-                    .enumerate()
-                    .map(|(index, t)| {
-                        cache.as_ref().map(|c| {
-                            c.key(
-                                model,
-                                target,
-                                t,
-                                &cache_scope(endpoint, &cue_refs, &ctx_refs, Some(index)),
-                            )
-                        })
-                    })
-                    .collect();
-
-                // All-cached fast path: skip the HTTP round-trip entirely.
-                let mut results: Vec<Option<String>> = Vec::with_capacity(n);
-                for k in &keys {
-                    let hit = match (cache.as_ref(), k.as_deref()) {
-                        (Some(_), Some(kk)) => self.cached(kk).await,
-                        _ => None,
-                    };
-                    results.push(hit);
-                }
-                if results.iter().all(|v| v.is_some()) {
-                    let pairs = ids
-                        .into_iter()
-                        .zip(results.into_iter().map(|v| v.unwrap()))
-                        .collect();
-                    return UnitDone {
-                        file,
-                        attempted: n,
-                        pairs,
-                    };
-                }
-
-                // Partial-cache path: request only the misses and keep the
-                // hits. Re-running a batch whose previous attempt half-failed
-                // must not re-translate (and re-bill) the cues that already
-                // succeeded.
-                let miss_idx: Vec<usize> = (0..n).filter(|&idx| results[idx].is_none()).collect();
-                let miss_cues: Vec<&str> = miss_idx.iter().map(|&idx| cue_refs[idx]).collect();
-                let _request_permit = if matches!(client, translate::ChatClient::Http(_)) {
-                    self.acquire_request_permit().await
-                } else {
-                    None
-                };
-                let trs = translate::translate_batch_using(
-                    client, endpoint, model, &miss_cues, &ctx_refs, target,
+                    Cache::key(&self.model, &self.target, text, &scope)
+                })
+            })
+            .collect();
+        let mut results = Vec::with_capacity(attempted);
+        for key in &keys {
+            results.push(match key {
+                Some(key) => self.cached(key).await,
+                None => None,
+            });
+        }
+        let misses: Vec<_> = (0..attempted)
+            .filter(|&index| results[index].is_none())
+            .collect();
+        if !misses.is_empty() {
+            let translations = if single {
+                let result = translate::translate_using(
+                    client,
+                    &self.endpoint,
+                    &self.model,
+                    &cues[0],
+                    &self.target,
                 )
                 .await;
-                for (slot, &idx) in miss_idx.iter().enumerate() {
-                    if let Some(tr) = &trs[slot] {
-                        if let (Some(_), Some(k)) = (cache.as_ref(), keys[idx].as_deref()) {
-                            self.remember(k, tr).await;
-                        }
-                        results[idx] = Some(tr.clone());
-                    }
+                if let Err(error) = &result {
+                    eprintln!("warn: segment {} failed: {error}", ids[0]);
                 }
-                let mut pairs = Vec::with_capacity(n);
-                for idx in 0..n {
-                    if let Some(tr) = results[idx].take() {
-                        pairs.push((ids[idx], tr));
+                vec![result.ok()]
+            } else {
+                let texts: Vec<_> = misses.iter().map(|&index| cue_refs[index]).collect();
+                translate::translate_batch_using(
+                    client,
+                    &self.endpoint,
+                    &self.model,
+                    &texts,
+                    &ctx_refs,
+                    &self.target,
+                )
+                .await
+            };
+            for (index, translation) in misses.into_iter().zip(translations) {
+                if let Some(translation) = translation {
+                    if let Some(key) = &keys[index] {
+                        self.remember(key, &translation).await;
                     }
-                }
-                UnitDone {
-                    file,
-                    attempted: n,
-                    pairs,
+                    results[index] = Some(translation);
                 }
             }
+        }
+        UnitDone {
+            file,
+            attempted,
+            pairs: ids
+                .into_iter()
+                .zip(results)
+                .filter_map(|(id, text)| text.map(|text| (id, text)))
+                .collect(),
         }
     }
 }
@@ -387,19 +348,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    fn test_engine(limiter: Arc<Semaphore>) -> Engine {
-        Engine::new(
-            reqwest::Client::new(),
-            "http://127.0.0.1:1".to_string(),
-            "model".to_string(),
-            "target".to_string(),
-            8,
-            None,
-        )
-        .with_request_limiter(limiter)
-    }
+    use std::sync::Arc;
 
     #[test]
     fn cache_scope_distinguishes_context_strategy_neighbors_and_position() {
@@ -413,27 +362,6 @@ mod tests {
         ] {
             assert_ne!(base, different);
         }
-    }
-
-    #[tokio::test]
-    async fn engines_share_one_request_budget() {
-        let limiter = Arc::new(Semaphore::new(1));
-        let first = test_engine(limiter.clone());
-        let second = test_engine(limiter);
-
-        let first_permit = first.acquire_request_permit().await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), second.acquire_request_permit())
-                .await
-                .is_err()
-        );
-
-        drop(first_permit);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), second.acquire_request_permit())
-                .await
-                .is_ok()
-        );
     }
 
     /// A partial-cache batch must send only the missing cues to orinfer and reuse
@@ -478,7 +406,7 @@ mod tests {
         let cache = Cache::open(Some(cache_dir.clone())).unwrap();
         // Prime the cache for two of the three cues.
         for (index, text) in ["one", "two"].into_iter().enumerate() {
-            let key = cache.key(
+            let key = Cache::key(
                 "model",
                 "target",
                 text,

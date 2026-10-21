@@ -9,6 +9,7 @@ init_build
 cp -R ai-pod-service/cloud.lazycat.aipod.ferryman/config "$STAGE/config"
 mkdir -p "$STAGE/agxorin"
 cp ai-pod-service/cloud.lazycat.aipod.ferryman/agxorin/docker-compose.yml "$STAGE/agxorin/"
+python3 scripts/bundle-orinfer.py "$STAGE/agxorin/orinfer"
 build_binary "$STAGE/agxorin/ferryman-agent"
 python3 scripts/check-artifacts.py write aipod "$STAGE"
 publish_stage

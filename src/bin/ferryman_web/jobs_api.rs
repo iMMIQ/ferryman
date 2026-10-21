@@ -301,7 +301,7 @@ pub(super) async fn create_job(
 
     let upload = dir.join(".upload.tmp");
     let mut filename = None;
-    let mut preset = Preset::SevenBFp8;
+    let mut preset = Preset::Index2B;
     let mut target = "中文".to_string();
     let mut mode = OutputMode::Bilingual;
     let mut save_directory = None;
@@ -353,8 +353,17 @@ pub(super) async fn create_job(
                 match name.as_str() {
                     "preset" => {
                         preset = match value.as_str() {
-                            "30b-fp8" => Preset::ThirtyBFp8,
-                            _ => Preset::SevenBFp8,
+                            "index-translate-35b" | "30b-fp8" => Preset::Index35B,
+                            "index-translate-9b" => Preset::Index9B,
+                            "index-translate-2b" | "7b-fp8" => Preset::Index2B,
+                            _ => {
+                                return reject_upload(
+                                    &dir,
+                                    StatusCode::BAD_REQUEST,
+                                    format!("unknown model preset: {value}"),
+                                )
+                                .await
+                            }
                         };
                     }
                     "target" => {
@@ -1335,7 +1344,7 @@ mod tests {
         }
         let request: CreateDirectoryJobsRequest = serde_json::from_value(serde_json::json!({
             "sources": [{"storage":"documents","path":"Books"}],
-            "save_strategy":"sibling_suffix", "preset":"7b-fp8", "target":"中文", "mode":"replace"
+            "save_strategy":"sibling_suffix", "preset":"index-translate-2b", "target":"中文", "mode":"replace"
         }))
         .unwrap();
         let response = preview_directory_jobs(
@@ -1370,7 +1379,7 @@ mod tests {
         );
         let invalid: CreateDirectoryJobsRequest = serde_json::from_value(serde_json::json!({
             "sources": [{"storage":"documents","path":"../outside"}],
-            "save_strategy":"sibling_overwrite", "preset":"7b-fp8", "target":"中文", "mode":"bilingual"
+            "save_strategy":"sibling_overwrite", "preset":"index-translate-2b", "target":"中文", "mode":"bilingual"
         })).unwrap();
         assert_eq!(
             preview_directory_jobs(

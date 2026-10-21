@@ -517,7 +517,7 @@ struct ClientConfig {
 }
 async fn config() -> Json<ClientConfig> {
     Json(ClientConfig {
-        presets: vec![Preset::SevenBFp8, Preset::ThirtyBFp8],
+        presets: Preset::ALL.to_vec(),
         formats: vec![
             "epub", "docx", "pdf", "srt", "vtt", "ass", "ssa", "lrc", "txt", "md",
         ],
@@ -743,12 +743,12 @@ async fn main() -> Result<()> {
         persister,
         request_limiters: Arc::new(HashMap::from([
             (
-                Preset::SevenBFp8,
-                Arc::new(Semaphore::new(Preset::SevenBFp8.config().concurrency)),
+                Preset::Index2B,
+                Arc::new(Semaphore::new(Preset::Index2B.config().concurrency)),
             ),
             (
-                Preset::ThirtyBFp8,
-                Arc::new(Semaphore::new(Preset::ThirtyBFp8.config().concurrency)),
+                Preset::Index35B,
+                Arc::new(Semaphore::new(Preset::Index35B.config().concurrency)),
             ),
         ])),
         translation_client,
@@ -841,12 +841,18 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn config_lists_every_supported_index_model() {
+        let Json(config) = config().await;
+        assert_eq!(config.presets, Preset::ALL);
+    }
+
     #[test]
     fn job_records_receive_optional_field_defaults() {
         let record: JobRecord = serde_json::from_value(serde_json::json!({
             "id": Uuid::new_v4(),
             "filename": "notes.txt",
-            "preset": "7b-fp8",
+            "preset": "index-translate-2b",
             "target": "中文",
             "mode": "bilingual",
             "status": "queued",
@@ -906,7 +912,7 @@ mod tests {
             record: JobRecord {
                 id,
                 filename: "notes.txt".to_string(),
-                preset: Preset::SevenBFp8,
+                preset: Preset::Index2B,
                 target: "中文".to_string(),
                 mode: OutputMode::Bilingual,
                 status: JobStatus::Translating,
@@ -1014,7 +1020,7 @@ mod tests {
                 record: JobRecord {
                     id,
                     filename: "notes.txt".to_string(),
-                    preset: Preset::SevenBFp8,
+                    preset: Preset::Index2B,
                     target: "中文".to_string(),
                     mode: OutputMode::Bilingual,
                     status,

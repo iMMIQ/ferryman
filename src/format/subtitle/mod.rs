@@ -5,7 +5,7 @@
 //! the model of context and produce disjoint output. Instead the format opts
 //! into [`crate::format::Strategy::Batched`] (see [`Document::strategy`]), and
 //! the engine batches consecutive cues behind ONE prompt with a `<cN>` delimiter
-//! alignment scheme (validated on Hy-MT2) that guarantees a strict **one-to-one
+//! alignment scheme that checks a strict **one-to-one
 //! correspondence**: the model returns exactly as many translations as it
 //! received, in order, never merging or splitting. See
 //! [`crate::translate::translate_batch`].
@@ -248,7 +248,7 @@ impl<F: SubFormat> Document for SubtitleDoc<F> {
     }
 
     /// Subtitles translate in contextual batches, not independently — see the
-    /// module docs. Defaults match the validated Hy-MT2 settings; the CLI may
+    /// module docs. Defaults use the shared translation settings; the CLI may
     /// override the parameters.
     fn strategy(&self) -> Strategy {
         Strategy::Batched {

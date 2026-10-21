@@ -164,21 +164,21 @@ mod tests {
         let output = PathBuf::from("chosen.txt");
         let busy = PathBuf::from("busy.txt");
         let jobs = HashMap::from([
-            (first, (Preset::SevenBFp8, Some(output.clone()))),
-            (other_model, (Preset::ThirtyBFp8, None)),
-            (blocked, (Preset::SevenBFp8, Some(busy.clone()))),
+            (first, (Preset::Index2B, Some(output.clone()))),
+            (other_model, (Preset::Index35B, None)),
+            (blocked, (Preset::Index2B, Some(busy.clone()))),
         ]);
         let mut pending = VecDeque::from([cancelled, blocked, first, other_model]);
         let active = HashMap::from([(0, busy)]);
         assert_eq!(
-            take_dispatchable(&mut pending, Some(Preset::SevenBFp8), &active, |id| jobs
+            take_dispatchable(&mut pending, Some(Preset::Index2B), &active, |id| jobs
                 .get(&id)
                 .cloned()),
-            Some((first, Preset::SevenBFp8, Some(output)))
+            Some((first, Preset::Index2B, Some(output)))
         );
         assert_eq!(pending, VecDeque::from([blocked, other_model]));
         assert!(
-            take_dispatchable(&mut pending, Some(Preset::SevenBFp8), &active, |id| jobs
+            take_dispatchable(&mut pending, Some(Preset::Index2B), &active, |id| jobs
                 .get(&id)
                 .cloned())
             .is_none()
@@ -192,21 +192,21 @@ mod tests {
         let active_outputs = [first.clone()];
 
         assert!(can_dispatch_job(
-            Some(Preset::SevenBFp8),
+            Some(Preset::Index2B),
             active_outputs.iter(),
-            Preset::SevenBFp8,
+            Preset::Index2B,
             Some(&second),
         ));
         assert!(!can_dispatch_job(
-            Some(Preset::SevenBFp8),
+            Some(Preset::Index2B),
             active_outputs.iter(),
-            Preset::ThirtyBFp8,
+            Preset::Index35B,
             Some(&second),
         ));
         assert!(!can_dispatch_job(
-            Some(Preset::SevenBFp8),
+            Some(Preset::Index2B),
             active_outputs.iter(),
-            Preset::SevenBFp8,
+            Preset::Index2B,
             Some(&first),
         ));
     }

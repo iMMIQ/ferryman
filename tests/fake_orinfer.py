@@ -42,7 +42,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-startup_delay = float(os.environ.get("FAKE_VLLM_START_DELAY", "0"))
+startup_delay = float(os.environ.get("FAKE_ORINFER_START_DELAY", "0"))
 if startup_delay:
     startup_lines = [
         "Loading safetensors checkpoint shards: 0% Completed",
@@ -55,4 +55,4 @@ if startup_delay:
         print(startup_line, file=sys.stderr, flush=True)
         time.sleep(startup_delay)
 
-HTTPServer(("127.0.0.1", 8001), Handler).serve_forever()
+HTTPServer(("127.0.0.1", 18088), Handler).serve_forever()

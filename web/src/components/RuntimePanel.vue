@@ -159,7 +159,7 @@ defineExpose({ manage });
         <pre>{{
           s.runtime.recent_logs?.join("\n") ||
           s.runtime.last_error ||
-          "等待 vLLM 输出…"
+          "等待 orinfer 输出…"
         }}</pre>
       </details>
     </section>
@@ -178,8 +178,9 @@ defineExpose({ manage });
         name="runtime-preset"
         label="待启动模型"
         :options="[
-          { value: '7b-fp8', label: '7B FP8' },
-          { value: '30b-fp8', label: '30B FP8' },
+          { value: 'index-translate-2b', label: 'Index 2B' },
+          { value: 'index-translate-9b', label: 'Index 9B' },
+          { value: 'index-translate-35b', label: 'Index 35B-A3B' },
         ]"
       />
       <div class="runtime-actions">

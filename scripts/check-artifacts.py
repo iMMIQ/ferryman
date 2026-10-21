@@ -77,15 +77,37 @@ def validate_payload(kind, files):
         require(needed <= {"libgcc_s.so.1", "libm.so.6", "libc.so.6", "ld-linux-aarch64.so.1"},
                 f"unexpected Agent dependency: {needed}")
         require(all(tuple(map(int, v[6:].split('.'))) <= (2, 35) for v in versions),
-                "Agent requires glibc newer than the pinned vLLM image's 2.35; use Ubuntu 22.04 sysroot")
+                "Agent requires glibc newer than the release baseline glibc 2.35; use Ubuntu 22.04 sysroot")
         compose = yaml.safe_load(files["agxorin/docker-compose.yml"][0])
         service = compose["services"]["ferryman-agent"]
-        require(re.search(r"@sha256:[0-9a-f]{64}$", service["image"]), "vLLM image must be digest pinned")
+        require(re.search(r"@sha256:[0-9a-f]{64}$", service["image"].removeprefix("${FERRYMAN_RUNTIME_IMAGE:-").removesuffix("}")), "Agent base image must be digest pinned")
         require("/healthz" in str(service["healthcheck"]["test"]), "missing Agent healthcheck")
         require("./ferryman-agent:/usr/local/bin/ferryman-agent:ro" in service["volumes"],
                 "Agent executable must be mounted read-only beside compose")
         require(compose["networks"]["default"]["name"] == "traefik-shared-network", "wrong AI Pod network")
         require(any("Host(`ferryman-agent-ai`)" in label for label in service["labels"]), "wrong AI host")
+        require(not service.get("ports") and service.get("network_mode") != "host", "inference must stay inside the Agent container")
+        require(service["environment"]["FERRYMAN_ORINFER_ENDPOINT"] == "http://127.0.0.1:18088", "inference must use container loopback")
+        require("./orinfer:/opt/orinfer:ro" in service["volumes"], "missing read-only Orinfer runtime")
+        require(service["environment"]["ORINFER_EXECUTION_CACHE"] == "/opt/orinfer/packages", "wrong execution package path")
+        lock = json.loads(files["agxorin/orinfer/release-lock.json"][0])
+        require(lock == json.loads(Path(__file__).with_name("orinfer-release.json").read_text()), "unexpected Orinfer release")
+        engine = files["agxorin/orinfer/bin/orinfer"][0]
+        elf(engine, 183)
+        require(files["agxorin/orinfer/bin/orinfer"][1] & 0o111, "Orinfer is not executable")
+        for name, digest in lock["assets"].items():
+            archive = files[f"agxorin/orinfer/releases/{name}"][0]
+            require(sha(archive) == digest, f"Orinfer release checksum mismatch: {name}")
+            contents = archive_files(archive)
+            if name == lock["engine"]:
+                require(contents["orinfer-v0.2.0-linux-aarch64/bin/orinfer"][0] == engine, "engine differs from release")
+            else:
+                # The build-time installer verifies package identity. Compare every
+                # installed file with the pinned release when validating the LPK.
+                for relative, (expected, _) in contents.items():
+                    installed = f"agxorin/orinfer/packages/{relative}"
+                    require(installed in files and files[installed][0] == expected, f"installed execution package differs: {relative}")
+        require(len([name for name in files if name.startswith("agxorin/orinfer/packages/") and name.endswith("/package.json")]) == 3, "expected three installed Index packages")
         config = yaml.safe_load(files["config/aipod.yml"][0])
         require("ferryman-agent-ai" in config["depends_on_hosts"], "missing host dependency")
     return {"target": TARGETS[kind][1], "needed": sorted(needed), "glibc": sorted(versions)}

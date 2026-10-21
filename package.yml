@@ -1,7 +1,7 @@
 package: cloud.lazycat.app.ferryman
-version: 0.3.1
+version: 0.4.0
 name: Ferryman
-description: 使用 Hy-MT2 翻译上传文件、用户文稿或网盘挂载目录，并保存双语或纯译文结果
+description: 使用 Index 翻译上传文件、用户文稿或网盘挂载目录，并保存双语或纯译文结果
 author: iMMIQ
 license: LGPL-3.0-or-later
 homepage: https://github.com/iMMIQ/ferryman
@@ -16,7 +16,7 @@ permissions:
 locales:
   zh-CN:
     name: Ferryman 文档翻译
-    description: 使用 Hy-MT2 翻译文件、用户文稿或网盘挂载目录
+    description: 使用 Index 翻译文件、用户文稿或网盘挂载目录
   en-US:
     name: Ferryman
-    description: Translate uploads, user documents, or mounted cloud drives with Hy-MT2
+    description: Translate uploads, user documents, or mounted cloud drives with Index

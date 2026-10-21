@@ -104,7 +104,7 @@ test("built frontend uses real Rust config, storage, preview and job lifecycle A
       body: JSON.stringify({
         sources: [{ storage: "documents", path: "smoke.txt" }],
         save_strategy: "sibling_suffix",
-        preset: "7b-fp8",
+        preset: "index-translate-2b",
         target: "中文",
         mode: "bilingual",
       }),

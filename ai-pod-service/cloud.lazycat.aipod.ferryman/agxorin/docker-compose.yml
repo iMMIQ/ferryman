@@ -1,12 +1,13 @@
 services:
   ferryman-agent:
-    image: docker.io/catdogai/lzc-aipod-vllm:agxorin-cu126-src-18f658bb3185-20260703@sha256:079f2ab5a3f19da5fbdf930476fed73625c3d47085407280fbee48c4293279be
+    image: ${FERRYMAN_RUNTIME_IMAGE:-debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251}
     entrypoint: ["/usr/local/bin/ferryman-agent"]
+    runtime: nvidia
     shm_size: 512m
     restart: unless-stopped
     # Agent health is independent of an on-demand model's loaded state.
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3)"]
+      test: ["CMD", "bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/8090; printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3; head -n 1 <&3 | grep -q ' 200 '"]
       interval: 30s
       timeout: 5s
       start_period: 10s
@@ -15,20 +16,20 @@ services:
       FERRYMAN_AGENT_LISTEN: 0.0.0.0:8090
       FERRYMAN_AUTH_STATE_FILE: /auth/token.sha256
       FERRYMAN_MODEL_ROOT: /models
-      FERRYMAN_CACHE_ROOT: /root/.cache
+      FERRYMAN_ORINFER_ENDPOINT: http://127.0.0.1:18088
+      FERRYMAN_CACHE_ROOT: /root/.cache/ferryman
       FERRYMAN_IDLE_TIMEOUT_SECONDS: 600
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
       RUST_LOG: info
-      LD_PRELOAD: ""
-      VLLM_CONFIGURE_LOGGING: "0"
-      VLLM_DO_NOT_TRACK: "1"
-      VLLM_NO_USAGE_STATS: "1"
-      TRITON_CACHE_DIR: /root/.cache/triton
-      TORCHINDUCTOR_CACHE_DIR: /root/.cache/torchinductor
+      PATH: /opt/orinfer/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      ORINFER_EXECUTION_CACHE: /opt/orinfer/packages
     volumes:
+      - ./orinfer:/opt/orinfer:ro
       - ./ferryman-agent:/usr/local/bin/ferryman-agent:ro
       - ${LZC_AGENT_DATA_DIR}/auth:/auth
       - ${LZC_AGENT_DATA_DIR}/models:/models
-      - ${LZC_AGENT_CACHE_DIR}/vllm:/root/.cache
+      - ${LZC_AGENT_CACHE_DIR}/orinfer:/root/.cache
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.${LZC_SERVICE_ID}-ferryman.rule=Host(`ferryman-agent-ai`)"

@@ -182,8 +182,11 @@ defineExpose({ chooseFile });
                 >翻译模型</label
               >
               <select id="translation-preset" v-model="s.preset">
-                <option value="7b-fp8">Hy-MT2 7B · 默认</option>
-                <option value="30b-fp8">Hy-MT2 30B · 更大模型</option>
+                <option value="index-translate-2b">Index 2B · 默认</option>
+                <option value="index-translate-9b">Index 9B</option>
+                <option value="index-translate-35b">
+                  Index 35B-A3B · 更大模型
+                </option>
               </select>
             </div>
           </div>

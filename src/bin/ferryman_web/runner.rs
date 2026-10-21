@@ -243,6 +243,12 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
             cache,
         )
         .with_request_limiter(request_limiter)
+        .with_jsonl(ferryman::jsonl::JsonlBackend {
+            client: state.translation_client.clone(),
+            endpoint: state.config.agent_url.clone(),
+            preset,
+            lease_id: lease_id.clone(),
+        })
         .with_checkpoint(Cache::open(Some(entry.dir.join("checkpoint"))));
 
         let (progress_tx, mut progress_rx) = watch::channel(BatchProgress::default());

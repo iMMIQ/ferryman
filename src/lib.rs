@@ -7,6 +7,7 @@ pub mod container;
 pub mod engine;
 pub mod format;
 pub mod html;
+pub mod jsonl;
 pub mod preset;
 pub mod settings;
 pub mod translate;

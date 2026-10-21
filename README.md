@@ -172,12 +172,16 @@ Ferryman's Web deployment has two processes:
   to queued and dispatched automatically; the content cache skips segments that
   were already translated. Temporary AI Pod outages keep waiting with backoff
   instead of turning recovered jobs into failures. Up to eight jobs
-  using the same preset run together through one process-wide HTTP client and
-  request budget (32 requests for each model). Preset groups stay ordered,
-  so the scheduler never tries to switch models while jobs are active.
+  using the same preset may run together. Web translation uses Orinfer JSONL:
+  requests from one document are collected into bounded rounds (up to 2048
+  requests / 63 MiB), and the Agent serializes GPU rounds with up to 32 active
+  model requests. Preset groups stay ordered, so the scheduler never tries to
+  switch models while jobs are active.
 - `ferryman-agent` is the lightweight AI Pod controller. It starts exactly one
   Orinfer child process (`index-translate-2b`, `index-translate-9b` or `index-translate-35b`) on demand and unloads it
-  after all leases expire and the idle timeout elapses. It also detects existing
+  after all leases expire and the idle timeout elapses. Document jobs invoke
+  `orinfer batch` with throughput scheduling and automatic prefix planning;
+  online/manual serving and batch execution are mutually exclusive. It also detects existing
   models, downloads missing weights with pause/resume and integrity checks, and
   benchmarks ModelScope, HF Mirror and Hugging Face using real model shards.
 
@@ -321,7 +325,10 @@ The CLI and Web adapter intentionally stop at the same library boundary:
 
 - `format` parses and renders every supported document type.
 - `translate` owns prompts, retries and response parsing.
-- `engine` owns caching, authenticated HTTP clients and request limiting.
+- `engine` owns caching, checkpoints and execution through HTTP or JSONL.
+- `jsonl` groups Chat requests, polls completed rows by byte cursor and maps
+  `custom_id` back to the waiting translation. Failed/truncated requests use
+  the same bounded retry/split logic and create fresh recovery rounds.
 - `batch` owns input discovery, output naming, concurrent dispatch, cancellation
   and progressive writes.
 - `settings` owns defaults and Web safety bounds.
@@ -329,7 +336,15 @@ The CLI and Web adapter intentionally stop at the same library boundary:
 `ferryman` maps CLI flags into these shared types. `ferryman-web` adds identity,
 mounted-storage validation, persistent job records and model leases, then calls
 the same engine and batch functions. `ferryman-agent` remains isolated to AI Pod
-model lifecycle and Orinfer proxying.
+model lifecycle, the authenticated JSONL spool and Orinfer proxying.
+
+JSONL input/output files live only in the AI Pod runtime cache and are removed
+when a round finishes or is cancelled. Interrupted Agent runs can resume the same
+immutable input with Orinfer's `--resume`; completed Web units also survive in
+per-job checkpoints. Truncated output is never cached as a complete translation.
+Cancellation sends SIGTERM, waits for the worker to drain, then reaps its process
+group. Unreachable Web leases expire and stop orphan workers; stale spools are
+collected automatically. Model inference has no public HTTP port.
 
 ## Usage
 

@@ -42,6 +42,57 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def batch():
+    def arg(name):
+        return sys.argv[sys.argv.index(name) + 1]
+
+    input_path, output_path = arg("--input"), arg("--output")
+    with open(input_path) as file:
+        requests = [json.loads(line) for line in file if line.strip()]
+    root = os.environ.get("FIXTURE_ROOT")
+    if root:
+        with open(os.path.join(root, "runs.jsonl"), "a") as file:
+            file.write(json.dumps({"args": sys.argv[1:], "requests": requests}) + "\n")
+    completed = set()
+    if "--resume" in sys.argv and os.path.exists(output_path):
+        with open(output_path) as file:
+            completed = {json.loads(line)["custom_id"] for line in file if line.strip()}
+    with open(output_path + ".meta.json", "w") as file:
+        json.dump({"fixture": True}, file)
+    with open(output_path, "a") as file:
+        # Deliberately reverse completion order. Every row remains independent.
+        for request in reversed(requests):
+            assert request["method"] == "POST"
+            assert request["url"] == "/v1/chat/completions"
+            if request["custom_id"] in completed:
+                continue
+            body = request["body"]
+            assert body["enable_thinking"] is False
+            prompt = body["messages"][0]["content"]
+            if "<delay>" in prompt or ("<resume-delay>" in prompt and "--resume" not in sys.argv):
+                time.sleep(120)
+            pairs = re.findall(r"<c(\d+)>(.*?)</c\1>", prompt, re.S)
+            text = prompt.split("\n\n")[-1]
+            truncated = "<truncate>" in prompt and (len(pairs) > 1 or len(text) > 128)
+            content = "INCOMPLETE-DO-NOT-CACHE" if truncated else (
+                "\n".join(f"<c{n}>译文:{text}</c{n}>" for n, text in pairs) if pairs else "译文:" + text
+            )
+            output = {"custom_id": request["custom_id"], "error": None, "response": {
+                "status_code": 200, "body": {"choices": [{
+                    "finish_reason": "length" if truncated else "stop", "message": {"content": content}
+                }]}
+            }}
+            file.write(json.dumps(output, ensure_ascii=False) + "\n")
+            file.flush()
+            time.sleep(0.01)
+    print(json.dumps({"processed": len(requests)}), flush=True)
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "batch":
+    batch()
+    sys.exit(0)
+
+
 startup_delay = float(os.environ.get("FAKE_ORINFER_START_DELAY", "0"))
 if startup_delay:
     startup_lines = [

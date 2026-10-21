@@ -24,14 +24,19 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+#[path = "ferryman_agent/jsonl.rs"]
+mod jsonl;
 #[path = "ferryman_agent/model_manager.rs"]
 mod model_manager;
+use ferryman::jsonl::BatchPhase;
+use jsonl::{BatchJob, BatchJobs};
 
 use model_manager::{DownloadRequest, ModelManager, ModelPhase};
 
 #[derive(Clone)]
 struct AppState {
     controller: Controller,
+    batches: BatchJobs,
     models: ModelManager,
     client: reqwest::Client,
     stream_client: reqwest::Client,
@@ -209,6 +214,7 @@ enum StartupStage {
 #[derive(Clone, Debug, Serialize, ts_rs::TS)]
 struct RuntimeStatus {
     state: RuntimePhase,
+    execution_mode: ExecutionMode,
     preset: Option<Preset>,
     pid: Option<u32>,
     active_requests: usize,
@@ -223,12 +229,22 @@ struct RuntimeStatus {
     recent_logs: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+enum ExecutionMode {
+    #[default]
+    Serve,
+    Batch,
+}
+
 #[derive(Deserialize)]
 struct AcquireRequest {
     preset: Preset,
     lease_id: String,
     #[serde(default = "default_lease_ttl")]
     ttl_seconds: u64,
+    #[serde(default)]
+    mode: ExecutionMode,
 }
 
 #[derive(Deserialize)]
@@ -260,6 +276,19 @@ enum RuntimeCommand {
         force: bool,
         reply: oneshot::Sender<Result<RuntimeStatus, String>>,
     },
+    CheckBatchLease {
+        preset: Preset,
+        lease_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    StartBatch {
+        job: Arc<BatchJob>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    CancelBatch {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Touch,
     OrinferLog {
         pid: u32,
@@ -275,6 +304,8 @@ struct RuntimeManager {
     phase: RuntimePhase,
     preset: Option<Preset>,
     child: Option<Child>,
+    mode: ExecutionMode,
+    batch: Option<Arc<BatchJob>>,
     process_group: Option<rustix::process::Pid>,
     leases: HashMap<String, Lease>,
     last_activity: Instant,
@@ -331,6 +362,7 @@ impl Controller {
         let active_requests = Arc::new(AtomicUsize::new(0));
         let initial = RuntimeStatus {
             state: RuntimePhase::Stopped,
+            execution_mode: ExecutionMode::Serve,
             preset: None,
             pid: None,
             active_requests: 0,
@@ -354,6 +386,8 @@ impl Controller {
             phase: RuntimePhase::Stopped,
             preset: None,
             child: None,
+            mode: ExecutionMode::Serve,
+            batch: None,
             process_group: None,
             leases: HashMap::new(),
             last_activity: Instant::now(),
@@ -419,12 +453,135 @@ impl Controller {
             .map_err(|_| "runtime manager stopped before replying".to_string())?
     }
 
+    async fn check_batch_lease(&self, preset: Preset, lease_id: &str) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::CheckBatchLease {
+                preset,
+                lease_id: lease_id.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| "runtime unavailable")?;
+        result.await.map_err(|_| "runtime stopped")?
+    }
+
+    async fn start_batch(&self, job: Arc<BatchJob>) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::StartBatch { job, reply })
+            .await
+            .map_err(|_| "runtime unavailable")?;
+        result.await.map_err(|_| "runtime stopped")?
+    }
+
+    async fn cancel_batch(&self, id: uuid::Uuid) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::CancelBatch { id, reply })
+            .await
+            .map_err(|_| "runtime unavailable")?;
+        result.await.map_err(|_| "runtime stopped")?
+    }
+
     async fn touch(&self) {
         let _ = self.commands.send(RuntimeCommand::Touch).await;
     }
 }
 
 impl RuntimeManager {
+    fn check_batch_lease(&self, preset: Preset, lease_id: &str) -> Result<(), String> {
+        if self.mode != ExecutionMode::Batch
+            || self.preset != Some(preset)
+            || !self
+                .leases
+                .get(lease_id)
+                .is_some_and(|lease| lease.preset == preset && lease.expires_at > Instant::now())
+        {
+            return Err("a matching batch model lease is required".into());
+        }
+        Ok(())
+    }
+
+    fn restore_batch_reservation(&mut self, preset: Option<Preset>) {
+        if !self.leases.is_empty() {
+            self.preset = preset;
+            self.phase = RuntimePhase::Ready;
+            self.startup_stage = Some(StartupStage::Ready);
+            self.startup_progress = 100;
+        }
+        self.publish();
+    }
+
+    async fn start_batch(&mut self, job: Arc<BatchJob>) -> Result<(), String> {
+        self.prune_leases();
+        self.check_batch_lease(job.preset, &job.lease_id)?;
+        if self
+            .batch
+            .as_ref()
+            .is_some_and(|active| active.id == job.id)
+        {
+            return Ok(());
+        }
+        if job.status.read().await.0.terminal() {
+            return Ok(());
+        }
+        if self.child.is_some() {
+            return Err("another JSONL job is running".into());
+        }
+        let model = FsPath::new(&self.model_root).join(job.preset.config().model_dir_name);
+        let mut command = Command::new(&self.orinfer_bin);
+        command
+            .arg("batch")
+            .arg(model)
+            .args(["--model", job.preset.api_model()])
+            .arg("--input")
+            .arg(job.directory.join("input.jsonl"))
+            .arg("--output")
+            .arg(job.directory.join("output.jsonl"))
+            .args(["--scheduler-policy", "throughput", "--batch-order", "auto"])
+            .args([
+                "--max-active-requests",
+                &job.preset.config().concurrency.to_string(),
+            ])
+            .args(["--prefix-cache-mib", "1024"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        if job.directory.join("output.jsonl.meta.json").exists() {
+            command.arg("--resume");
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                *job.status.write().await = (
+                    BatchPhase::Failed,
+                    Some(format!("start Orinfer batch: {error}")),
+                );
+                return Ok(());
+            }
+        };
+        let pid = child.id().unwrap_or_default();
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(pipe_logs(stdout, pid, "stdout", self.commands.clone()));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(pipe_logs(stderr, pid, "stderr", self.commands.clone()));
+        }
+        self.process_group = rustix::process::Pid::from_raw(pid as i32);
+        self.child = Some(child);
+        self.batch = Some(job.clone());
+        self.active_requests.fetch_add(1, Ordering::AcqRel);
+        self.recent_logs.clear();
+        self.last_activity = Instant::now();
+        *job.status.write().await = (BatchPhase::Running, None);
+        info!(id = %job.id, pid, "Orinfer JSONL process started");
+        self.publish();
+        Ok(())
+    }
+
     async fn run(mut self) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -447,6 +604,15 @@ impl RuntimeManager {
             }
             RuntimeCommand::Release { lease_id, reply } => {
                 self.leases.remove(&lease_id);
+                if self
+                    .batch
+                    .as_ref()
+                    .is_some_and(|job| job.lease_id == lease_id)
+                {
+                    let preset = self.preset;
+                    let _ = self.stop_child(false).await;
+                    self.restore_batch_reservation(preset);
+                }
                 self.last_activity = Instant::now();
                 let status = self.publish();
                 let _ = reply.send(status);
@@ -459,6 +625,29 @@ impl RuntimeManager {
                 } else {
                     self.leases.clear();
                     self.stop_child(force).await.map(|_| self.publish())
+                };
+                let _ = reply.send(result);
+            }
+            RuntimeCommand::CheckBatchLease {
+                preset,
+                lease_id,
+                reply,
+            } => {
+                self.prune_leases();
+                let _ = reply.send(self.check_batch_lease(preset, &lease_id));
+            }
+            RuntimeCommand::StartBatch { job, reply } => {
+                let result = self.start_batch(job).await;
+                let _ = reply.send(result);
+            }
+            RuntimeCommand::CancelBatch { id, reply } => {
+                let result = if self.batch.as_ref().is_some_and(|job| job.id == id) {
+                    let preset = self.preset;
+                    let result = self.stop_child(false).await;
+                    self.restore_batch_reservation(preset);
+                    result
+                } else {
+                    Ok(())
                 };
                 let _ = reply.send(result);
             }
@@ -484,7 +673,7 @@ impl RuntimeManager {
         let ttl = Duration::from_secs(request.ttl_seconds.clamp(30, 3600));
 
         if let Some(current) = self.preset {
-            if current != request.preset {
+            if current != request.preset || self.mode != request.mode {
                 let other_leases = self
                     .leases
                     .iter()
@@ -509,7 +698,14 @@ impl RuntimeManager {
         );
         self.last_activity = Instant::now();
 
-        if self.child.is_none() {
+        self.mode = request.mode;
+        if self.mode == ExecutionMode::Batch {
+            self.preset = Some(request.preset);
+            self.phase = RuntimePhase::Ready;
+            self.startup_stage = Some(StartupStage::Ready);
+            self.startup_progress = 100;
+            self.last_error = None;
+        } else if self.child.is_none() {
             if let Err(error) = self.start_child(request.preset).await {
                 self.leases
                     .retain(|_, lease| lease.preset != request.preset);
@@ -617,6 +813,10 @@ impl RuntimeManager {
     }
 
     async fn stop_child(&mut self, force: bool) -> Result<(), String> {
+        if let Some(job) = self.batch.take() {
+            self.active_requests.fetch_sub(1, Ordering::AcqRel);
+            *job.status.write().await = (BatchPhase::Cancelled, Some("batch cancelled".into()));
+        }
         let group = self.process_group.take();
         let Some(mut child) = self.child.take() else {
             if let Some(pid) = group {
@@ -681,6 +881,29 @@ impl RuntimeManager {
                             rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
                     }
                     self.child = None;
+                    if let Some(job) = self.batch.take() {
+                        self.active_requests.fetch_sub(1, Ordering::AcqRel);
+                        *job.status.write().await = if status.success() {
+                            (BatchPhase::Completed, None)
+                        } else {
+                            (
+                                BatchPhase::Failed,
+                                Some(format!(
+                                    "Orinfer batch exited with {status}: {}",
+                                    self.recent_logs
+                                        .back()
+                                        .map(String::as_str)
+                                        .unwrap_or("no worker log")
+                                )),
+                            )
+                        };
+                        self.last_activity = Instant::now();
+                        // A nonzero exit may simply report truncated/invalid rows.
+                        // Their envelopes are authoritative; absent rows retry.
+                        info!(id = %job.id, %status, "Orinfer JSONL process finished");
+                        self.publish();
+                        return;
+                    }
                     self.phase = RuntimePhase::Failed;
                     self.last_error = Some(format!("orinfer exited with {status}"));
                     self.startup_elapsed_seconds =
@@ -696,6 +919,23 @@ impl RuntimeManager {
                     warn!(%error, "could not poll orinfer process");
                 }
             }
+        }
+
+        if self.mode == ExecutionMode::Batch {
+            if self
+                .batch
+                .as_ref()
+                .is_some_and(|job| !self.leases.contains_key(&job.lease_id))
+            {
+                let preset = self.preset;
+                let _ = self.stop_child(false).await;
+                self.restore_batch_reservation(preset);
+            }
+            if self.leases.is_empty() && self.last_activity.elapsed() >= self.idle_timeout {
+                let _ = self.stop_child(false).await;
+            }
+            self.publish();
+            return;
         }
 
         if self.phase == RuntimePhase::Starting
@@ -853,6 +1093,7 @@ impl RuntimeManager {
         };
         let status = RuntimeStatus {
             state: self.phase,
+            execution_mode: self.mode,
             preset: self.preset,
             pid: self.child.as_ref().and_then(Child::id),
             active_requests: self.active_requests.load(Ordering::Relaxed),
@@ -1170,7 +1411,8 @@ fn streaming_client() -> reqwest::Result<reqwest::Client> {
 }
 
 async fn proxy_chat(State(state): State<AppState>, body: Bytes) -> Response {
-    if state.controller.snapshot().state != RuntimePhase::Ready {
+    let runtime = state.controller.snapshot();
+    if runtime.state != RuntimePhase::Ready || runtime.execution_mode != ExecutionMode::Serve {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorBody {
@@ -1308,11 +1550,14 @@ async fn main() -> anyhow::Result<()> {
         orinfer_endpoint.clone(),
         client.clone(),
     );
+    let batches = BatchJobs::new(PathBuf::from(&cache_root).join("batches"));
+    batches.start_cleanup();
     let models = ModelManager::new_background(model_root.into(), cache_root.into())
         .await
         .map_err(anyhow::Error::msg)?;
     let state = AppState {
         controller: controller.clone(),
+        batches,
         models,
         client,
         stream_client: streaming_client()?,
@@ -1357,6 +1602,13 @@ fn agent_router(state: AppState) -> Router {
         .route("/storage", get(storage_status))
         .route("/cache", delete(clear_runtime_cache))
         .route("/v1/chat/completions", post(proxy_chat))
+        .route(
+            "/batch/jobs/{id}",
+            post(jsonl::submit).get(jsonl::poll).delete(jsonl::remove),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            ferryman::jsonl::MAX_BATCH_BYTES + 1024 * 1024,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_agent_auth,
@@ -1417,6 +1669,7 @@ mod tests {
         let (commands, _receiver) = mpsc::channel(8);
         let (_, status) = watch::channel(RuntimeStatus {
             state: RuntimePhase::Ready,
+            execution_mode: ExecutionMode::Serve,
             preset: Some(Preset::Index2B),
             pid: None,
             active_requests: 0,
@@ -1437,6 +1690,7 @@ mod tests {
                 status,
                 active_requests: active.clone(),
             },
+            batches: BatchJobs::new(root.path().join("batches")),
             models: ModelManager::new(root.path().join("models"), root.path().join("cache"))
                 .await
                 .unwrap(),
@@ -1530,6 +1784,7 @@ mod tests {
         let (commands, _receiver) = mpsc::channel(1);
         let (_, status) = watch::channel(RuntimeStatus {
             state: RuntimePhase::Stopped,
+            execution_mode: ExecutionMode::Serve,
             preset: None,
             pid: None,
             active_requests: 0,
@@ -1549,6 +1804,7 @@ mod tests {
                 status,
                 active_requests: Arc::new(AtomicUsize::new(0)),
             },
+            batches: BatchJobs::new(root.path().join("batches")),
             models: ModelManager::new(root.path().join("models"), root.path().join("cache"))
                 .await
                 .unwrap(),
@@ -1569,6 +1825,7 @@ mod tests {
             "/models/index-translate-2b/pause",
             "/model-sources/benchmark",
             "/v1/chat/completions",
+            "/batch/jobs/00000000-0000-0000-0000-000000000000",
         ] {
             let response = client
                 .post(format!("{origin}{path}"))

@@ -1,124 +1,13 @@
 //! Orinfer OpenAI-compatible translation client.
 
 use anyhow::{anyhow, Result};
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-pub(crate) enum ChatClient<'a> {
-    Http(&'a reqwest::Client),
-    Jsonl(&'a crate::jsonl::JsonlSender),
-}
-
-impl ChatClient<'_> {
-    async fn post(&self, url: &str, body: &ChatReq<'_>) -> ChatAttempt {
-        match self {
-            Self::Http(client) => post_chat_once(client, url, body).await,
-            Self::Jsonl(sender) => {
-                let output = match sender
-                    .chat(serde_json::to_value(body).expect("serialize chat request"))
-                    .await
-                {
-                    Ok(output) => output,
-                    Err(error) => {
-                        return ChatAttempt::Transient {
-                            error: error.to_string(),
-                            retry_after: None,
-                        }
-                    }
-                };
-                if !output["error"].is_null() {
-                    let error = output["error"].to_string();
-                    // Orinfer row validation errors use an error envelope rather
-                    // than HTTP 4xx; context errors still invoke our splitter.
-                    return if is_context_overflow(&error) {
-                        ChatAttempt::Fatal {
-                            overflow: true,
-                            error,
-                        }
-                    } else {
-                        // Orinfer uses request_failed for both validation and
-                        // worker errors. Retry the latter within our usual cap.
-                        ChatAttempt::Transient {
-                            error,
-                            retry_after: None,
-                        }
-                    };
-                }
-                let response = &output["response"];
-                let status = response["status_code"].as_u64().unwrap_or(500);
-                if !(200..300).contains(&status) {
-                    let error = response["body"].to_string();
-                    return if status == 429 || status >= 500 {
-                        ChatAttempt::Transient {
-                            error,
-                            retry_after: None,
-                        }
-                    } else {
-                        ChatAttempt::Fatal {
-                            overflow: is_context_overflow(&error),
-                            error,
-                        }
-                    };
-                }
-                parse_chat_response(response["body"].clone())
-            }
-        }
-    }
-}
-
-fn parse_chat_response(value: serde_json::Value) -> ChatAttempt {
-    match serde_json::from_value::<ChatResp>(value) {
-        Ok(parsed) => match parsed.choices.into_iter().next() {
-            Some(choice) => validate_choice(choice),
-            None => ChatAttempt::Transient {
-                error: "empty choices".into(),
-                retry_after: None,
-            },
-        },
-        Err(error) => ChatAttempt::Transient {
-            error: format!("parse json: {error}"),
-            retry_after: None,
-        },
-    }
-}
+mod chat;
+pub(crate) use chat::ChatClient;
+use chat::{ChatAttempt, ChatReq};
 
 pub(crate) const TRANSLATION_CACHE_VERSION: &str = "v3-index-orinfer";
-
-#[derive(Serialize)]
-struct ChatReq<'a> {
-    model: &'a str,
-    messages: Vec<Message<'a>>,
-    temperature: f32,
-    top_p: f32,
-    top_k: i32,
-    repetition_penalty: f32,
-    enable_thinking: bool,
-    // Orinfer derives the output budget from the remaining context (up to 8192 tokens).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-}
-
-#[derive(Serialize)]
-struct Message<'a> {
-    role: &'a str,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct ChatResp {
-    choices: Vec<Choice>,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    message: RespMsg,
-    finish_reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RespMsg {
-    content: Option<String>,
-}
 
 /// Translate `text` into `target_lang` with Index translation models.
 ///
@@ -179,19 +68,7 @@ async fn translate_single(
         text = trimmed
     );
 
-    let body = ChatReq {
-        model,
-        messages: vec![Message {
-            role: "user",
-            content: prompt,
-        }],
-        temperature: 0.0,
-        top_p: 1.0,
-        top_k: 0,
-        repetition_penalty: 1.0,
-        enable_thinking: false,
-        max_tokens: None,
-    };
+    let body = ChatReq::translation(model, prompt);
 
     let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
 
@@ -298,17 +175,6 @@ fn split_at_language_boundary(text: &str) -> Option<(String, String)> {
 /// through a multi-byte code point (which would panic — common with CJK
 /// content, where byte index `n` routinely lands mid-character). Appends `…`
 /// when truncated. Floors `n` back to the nearest char boundary.
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        return s.to_string();
-    }
-    let mut end = n;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
-}
-
 /// Translate a batch of segments (subtitle cues, prose lines) into
 /// `target_lang`, returning one `Option<String>` per segment, aligned by
 /// position (`Some` = translated; `None` = the model skipped/failed it and the
@@ -436,27 +302,6 @@ struct SliceOutcome {
     overflow: bool,
 }
 
-/// Did a fatal 4xx come from the prompt not fitting the model's context window?
-/// vLLM's body reads "This model's maximum context length is N tokens … reduce
-/// the length of the input prompt"; other compatible servers say "context
-/// window" or "token limit". Such a batch is recoverable by splitting; other
-/// 4xx (bad model id, malformed request) are not. Matched case-insensitively
-/// against a small pattern set rather than one exact phrasing, so a server
-/// wording change doesn't silently turn a recoverable overflow into a
-/// permanent failure.
-fn is_context_overflow(err: &str) -> bool {
-    const PATTERNS: &[&str] = &[
-        "context length",
-        "context_length_exceeded",
-        "input prompt",
-        "context window",
-        "token limit",
-        "maximum context",
-    ];
-    let lower = err.to_ascii_lowercase();
-    PATTERNS.iter().any(|pattern| lower.contains(pattern))
-}
-
 /// Retry budget shared by the Single and Batch paths (4 attempts total).
 const MAX_ATTEMPTS: u32 = 4;
 
@@ -484,116 +329,6 @@ async fn backoff(attempt: u32, retry_after: Option<Duration>) {
     tokio::time::sleep(retry_delay(attempt, retry_after)).await;
 }
 
-fn parse_retry_after(value: &str, now: std::time::SystemTime) -> Option<Duration> {
-    let value = value.trim();
-    value
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
-        .or_else(|| {
-            httpdate::parse_http_date(value)
-                .ok()
-                .map(|date| date.duration_since(now).unwrap_or_default())
-        })
-}
-
-/// One POST to `/v1/chat/completions`, classified. This is the single shared
-/// HTTP+parse layer for the Single and Batch paths; callers own retry policy
-/// and what to do with the content.
-enum ChatAttempt {
-    /// 2xx with the assistant message content parsed out.
-    Success(String),
-    /// Worth retrying: network error, 5xx, 429, or an unparseable body. Carries
-    /// a server-supplied `Retry-After` (seconds) when the response had one.
-    Transient {
-        error: String,
-        retry_after: Option<Duration>,
-    },
-    /// Other 4xx — permanent for this body (bad model id, malformed request,
-    /// or a context-length overflow, flagged for the caller's split logic).
-    Fatal { error: String, overflow: bool },
-}
-
-fn validate_choice(choice: Choice) -> ChatAttempt {
-    match choice.finish_reason.as_deref() {
-        Some("length") => {
-            return ChatAttempt::Fatal {
-                error: "model output was truncated".into(),
-                overflow: true,
-            }
-        }
-        // Some compatible servers omit finish_reason. Still reject empty text.
-        None | Some("stop") => {}
-        Some(reason) => {
-            return ChatAttempt::Fatal {
-                error: format!("model did not complete translation: {reason}"),
-                overflow: false,
-            }
-        }
-    }
-    match choice.message.content {
-        Some(content) if !content.trim().is_empty() => ChatAttempt::Success(content),
-        _ => ChatAttempt::Transient {
-            error: "empty translation".into(),
-            retry_after: None,
-        },
-    }
-}
-
-async fn post_chat_once(client: &reqwest::Client, url: &str, body: &ChatReq<'_>) -> ChatAttempt {
-    match client.post(url).json(body).send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            // `Retry-After` only means something on a retryable response; read
-            // it before `text()` consumes the response.
-            let retry_after =
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                    resp.headers()
-                        .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|value| parse_retry_after(value, std::time::SystemTime::now()))
-                } else {
-                    None
-                };
-            let txt = resp.text().await.unwrap_or_default();
-            if !status.is_success() {
-                let message = format!("HTTP {}: {}", status, truncate(&txt, 300));
-                // 4xx (except 429 Too Many Requests) are permanent — bad model
-                // id, malformed request, or a block over the context window.
-                // Retrying just burns a concurrency slot for several seconds
-                // and can never succeed.
-                if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    return ChatAttempt::Fatal {
-                        overflow: is_context_overflow(&message),
-                        error: message,
-                    };
-                }
-                return ChatAttempt::Transient {
-                    error: message,
-                    retry_after,
-                };
-            }
-            match serde_json::from_str::<ChatResp>(&txt) {
-                Ok(parsed) => match parsed.choices.into_iter().next() {
-                    Some(choice) => validate_choice(choice),
-                    None => ChatAttempt::Transient {
-                        error: "empty choices".into(),
-                        retry_after: None,
-                    },
-                },
-                Err(e) => ChatAttempt::Transient {
-                    error: format!("parse json: {} | {}", e, truncate(&txt, 200)),
-                    retry_after: None,
-                },
-            }
-        }
-        Err(e) => ChatAttempt::Transient {
-            error: format!("request: {}", e),
-            retry_after: None,
-        },
-    }
-}
-
 /// Send one cue slice as a tagged batch, retrying transient failures and
 /// keeping the attempt that translated the most cues (so a flaky batch still
 /// yields what it could). Never aborts on a partial result — a degenerate cue
@@ -610,20 +345,7 @@ async fn translate_one_batch(
     target_lang: &str,
 ) -> SliceOutcome {
     let prompt = build_batch_prompt(cues, context, target_lang);
-    let body = ChatReq {
-        model,
-        messages: vec![Message {
-            role: "user",
-            content: prompt,
-        }],
-        temperature: 0.0,
-        top_p: 1.0,
-        top_k: 0,
-        repetition_penalty: 1.0,
-        enable_thinking: false,
-        // Use the server context budget; length responses trigger bounded splitting.
-        max_tokens: None,
-    };
+    let body = ChatReq::translation(model, prompt);
 
     let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
 
@@ -818,43 +540,6 @@ mod tests {
 
     use std::sync::Arc;
 
-    #[test]
-    fn rejects_empty_truncated_and_non_text_completions() {
-        let classify = |reason: Option<&str>, content: Option<&str>| {
-            validate_choice(Choice {
-                finish_reason: reason.map(str::to_owned),
-                message: RespMsg {
-                    content: content.map(str::to_owned),
-                },
-            })
-        };
-        assert!(matches!(
-            classify(Some("length"), Some("partial")),
-            ChatAttempt::Fatal { overflow: true, .. }
-        ));
-        for content in [None, Some(""), Some(" \n ")] {
-            assert!(matches!(
-                classify(Some("stop"), content),
-                ChatAttempt::Transient { .. }
-            ));
-        }
-        assert!(matches!(
-            classify(Some("content_filter"), Some("partial")),
-            ChatAttempt::Fatal {
-                overflow: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            classify(Some("stop"), Some("complete")),
-            ChatAttempt::Success(_)
-        ));
-        assert!(matches!(
-            classify(None, Some("legacy server")),
-            ChatAttempt::Success(_)
-        ));
-    }
-
     #[tokio::test]
     async fn truncated_single_and_batch_are_retranslated_in_smaller_pieces() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1037,49 +722,6 @@ mod tests {
     }
 
     #[test]
-    fn is_context_overflow_matches_vllm_context_error() {
-        // The exact body vLLM returns when the prompt exceeds the context window.
-        let vllm = "HTTP 400 Bad Request: {\"error\":{\"message\":\"This model's \
-            maximum context length is 4096 tokens. However, you requested 0 output \
-            tokens and your prompt contains at least 4097 input tokens, for a total \
-            of at least 4097 tokens. Please reduce the length of the input prompt or \
-            the number of requested output tokens.\"}}";
-        assert!(is_context_overflow(vllm));
-        // The shorter "input prompt" phrasing alone also matches.
-        assert!(is_context_overflow(
-            "HTTP 400: Please reduce the length of the input prompt"
-        ));
-        // Other 4xx must NOT match — those aren't recoverable by splitting.
-        assert!(!is_context_overflow("HTTP 404 Not Found: model not found"));
-        assert!(!is_context_overflow(
-            "HTTP 400: invalid sampling temperature"
-        ));
-    }
-
-    #[test]
-    fn truncate_never_splits_multibyte_char() {
-        // '。' is 3 bytes (E3 80 82). A cut at byte 200 inside a run of them
-        // must floor to the nearest boundary, not panic. Build a string whose
-        // byte 200 is mid-character.
-        let s = "あ".repeat(200); // each 'あ' is 3 bytes; byte 200 == char #66 boundary
-        let t = truncate(&s, 200);
-        assert!(t.ends_with('…'));
-        // The truncated body must be valid UTF-8 (no panic) and shorter than s.
-        assert!(t.len() <= 201);
-
-        // A cut landing mid-character: byte 200 of "。" * 100 is inside char #67.
-        let u = "。".repeat(100); // bytes: char ends at 3,6,...,201; 200 is mid-char #67
-        let v = truncate(&u, 200);
-        assert!(v.ends_with('…'));
-        assert_eq!(v.len(), 3 * 66 + 3); // 66 full chars (198 bytes) + '…' (3 bytes)
-
-        // Short string returned unchanged.
-        assert_eq!(truncate("hello", 10), "hello");
-        // ASCII boundary exact.
-        assert_eq!(truncate("hello world", 5), "hello…");
-    }
-
-    #[test]
     fn split_at_language_boundary_cuts_between_words() {
         // Midpoint falls inside "middle"; the nearest whitespace wins, and
         // the boundary char (and any trailing run) stays with the left half.
@@ -1184,19 +826,5 @@ mod retry_policy_tests {
                 );
             }
         }
-    }
-    #[test]
-    fn retry_after_accepts_seconds_and_dates() {
-        let now = httpdate::parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").unwrap();
-        assert_eq!(parse_retry_after("10", now), Some(Duration::from_secs(10)));
-        assert_eq!(
-            parse_retry_after("Wed, 21 Oct 2015 07:28:15 GMT", now),
-            Some(Duration::from_secs(15))
-        );
-        assert_eq!(
-            parse_retry_after("Wed, 21 Oct 2015 07:27:00 GMT", now),
-            Some(Duration::ZERO)
-        );
-        assert_eq!(parse_retry_after("invalid", now), None);
     }
 }

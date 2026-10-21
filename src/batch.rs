@@ -159,43 +159,22 @@ async fn run_batch_impl(
     state.budget = state.opts.limit;
 
     if engine.uses_jsonl() {
-        // Freeze one document's requests at a time. Retain only this file's IR;
-        // Orinfer plans its complete request set and returns rows as they finish.
-        while let Some(input) = state.inputs.next() {
-            if cancel.is_cancelled() {
-                break;
-            }
-            let fidx = state.next_file_idx;
-            state.next_file_idx += 1;
-            let opts = state.opts.clone();
-            let budget = state.budget;
-            let path = input.clone();
+        // Retain one document's IR; the engine prepares bounded JSONL windows.
+        // Parsing, completion accounting and writing use the same state as HTTP.
+        while let Some(parse) = state.next_parse() {
             let prepared = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                result = run_parser(parser_limiter(), move || prepare_file(opts, fidx, input, budget)) => result,
+                prepared = parse => prepared,
             };
-            match prepared {
-                Ok(Ok((file, budget))) => {
-                    state.budget = budget;
-                    state.accept_file(fidx, file);
-                    let mut units = Vec::new();
-                    while let Some(unit) = state.next_unit() {
-                        units.push(unit);
-                    }
-                    engine
-                        .exec_jsonl_units(units, cancel.clone(), |done| state.on_done(done))
-                        .await;
-                }
-                result => {
-                    let error = match result {
-                        Ok(Err(error)) => format!("{error:#}"),
-                        Err(error) => format!("parse task failed: {error}"),
-                        Ok(Ok(_)) => unreachable!(),
-                    };
-                    state.failed_files.push((path, error));
-                }
+            state.accept_parsed(prepared);
+            let mut units = Vec::new();
+            while let Some(unit) = state.next_unit() {
+                units.push(unit);
             }
+            engine
+                .exec_jsonl_units(units, cancel.clone(), |done| state.on_done(done))
+                .await;
         }
         state.cancelled = cancel.is_cancelled();
         return state.finish().await;
@@ -217,21 +196,11 @@ async fn run_batch_impl(
         // One lazy parse per batch, at most two across all Web/CLI batches.
         // The HTTP drain remains polled while parsing or waiting for a permit.
         if in_flight.len() < concurrency && parsing.is_empty() {
-            if let Some(input) = state.inputs.next() {
-                let fidx = state.next_file_idx;
-                state.next_file_idx += 1;
-                let opts = state.opts.clone();
-                let budget = state.budget;
-                parsing.spawn(async move {
-                    let path = input.clone();
-                    let result = run_parser(parser_limiter(), move || {
-                        prepare_file(opts, fidx, input, budget)
-                    })
-                    .await;
-                    (fidx, path, result)
-                });
+            if let Some(parse) = state.next_parse() {
+                parsing.spawn(parse);
             }
         }
+
         if in_flight.is_empty() && parsing.is_empty() {
             break;
         }
@@ -243,21 +212,11 @@ async fn run_batch_impl(
             }
             Some(result) = parsing.join_next(), if !parsing.is_empty() => {
                 match result {
-                    Ok((fidx, _, Ok(Ok((file, budget))))) => {
-                        state.budget = budget;
-                        state.accept_file(fidx, file);
-                    }
-                    Ok((_, path, result)) => {
-                        let error = match result {
-                            Ok(Err(error)) => format!("{error:#}"),
-                            Err(error) => format!("parse task failed: {error}"),
-                            Ok(Ok(_)) => unreachable!(),
-                        };
-                        state.failed_files.push((path, error));
-                    }
+                    Ok(prepared) => state.accept_parsed(prepared),
                     Err(error) => state.failed_files.push((PathBuf::new(), format!("parse task failed: {error}"))),
                 }
             }
+
             Some(done) = in_flight.next(), if !in_flight.is_empty() => state.on_done(done),
         }
     }
@@ -334,6 +293,12 @@ fn prepare_file(
 
 // ── queue state machine ─────────────────────────────────────────────────────
 
+struct ParsedFile {
+    index: usize,
+    path: PathBuf,
+    result: Result<(OpenFile, Option<usize>)>,
+}
+
 struct BatchState {
     opts: BatchOpts,
     inputs: std::vec::IntoIter<PathBuf>,
@@ -352,6 +317,40 @@ struct BatchState {
 }
 
 impl BatchState {
+    fn next_parse(
+        &mut self,
+    ) -> Option<impl std::future::Future<Output = ParsedFile> + Send + 'static> {
+        let input = self.inputs.next()?;
+        let index = self.next_file_idx;
+        self.next_file_idx += 1;
+        let opts = self.opts.clone();
+        let budget = self.budget;
+        Some(async move {
+            let path = input.clone();
+            let result = run_parser(parser_limiter(), move || {
+                prepare_file(opts, index, input, budget)
+            })
+            .await
+            .context("parse task failed")
+            .and_then(std::convert::identity);
+            ParsedFile {
+                index,
+                path,
+                result,
+            }
+        })
+    }
+
+    fn accept_parsed(&mut self, parsed: ParsedFile) {
+        match parsed.result {
+            Ok((file, budget)) => {
+                self.budget = budget;
+                self.accept_file(parsed.index, file);
+            }
+            Err(error) => self.failed_files.push((parsed.path, format!("{error:#}"))),
+        }
+    }
+
     fn next_unit(&mut self) -> Option<Unit> {
         for file in self.open.values_mut() {
             if let Some(unit) = file.pending.pop_front() {

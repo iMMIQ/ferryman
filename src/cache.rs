@@ -37,7 +37,7 @@ impl Cache {
     /// Versioned, unambiguous key. Bump TRANSLATION_CACHE_VERSION whenever
     /// prompts, decoding parameters or recovery semantics change.
     /// `scope` identifies the endpoint, strategy and complete batch context.
-    pub fn key(&self, model: &str, target: &str, text: &str, scope: &str) -> String {
+    pub fn key(model: &str, target: &str, text: &str, scope: &str) -> String {
         let bytes = serde_json::to_vec(&(
             crate::translate::TRANSLATION_CACHE_VERSION,
             model,
@@ -90,36 +90,33 @@ mod tests {
     async fn legacy_empty_cache_entries_are_misses() {
         let root = tempfile::tempdir().unwrap();
         let cache = Cache::open(Some(root.path().into())).unwrap();
-        let key = cache.key("model", "zh", "original", "scope");
+        let key = Cache::key("model", "zh", "original", "scope");
         cache.put(&key, " \n").await;
         assert_eq!(cache.get(&key).await, None);
     }
 
     #[test]
     fn cache_keys_are_unambiguous_and_versioned() {
-        let cache = Cache {
-            root: PathBuf::new(),
-        };
         assert_ne!(
-            cache.key("a\u{1f}b", "c", "text", "scope"),
-            cache.key("a", "b\u{1f}c", "text", "scope")
+            Cache::key("a\u{1f}b", "c", "text", "scope"),
+            Cache::key("a", "b\u{1f}c", "text", "scope")
         );
         assert_ne!(
-            cache.key("model", "zh", "text", "context-one"),
-            cache.key("model", "zh", "text", "context-two")
+            Cache::key("model", "zh", "text", "context-one"),
+            Cache::key("model", "zh", "text", "context-two")
         );
         let legacy: String = Sha256::digest(b"model\x1fzh\x1ftext")
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        assert_ne!(cache.key("model", "zh", "text", "scope"), legacy);
+        assert_ne!(Cache::key("model", "zh", "text", "scope"), legacy);
     }
 
     #[tokio::test]
     async fn independent_instances_publish_only_complete_values() {
         let root = std::env::temp_dir().join(format!("ferryman-cache-{}", uuid::Uuid::new_v4()));
         let reader = Cache::open(Some(root.clone())).unwrap();
-        let key = reader.key("model", "zh", "text", "scope");
+        let key = Cache::key("model", "zh", "text", "scope");
         let mut tasks = tokio::task::JoinSet::new();
         for i in 0..24 {
             let cache = Cache::open(Some(root.clone())).unwrap();

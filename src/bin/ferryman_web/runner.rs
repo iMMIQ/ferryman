@@ -224,31 +224,19 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
             .join("users")
             .join(&entry.owner)
             .join("cache");
-        let request_limiter = state
-            .request_limiters
-            .get(&preset)
-            .cloned()
-            .context("missing request limiter for model preset")?;
         let cache = if entry.record.settings.cache_enabled {
             Cache::open(Some(cache_dir))
         } else {
             None
         };
-        let engine = Engine::new(
+        let engine = Engine::for_agent(
             state.translation_client.clone(),
             state.config.agent_url.clone(),
-            preset.api_model().to_string(),
-            entry.record.target.clone(),
-            preset.config().concurrency,
-            cache,
-        )
-        .with_request_limiter(request_limiter)
-        .with_jsonl(ferryman::jsonl::JsonlBackend {
-            client: state.translation_client.clone(),
-            endpoint: state.config.agent_url.clone(),
             preset,
-            lease_id: lease_id.clone(),
-        })
+            entry.record.target.clone(),
+            cache,
+            lease_id.clone(),
+        )
         .with_checkpoint(Cache::open(Some(entry.dir.join("checkpoint"))));
 
         let (progress_tx, mut progress_rx) = watch::channel(BatchProgress::default());

@@ -1,7 +1,6 @@
 //! Private Web ↔ AI Pod protocol for Orinfer's local JSONL runner.
 use crate::preset::Preset;
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{
@@ -13,55 +12,22 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub const MAX_BATCH_REQUESTS: usize = 2048;
-pub const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BatchRequest {
-    pub custom_id: String,
-    pub body: Value,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct BatchSubmission {
-    pub preset: Preset,
-    pub lease_id: String,
-    pub requests: Vec<BatchRequest>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BatchPhase {
-    Pending,
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-impl BatchPhase {
-    pub fn terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct BatchPage {
-    pub state: BatchPhase,
-    pub cursor: u64,
-    pub outputs: Vec<Value>,
-    pub error: Option<String>,
-}
+#[cfg(test)]
+use crate::agent_protocol::BatchOutput;
+pub use crate::agent_protocol::{
+    BatchPage, BatchPhase, BatchRequest, BatchSubmission, MAX_BATCH_BYTES, MAX_BATCH_REQUESTS,
+};
+use crate::agent_protocol::{BatchReply, MAX_BATCH_LINE_BYTES};
 
 #[derive(Clone)]
-pub struct JsonlBackend {
+pub(crate) struct JsonlBackend {
     pub client: reqwest::Client,
     pub endpoint: String,
     pub preset: Preset,
     pub lease_id: String,
 }
 
-type Reply = oneshot::Sender<Result<Value, String>>;
+type Reply = oneshot::Sender<Result<BatchReply, String>>;
 struct Pending {
     bytes: usize,
     body: Value,
@@ -105,12 +71,12 @@ impl JsonlSender {
         }
     }
 
-    pub async fn chat(&self, body: Value) -> Result<Value> {
+    pub async fn chat(&self, body: Value) -> Result<BatchReply> {
         let bytes = serde_json::to_vec(&body)?.len() + 256;
-        if bytes > 32 * 1024 * 1024 {
-            return Ok(
-                serde_json::json!({"error":{"code":"request_failed", "message":"input prompt exceeds JSONL context length limit"}}),
-            );
+        if bytes > MAX_BATCH_LINE_BYTES {
+            return Ok(BatchReply::failure(
+                "input prompt exceeds JSONL context length limit",
+            ));
         }
         let (reply, result) = oneshot::channel();
         self.tx
@@ -270,7 +236,9 @@ impl JsonlBackend {
                 Ok(response) if response.status().is_success() => {
                     if !submitted {
                         submitted = true;
-                        last_contact = Instant::now();
+                        // Only valid output pages renew the outage deadline.
+                        // Repeated acknowledgements followed by broken polls
+                        // must eventually fail instead of resetting it forever.
                         continue;
                     }
                     match response.json::<BatchPage>().await {
@@ -282,15 +250,11 @@ impl JsonlBackend {
                             let advanced = page.cursor > cursor;
                             cursor = page.cursor;
                             for output in page.outputs {
-                                let custom_id = output
-                                    .get("custom_id")
-                                    .and_then(Value::as_str)
-                                    .context("JSONL response missing custom_id")?;
-                                if !output["error"].is_null() {
-                                    failed_outputs.insert(custom_id.to_string(), output);
-                                } else if let Some(reply) = replies.remove(custom_id) {
-                                    failed_outputs.remove(custom_id);
-                                    let _ = reply.send(Ok(output));
+                                if output.reply.error.is_some() {
+                                    failed_outputs.insert(output.custom_id, output.reply);
+                                } else if let Some(reply) = replies.remove(&output.custom_id) {
+                                    failed_outputs.remove(&output.custom_id);
+                                    let _ = reply.send(Ok(output.reply));
                                 }
                             }
                             last_contact = Instant::now();
@@ -320,7 +284,9 @@ impl JsonlBackend {
                     let status = response.status();
                     if status.as_u16() == 404 || status.is_server_error() {
                         submitted = false;
-                    } else if !matches!(status.as_u16(), 409 | 429 | 408) {
+                    } else if status != reqwest::StatusCode::CONFLICT
+                        && !crate::http_client::is_transient_status(status)
+                    {
                         bail!(
                             "Agent JSONL request failed ({status}): {}",
                             response.text().await.unwrap_or_default()
@@ -367,7 +333,7 @@ mod tests {
                 } else if number == 2 {
                     (2, vec![serde_json::json!({"custom_id":"request-0", "error":null,"response":{"status_code":200,"body":{"ok":true}}})])
                 } else { (2, vec![]) };
-                Json(BatchPage { state: if number == 0 { BatchPhase::Running } else { BatchPhase::Completed }, cursor, outputs, error: None }).into_response()
+                Json(BatchPage { state: if number == 0 { BatchPhase::Running } else { BatchPhase::Completed }, cursor, outputs: outputs.into_iter().map(|value| serde_json::from_value::<BatchOutput>(value).unwrap()).collect(), error: None }).into_response()
             }
         }).delete(|| async { axum::http::StatusCode::NO_CONTENT }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -391,7 +357,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(response["response"]["body"]["ok"], true);
+        assert_eq!(response.response.unwrap().body["ok"], true);
         {
             let submissions = submissions.lock().unwrap();
             assert_eq!(submissions.len(), 2);

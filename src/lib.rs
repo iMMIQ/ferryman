@@ -1,3 +1,4 @@
+pub mod agent_protocol;
 pub mod archive;
 pub mod atomic_file;
 pub mod auth;
@@ -7,6 +8,7 @@ pub mod container;
 pub mod engine;
 pub mod format;
 pub mod html;
+pub mod http_client;
 pub mod jsonl;
 pub mod preset;
 pub mod settings;

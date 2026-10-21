@@ -51,8 +51,56 @@ fn unhealthy_cli_container_is_removed() {
     assert!(!result.status.success());
     assert!(!root.path().join("running").exists());
 }
+fn fixture_model(r: &Path, preset: ferryman::preset::Preset) {
+    let models = r.join("models").join(preset.config().model_dir_name);
+    fs::create_dir_all(models.join("cache/weights")).unwrap();
+    fs::write(
+        models.join("cache/model.json"),
+        serde_json::to_vec(
+            &serde_json::json!({"execution_package": preset.config().execution_package}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(models.join("config.json"), r#"{"model_type":"fixture"}"#).unwrap();
+    fs::write(models.join("tokenizer.json"), r#"{"model":{}}"#).unwrap();
+    fs::write(
+        models.join("cache/weights/model.safetensors.index.json"),
+        r#"{"weight_map":{"weight":"weights.safetensors"}}"#,
+    )
+    .unwrap();
+    let bytes = 4;
+    let header =
+        format!(r#"{{"weight":{{"dtype":"U8","shape":[{bytes}],"data_offsets":[0,{bytes}]}}}}"#);
+    use std::io::Write;
+    let mut file = fs::File::create(models.join("cache/weights/weights.safetensors")).unwrap();
+    file.write_all(&(header.len() as u64).to_le_bytes())
+        .unwrap();
+    file.write_all(header.as_bytes()).unwrap();
+    file.set_len(bytes + 8 + header.len() as u64).unwrap();
+}
+
+struct ProcessGuard(Child);
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+impl std::ops::Deref for ProcessGuard {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for ProcessGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
 struct Agent {
-    child: Child,
+    child: ProcessGuard,
     root: tempfile::TempDir,
     origin: String,
     client: reqwest::Client,
@@ -70,8 +118,6 @@ impl Drop for Agent {
                 }
             }
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 impl Agent {
@@ -97,23 +143,17 @@ impl Agent {
             Some("isolated-regression-token"),
         )
         .unwrap();
-        ferryman::engine::Engine::new(
-            client.clone(),
+        ferryman::engine::Engine::for_agent(
+            client,
             self.origin.clone(),
-            "index-translate-2b".into(),
+            ferryman::preset::Preset::Index2B,
             "中文".into(),
-            32,
             None,
+            "test".into(),
         )
         .with_checkpoint(ferryman::cache::Cache::open(Some(
             self.root.path().join("checkpoint"),
         )))
-        .with_jsonl(ferryman::jsonl::JsonlBackend {
-            client,
-            endpoint: self.origin.clone(),
-            preset: ferryman::preset::Preset::Index2B,
-            lease_id: "test".into(),
-        })
     }
 
     async fn start(mode: &str) -> Self {
@@ -122,26 +162,9 @@ impl Agent {
     async fn start_with_endpoint(mode: &str, endpoint: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let r = root.path();
-        let models = r.join("models/Index-Translate-2B-Orinfer-E8P-Q4A8");
-        fs::create_dir_all(models.join("cache/weights")).unwrap();
-        fs::write(models.join("cache/model.json"), serde_json::to_vec(&serde_json::json!({"execution_package": ferryman::preset::Preset::Index2B.config().execution_package})).unwrap()).unwrap();
-        fs::write(models.join("config.json"), r#"{"model_type":"fixture"}"#).unwrap();
-        fs::write(models.join("tokenizer.json"), r#"{"model":{}}"#).unwrap();
-        fs::write(
-            models.join("cache/weights/model.safetensors.index.json"),
-            r#"{"weight_map":{"weight":"weights.safetensors"}}"#,
-        )
-        .unwrap();
-        let bytes = 4;
-        let header = format!(
-            r#"{{"weight":{{"dtype":"U8","shape":[{bytes}],"data_offsets":[0,{bytes}]}}}}"#
-        );
-        use std::io::Write;
-        let mut file = fs::File::create(models.join("cache/weights/weights.safetensors")).unwrap();
-        file.write_all(&(header.len() as u64).to_le_bytes())
-            .unwrap();
-        file.write_all(header.as_bytes()).unwrap();
-        file.set_len(bytes + 8 + header.len() as u64).unwrap();
+        for preset in ferryman::preset::Preset::ALL {
+            fixture_model(r, preset);
+        }
         executable(
             &r.join("orinfer"),
             r#"#!/bin/sh
@@ -183,7 +206,7 @@ exec sleep 120
             .stderr(Stdio::null());
         let child = command.spawn().unwrap();
         let agent = Self {
-            child,
+            child: ProcessGuard(child),
             root,
             origin: format!("http://{address}"),
             client: reqwest::Client::new(),
@@ -426,6 +449,187 @@ async fn jsonl_document_pipeline_writes_each_file_in_source_order() {
 }
 
 #[tokio::test]
+async fn agent_engine_single_unit_uses_jsonl_without_an_http_model() {
+    let agent = Agent::start("jsonl").await;
+    agent.batch_lease().await;
+    let done = agent
+        .jsonl_engine()
+        .exec_unit(ferryman::engine::Unit::Single {
+            file: 0,
+            id: 17,
+            text: "One independent paragraph.".into(),
+        })
+        .await;
+    assert_eq!(
+        done.pairs,
+        vec![(17, "译文:One independent paragraph.".into())]
+    );
+    let runs = fs::read_to_string(agent.root.path().join("runs.jsonl")).unwrap();
+    assert_eq!(runs.lines().count(), 1);
+}
+
+#[tokio::test]
+async fn web_translates_with_every_preset_including_9b() {
+    let agent = Agent::start("jsonl").await;
+    let root = agent.root.path().join("web");
+    fs::create_dir_all(root.join("documents")).unwrap();
+    fs::create_dir_all(root.join("remote")).unwrap();
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    drop(socket);
+    let _web = ProcessGuard(
+        Command::new(env!("CARGO_BIN_EXE_ferryman-web"))
+            .env("FERRYMAN_WEB_LISTEN", address.to_string())
+            .env("FERRYMAN_DATA_DIR", root.join("data"))
+            .env("FERRYMAN_USER_DOCUMENTS_DIR", root.join("documents"))
+            .env("FERRYMAN_REMOTE_FS_DIR", root.join("remote"))
+            .env("FERRYMAN_ALLOW_LOCAL_USER", "true")
+            .env("FERRYMAN_AGENT_URL", &agent.origin)
+            .env("FERRYMAN_AGENT_TOKEN", "isolated-regression-token")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let origin = format!("http://{address}");
+    let client = reqwest::Client::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if client
+                .get(format!("{origin}/api/config"))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for preset in ferryman::preset::Preset::ALL {
+        let preset_id = preset.to_string();
+        let boundary = "ferryman-quality-regression";
+        let mut body = String::new();
+        for (name, value) in [
+            ("preset", preset_id.as_str()),
+            ("target", "中文"),
+            ("mode", "replace"),
+            ("batch_size", "1"),
+        ] {
+            body.push_str(&format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"));
+        }
+        body.push_str(&format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"regression.txt\"\r\nContent-Type: text/plain\r\n\r\nFirst paragraph.\nSecond paragraph.\n\r\n--{boundary}--\r\n"));
+        let response = client
+            .post(format!("{origin}/api/jobs"))
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let created: serde_json::Value = response.json().await.unwrap();
+        let id = created["id"].as_str().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let job: serde_json::Value = client
+                    .get(format!("{origin}/api/jobs/{id}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                match job["status"].as_str() {
+                    Some("completed") => break job,
+                    Some("failed" | "cancelled") => panic!("{preset}: {job}"),
+                    _ => tokio::time::sleep(Duration::from_millis(30)).await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result["translated"], 2, "{preset}: {result}");
+        assert_eq!(result["failed_segments"], 0, "{preset}: {result}");
+        let text = client
+            .get(format!("{origin}/api/jobs/{id}/result"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            text.find("译文:First paragraph.").unwrap()
+                < text.find("译文:Second paragraph.").unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn jsonl_window_boundary_keeps_every_unit_and_reaps_each_worker() {
+    use ferryman::engine::Unit;
+    let agent = Agent::start("jsonl").await;
+    agent.batch_lease().await;
+    let count = ferryman::jsonl::MAX_BATCH_REQUESTS + 1;
+    let units = (0..count)
+        .map(|id| Unit::Single {
+            file: 0,
+            id,
+            text: format!("Paragraph {id}."),
+        })
+        .collect();
+    let mut pairs = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        agent.jsonl_engine().exec_jsonl_units(
+            units,
+            tokio_util::sync::CancellationToken::new(),
+            |done| pairs.extend(done.pairs),
+        ),
+    )
+    .await
+    .unwrap();
+    pairs.sort();
+    assert_eq!(pairs.len(), count);
+    for (id, (actual, text)) in pairs.into_iter().enumerate() {
+        assert_eq!(actual, id);
+        assert_eq!(text, format!("译文:Paragraph {id}."));
+    }
+    let invocations = fs::read_to_string(agent.root.path().join("runs.jsonl")).unwrap();
+    let sizes: Vec<_> = invocations
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["requests"]
+                .as_array()
+                .unwrap()
+                .len()
+        })
+        .collect();
+    assert_eq!(sizes, vec![count - 1, 1]);
+    let runtime: serde_json::Value = agent
+        .request("/runtime")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(runtime["pid"].is_null());
+    assert_eq!(runtime["active_requests"], 0);
+    assert_eq!(
+        fs::read_dir(agent.root.path().join("cache/batches"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn jsonl_submit_is_idempotent_and_requires_a_batch_lease() {
     let agent = Agent::start("jsonl").await;
     let path = format!("/batch/jobs/{}", uuid::Uuid::new_v4());
@@ -468,6 +672,25 @@ async fn jsonl_submit_is_idempotent_and_requires_a_batch_lease() {
     );
     // A manual online load must not replace an active batch reservation.
     assert_eq!(agent.acquire().send().await.unwrap().status(), 409);
+    let output = agent
+        .root
+        .path()
+        .join("cache/batches")
+        .join(path.rsplit('/').next().unwrap())
+        .join("output.jsonl");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !output.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fs::write(output, b"{invalid completed row}\n").unwrap();
+    assert_eq!(
+        agent.request(&path).send().await.unwrap().status(),
+        422,
+        "corrupt committed output must be a permanent protocol failure"
+    );
     let response = agent
         .client
         .delete(format!("{}{path}", agent.origin))
@@ -537,25 +760,28 @@ async fn jsonl_agent_restart_resumes_committed_rows_without_repeating_them() {
     )
     .unwrap();
     let root = agent.root.path();
-    agent.child = Command::new(env!("CARGO_BIN_EXE_ferryman-agent"))
-        .env(
-            "FERRYMAN_AGENT_LISTEN",
-            agent.origin.trim_start_matches("http://"),
-        )
-        .env("FERRYMAN_AGENT_TOKEN", "isolated-regression-token")
-        .env("FERRYMAN_MODEL_ROOT", root.join("models"))
-        .env("FERRYMAN_CACHE_ROOT", root.join("cache"))
-        .env("FERRYMAN_ORINFER_BIN", root.join("orinfer"))
-        .env("FIXTURE_ROOT", root)
-        .env("FIXTURE_MODE", "jsonl")
-        .env(
-            "FIXTURE_ORINFER",
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_orinfer.py"),
-        )
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    agent.child = ProcessGuard(
+        Command::new(env!("CARGO_BIN_EXE_ferryman-agent"))
+            .env(
+                "FERRYMAN_AGENT_LISTEN",
+                agent.origin.trim_start_matches("http://"),
+            )
+            .env("FERRYMAN_AGENT_TOKEN", "isolated-regression-token")
+            .env("FERRYMAN_MODEL_ROOT", root.join("models"))
+            .env("FERRYMAN_CACHE_ROOT", root.join("cache"))
+            .env("FERRYMAN_ORINFER_BIN", root.join("orinfer"))
+            .env("FIXTURE_ROOT", root)
+            .env("FIXTURE_MODE", "jsonl")
+            .env(
+                "FIXTURE_ORINFER",
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_orinfer.py"),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(response) = agent.post("/runtime/acquire", serde_json::json!({"preset":"index-translate-2b", "lease_id":"test", "mode":"batch"})).send().await {

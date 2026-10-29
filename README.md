@@ -182,6 +182,10 @@ adapter, served context length, output limit and per-task concurrency. The
 `/health` metadata supplies the served context limit. Models lacking that
 metadata default conservatively to 2048 context tokens. Base URLs may include
 `/v1`, a provider-specific path, or the full `/chat/completions` suffix.
+For discovered models, connection details separate client per-task request
+concurrency from the service's reported `scheduler.max_active` limit. Missing
+or invalid service limits remain unknown; client defaults are never used as
+discovered service capabilities.
 
 Discovery prioritizes `category: translation` while allowing other chat models;
 `runtimeStatus: unknown` and nullable accessibility do not automatically exclude

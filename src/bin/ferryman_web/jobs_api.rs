@@ -57,12 +57,20 @@ pub(super) struct CreateDirectoryJobsRequest {
     #[serde(default)]
     #[ts(optional = nullable)]
     save_path: Option<String>,
+    #[serde(default = "default_preset")]
     preset: Preset,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    model_id: Option<String>,
     target: String,
     mode: OutputMode,
     #[serde(default)]
     #[ts(as = "Option<TranslationSettings>", optional)]
     settings: TranslationSettings,
+}
+
+fn default_preset() -> Preset {
+    Preset::Index2B
 }
 
 #[derive(Serialize, ts_rs::TS)]
@@ -302,6 +310,7 @@ pub(super) async fn create_job(
     let upload = dir.join(".upload.tmp");
     let mut filename = None;
     let mut preset = Preset::Index2B;
+    let mut model_id: Option<String> = None;
     let mut target = "中文".to_string();
     let mut mode = OutputMode::Bilingual;
     let mut save_directory = None;
@@ -365,6 +374,9 @@ pub(super) async fn create_job(
                                 .await
                             }
                         };
+                    }
+                    "model_id" => {
+                        model_id = Some(value);
                     }
                     "target" => {
                         if !value.trim().is_empty() && value.len() <= 64 {
@@ -441,6 +453,15 @@ pub(super) async fn create_job(
             "DOCX currently supports bilingual output only",
         );
     }
+    let model = match model_id {
+        Some(id) => match super::models::selected(&state, &owner, &id).await {
+            Ok(model) => Some(model),
+            Err(error) => {
+                return reject_upload(&dir, StatusCode::BAD_REQUEST, error.to_string()).await
+            }
+        },
+        None => None, // Legacy clients retain their original preset record.
+    };
     let selected_mode = mode;
     let (save_root, save_to, save_path) = if let Some(save_directory) = save_directory {
         let (root, destination, relative) =
@@ -493,6 +514,7 @@ pub(super) async fn create_job(
             id,
             filename,
             preset,
+            model,
             target,
             mode,
             status: JobStatus::Queued,
@@ -586,6 +608,7 @@ async fn prepare_document_job(
                 .map(|value| value.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "document".to_string()),
             preset,
+            model: None,
             target: target.to_string(),
             mode,
             status: JobStatus::Queued,
@@ -663,6 +686,13 @@ async fn directory_jobs(
         }
     } else {
         None
+    };
+    let model = match request.model_id.as_deref() {
+        Some(id) => match super::models::selected(&state, &identity.owner, id).await {
+            Ok(model) => Some(model),
+            Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
+        },
+        None => None,
     };
     let mode = request.mode;
     let settings = match request.settings.validate_for_web() {
@@ -907,7 +937,10 @@ async fn directory_jobs(
         )
         .await
         {
-            Ok(job) => jobs.push(job),
+            Ok(mut job) => {
+                job.record.model = model.clone();
+                jobs.push(job);
+            }
             Err(error) => {
                 for entry in &jobs {
                     let _ = tokio::fs::remove_dir_all(&entry.dir).await;
@@ -1301,6 +1334,8 @@ mod tests {
         let (queue, _receiver) = mpsc::channel(1);
         let store = JobStore::open(base.join("jobs.sqlite3")).await.unwrap();
         AppState {
+            #[cfg(feature = "lazycat")]
+            delegate_tickets: Arc::default(),
             active_jobs: Arc::new(RwLock::new(HashMap::new())),
             persister: JobPersister::spawn(store.clone()),
             store,
@@ -1312,9 +1347,7 @@ mod tests {
                 data_dir: base.join("data"),
                 user_documents_dir: base.join("documents"),
                 remote_fs_dir: base.join("remote-fs"),
-                agent_url: String::new(),
-                agent_token: String::new(),
-                agent_pairing: false,
+                discovery_url: String::new(),
                 allow_local_user: true,
                 client: reqwest::Client::new(),
             }),

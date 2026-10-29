@@ -15,13 +15,14 @@ pub fn build_translation_client(
     timeout: Duration,
     bearer_token: Option<&str>,
 ) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(token) = bearer_token {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}"))?,
-        );
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}"))?;
+        value.set_sensitive(true);
+        headers.insert(AUTHORIZATION, value);
         builder = builder.default_headers(headers);
     }
     Ok(builder.build()?)
@@ -43,6 +44,7 @@ pub struct Engine {
     cache: Option<Cache>,
     checkpoint: Option<Cache>,
     backend: Backend,
+    model_target: Option<crate::model_api::ModelTarget>,
 }
 
 enum Backend {
@@ -116,7 +118,13 @@ impl Engine {
             cache,
             checkpoint: None,
             backend: Backend::Http,
+            model_target: None,
         }
+    }
+
+    pub fn with_model_target(mut self, target: crate::model_api::ModelTarget) -> Self {
+        self.model_target = Some(target);
+        self
     }
 
     /// Model identity, concurrency and transport share a single Agent config.
@@ -256,8 +264,11 @@ impl Engine {
             .await;
             done.expect("an uncancelled unit always reports completion")
         } else {
-            self.exec_unit_using(unit, &translate::ChatClient::Http(&self.client))
-                .await
+            let client = match &self.model_target {
+                Some(target) => translate::ChatClient::Compatible(&self.client, target),
+                None => translate::ChatClient::Http(&self.client),
+            };
+            self.exec_unit_using(unit, &client).await
         }
     }
 
@@ -283,6 +294,10 @@ impl Engine {
                         cache_scope(&self.endpoint, &[], &[], None)
                     } else {
                         cache_scope(&self.endpoint, &cue_refs, &ctx_refs, Some(index))
+                    };
+                    let scope = match &self.model_target {
+                        Some(target) => format!("{}:{scope}", target.cache_identity()),
+                        None => scope,
                     };
                     Cache::key(&self.model, &self.target, text, &scope)
                 })

@@ -7,17 +7,16 @@
 > ship today. Ferryman can run as a CLI or as a Lazycat MicroServer + AI Pod Web app.
 
 Produce a **bilingual (original + Chinese) EPUB** from any EPUB book by translating
-its content through a Orinfer-served model. The original formatting is preserved
+its content through an OpenAI-compatible model. The original formatting is preserved
 byte-for-byte; after each translated block a styled sibling carrying the
 translation is inserted.
 
-Ferryman uses **Orinfer 0.2.0** on Jetson AGX Orin with the prepared
-**Index-Translate-2B / 9B / 35B-A3B-preview E8P Q4A8** models. The default model alias is `index-translate-2b`. The AI Pod Agent owns the
-inference process, listening only on container loopback `127.0.0.1:18088`.
-The inference port is not published; the Web backend uses authenticated Agent calls.
-
-With `--serve`, Ferryman starts a container built from the bundled Orinfer
-runtime and stops it after translation.
+The Web application runs as a **single image on the MicroServer**. It discovers
+existing model deployments or connects to user-configured OpenAI-compatible Chat
+APIs. Ferryman does not deploy, download, start or stop models on the AI Pod.
+Translation instructions are versioned: generic chat models use a general
+translation prompt, and Index-Translate uses its official Chinese prompt and
+instTrans structure constraints.
 
 ## How it works
 
@@ -112,7 +111,7 @@ assets to `dist/web` (the default `FERRYMAN_WEB_DIR`).
 Browser regression tests serve the production assets and mock API responses.
 A separate smoke test starts the real Rust server against temporary storage and
 checks config, directory selection, preview and job lifecycle contracts without a GPU.
-Its temporary job waits for an unavailable agent, then is cancelled and deleted through the UI.
+It configures a custom API against a local model fixture, exercises cancellation and deletion, and completes a translation task through the real Rust backend.
 
 ```bash
 npm ci
@@ -161,29 +160,41 @@ UI tokens live in
 
 ## Web app and Lazycat deployment
 
-Ferryman's Web deployment has two processes:
+`ferryman-web` owns the UI, per-user model connections, uploads, document
+processing, persistent SQLite job queue, translation requests, cancellation and
+result downloads. Up to eight jobs run concurrently, with each connection's
+per-task request limit. Jobs writing the same output remain serialized.
+Interrupted jobs resume from their stored model selection and checkpoints.
 
-- `ferryman-web` runs on the MicroServer. It owns uploads, per-user files, the
-  persistent job queue, progress/cancellation and result downloads. Job metadata
-  and state live in a SQLite WAL database; source/result files stay on disk, and
-  only nonterminal jobs are retained in memory. History is read with cursor
-  pagination while active jobs use a small polling endpoint. After a system or
-  application restart, queued/model-starting/translating/writing jobs are reset
-  to queued and dispatched automatically; the content cache skips segments that
-  were already translated. Temporary AI Pod outages keep waiting with backoff
-  instead of turning recovered jobs into failures. Up to eight jobs
-  using the same preset may run together. Web translation uses Orinfer JSONL:
-  requests from one document are collected into bounded rounds (up to 2048
-  requests / 63 MiB), and the Agent serializes GPU rounds with up to 32 active
-  model requests. Preset groups stay ordered, so the scheduler never tries to
-  switch models while jobs are active.
-- `ferryman-agent` is the lightweight AI Pod controller. It starts exactly one
-  Orinfer child process (`index-translate-2b`, `index-translate-9b` or `index-translate-35b`) on demand and unloads it
-  after all leases expire and the idle timeout elapses. Document jobs invoke
-  `orinfer batch` with throughput scheduling and automatic prefix planning;
-  online/manual serving and batch execution are mutually exclusive. It also detects existing
-  models, downloads missing weights with pause/resume and integrity checks, and
-  benchmarks ModelScope, HF Mirror and Hugging Face using real model shards.
+Model discovery runs on the MicroServer through
+`http://app.cloud.lazycat.app.ai.lzcx/api/v1/model-deployments`. The package declares
+required `lzcapp.user_delegate`; the backend captures the signed-in user's
+`X-HC-USER-TICKET` for up to 15 minutes in memory, and sends it only to canonical
+`.lzcx` app ingress. Tickets and browser cookies are never forwarded to inference
+APIs. Missing/expired authorization is shown in the model manager; custom APIs
+continue working. This follows the platform's current
+[application delegation contract](https://developer.lazycat.cloud/advanced-app-interconnect.html),
+which may evolve toward an explicit authorization flow.
+
+The model manager accepts an API base URL, optional API Key, model ID, prompt
+adapter, served context length, output limit and per-task concurrency. The
+“Read model list” action queries `/models` under the chosen base URL; optional
+`/health` metadata supplies the served context limit. Models lacking that
+metadata default conservatively to 2048 context tokens. Base URLs may include
+`/v1`, a provider-specific path, or the full `/chat/completions` suffix.
+
+Discovery prioritizes `category: translation` while allowing other chat models;
+`runtimeStatus: unknown` and nullable accessibility do not automatically exclude
+a deployment. Stopped/offline records remain visible but unavailable. Partial
+refreshes show warnings and preserve previously discovered records. Discovery
+metadata is a candidate catalogue, not proof of Chat compatibility.
+
+API Keys are stored in the backend's owner-scoped SQLite configuration and are
+never returned by catalogue or job APIs. The database is mode `0600`. Job records
+pin the model ID, base URL, adapter and token budgets; credentials are resolved
+for the same owner and destination. Moving an API to another URL does not reuse
+its saved key. Removing a connection or changing its destination requires
+resubmitting affected tasks. Adapter identity participates in cache keys.
 
 The Web UI accepts an uploaded file or a mixed selection of files and directories
 from the user's MicroServer documents and mounted Lazycat cloud drives. The picker
@@ -219,132 +230,57 @@ mounts contain one directory per MicroServer UID; the backend confines every
 request to the signed-in user's subtree, skips symlinks, and keeps internal
 queue data under `/lzcapp/var/ferryman`.
 
-Run both locally with a shared control token:
+Run locally:
 
 ```bash
-export FERRYMAN_AGENT_TOKEN='replace-with-at-least-16-characters'
-
-FERRYMAN_MODEL_ROOT="$HOME/model" \
-FERRYMAN_AGENT_LISTEN=127.0.0.1:8090 \
-cargo run --bin ferryman-agent
-
 npm ci && npm run build
 mkdir -p ./ferryman-documents/local-development-user ./ferryman-remotefs/local-development-user
-FERRYMAN_AGENT_URL=http://127.0.0.1:8090 \
-FERRYMAN_USER_DOCUMENTS_DIR=./ferryman-documents \
-FERRYMAN_REMOTE_FS_DIR=./ferryman-remotefs \
 FERRYMAN_ALLOW_LOCAL_USER=true \
 cargo run --bin ferryman-web
 ```
 
-The Web UI is then available at `http://127.0.0.1:8080`.
-
-For AI Pod deployment, the release build packages the explicit ARM64 controller
-binary in a separate resource-only LPK. It bundles the verified Orinfer 0.2.0
-engine release and installs all three Index execution packages during the build:
+Open `http://127.0.0.1:8080`, then use **模型与 API** to add a model service.
+The default build supports custom APIs only. Lazycat discovery and ticket
+handling are compiled only with `--features lazycat`, which the LPK build script
+enables automatically. The UI shows discovery controls only when the backend
+reports that discovery is enabled.
+On Lazycat, build only the MicroServer package:
 
 ```bash
-# Install the pinned toolchains, cross compilers, fonts and verifier dependencies
-# described in docs/packaging.md. Build either product independently:
 sh scripts/build-release.sh
-sh scripts/build-agent-release.sh
-```
-
-Models are downloaded from the Web model manager into the app's persistent AI
-Pod data directory. Existing directories in these locations are detected without
-another download:
-
-```text
-models/Index-Translate-2B-Orinfer-E8P-Q4A8
-models/Index-Translate-9B-Orinfer-E8P-Q4A8
-models/Index-Translate-35B-A3B-preview-Orinfer-E8P-Q4A8
-```
-
-Model weights and incomplete downloads live under `LZC_AGENT_DATA_DIR` on the
-selected AI Pod, not on the MicroServer. Runtime caches live under `LZC_AGENT_CACHE_DIR`. Installed execution packages
-are read directly from the read-only AI Pod resource at `/opt/orinfer/packages`. Upgrading the app or restarting the AI Pod preserves the
-models; switching to another AI Pod requires that pod to download its own copy.
-
-Lazycat deployments generate a device-specific `FERRYMAN_AGENT_TOKEN` in the
-Web application's persistent private data on first startup. The Web service
-pairs that token with the AI Pod, where only its SHA-256 hash is persisted under
-`${LZC_AGENT_DATA_DIR}/auth`. No production bearer token is stored in the
-repository or either LPK. The token file is mode `0600`. Then lint and build the
-Web and AI Pod resource packages:
-
-```bash
 lzc-cli project lint .
-lzc-cli project release .
-lzc-cli project release -f lzc-build.aipod.yml
+lzc-cli project release -o dist/ferryman-web.lpk
 ```
 
-The AI Pod resource package requires LZCOS 1.5.2+ and currently supports AGX Orin.
-See [packaging](docs/packaging.md) for final LPK verification, local CI packaging,
-artifact checksums, toolchain pins and standalone build targets.
+LZCOS 1.5.2+ is required for canonical app delegation. There is no AI Pod resource
+LPK or Agent image in this release. Existing self-deployment jobs keep their
+history; unfinished tasks without an API selection report a migration message
+and must be resubmitted against a configured model. Existing Ferryman Agent
+source and CLI development helpers are retained for compatibility, outside the
+Web deployment. See [packaging](docs/packaging.md).
 
-### Standalone Docker deployment (single machine)
+### Standalone Docker deployment
 
-On a single machine without Lazycat — a Jetson board or any Linux host with an
-NVIDIA GPU — `docker-compose.standalone.yml` runs both processes with plain
-Docker. Everything builds from source inside Docker, so no cross toolchain or
-host Rust install is needed:
+The standalone image is built without Lazycat discovery, delegation tickets, or
+discovery API Auth Token support. **模型与 API** only offers custom API
+configuration; no discovery endpoint or discovery URL setting is available.
 
 ```bash
-cp .env.example .env   # then set FERRYMAN_AGENT_TOKEN (openssl rand -hex 32)
+cp .env.example .env
 docker compose -f docker-compose.standalone.yml up -d --build
 ```
 
-The web UI listens on `http://<host>:$FERRYMAN_WEB_PORT` (default 8080). The
-job database, both libraries, model weights and runtime caches live in host
-directories configured in `.env`; `init-dirs` creates the
-`local-development-user/` library subtree on first start. Models are
-downloaded through the web model manager, or detected automatically when
-`$FERRYMAN_MODELS_DIR` already contains the Index model directories listed above.
+The stack runs one Web container and initializes its local library directories. It
+requires no local GPU. Configure an external model API in the UI; `.env` controls
+the Web port and persistent data/library paths. Leave discovery disabled unless
+you have a reachable discovery service. Every visitor shares the
+`local-development-user` identity in standalone mode. Multi-user installations
+need an authenticating proxy injecting `safe_uid` and per-user library directories.
 
-The stack runs in **single-user mode**: every visitor shares the
-`local-development-user` identity, so keep the port on a trusted network. For
-multiple users, front the web service with an authenticating reverse proxy
-that injects a per-user `safe_uid` header, and create
-`<documents>/<uid>/` and `<remotefs>/<uid>/` directories for each user.
-
-The packaged inference runtime targets ARM64 Jetson AGX Orin / SM87. Models
-are downloaded into the persistent `/models` mount, including their
-`cache/model.json` and `cache/weights` subdirectories. The 35B download sources are
-[Hugging Face](https://huggingface.co/immiq/Index-Translate-35B-A3B-preview-Orinfer-E8P-Q4A8)
-and [ModelScope](https://modelscope.cn/models/iammiq/Index-Translate-35B-A3B-preview-Orinfer-E8P-Q4A8).
-Existing prepared model directories are detected locally.
-
-The AI Pod and standalone Agent deploy their own model processes. Models start
-on demand, switch after leases drain and unload after the idle timeout. The
-Agent reads weights from `/models` and serves inference only on container
-loopback `127.0.0.1:18088`. No inference port is mapped to the host.
-
-### Shared core boundary
-
-The CLI and Web adapter intentionally stop at the same library boundary:
-
-- `format` parses and renders every supported document type.
-- `translate` owns prompts, retries and response parsing.
-- `engine` owns caching, checkpoints and execution through HTTP or JSONL.
-- `jsonl` groups Chat requests, polls completed rows by byte cursor and maps
-  `custom_id` back to the waiting translation. Failed/truncated requests use
-  the same bounded retry/split logic and create fresh recovery rounds.
-- `batch` owns input discovery, output naming, concurrent dispatch, cancellation
-  and progressive writes.
-- `settings` owns defaults and Web safety bounds.
-
-`ferryman` maps CLI flags into these shared types. `ferryman-web` adds identity,
-mounted-storage validation, persistent job records and model leases, then calls
-the same engine and batch functions. `ferryman-agent` remains isolated to AI Pod
-model lifecycle, the authenticated JSONL spool and Orinfer proxying.
-
-JSONL input/output files live only in the AI Pod runtime cache and are removed
-when a round finishes or is cancelled. Interrupted Agent runs can resume the same
-immutable input with Orinfer's `--resume`; completed Web units also survive in
-per-job checkpoints. Truncated output is never cached as a complete translation.
-Cancellation sends SIGTERM, waits for the worker to drain, then reaps its process
-group. Unreachable Web leases expire and stop orphan workers; stale spools are
-collected automatically. Model inference has no public HTTP port.
+The CLI and Web share document parsing, translation retries, overflow recovery,
+caching, checkpoints and result writing. The Web uses HTTP Chat requests;
+translation batching combines document segments within a request and does not
+require a JSONL server API.
 
 ## Usage
 
@@ -359,35 +295,6 @@ collected automatically. Model inference has no public HTTP port.
 
 The endpoint defaults to `http://127.0.0.1:8088`. `--model` overrides the
 OpenAI model alias; `--endpoint` selects a different server.
-
-### Self-managed container
-
-Build the standalone Agent image first, then use `--serve`. The image includes
-the engine and all three execution packages; model weights come from the host:
-
-```bash
-docker compose -f docker-compose.standalone.yml build agent
-./target/release/ferryman -i book.epub -o bilingual.epub --serve \
-  --host-model-dir /path/to/Index-Translate-2B-Orinfer-E8P-Q4A8
-```
-
-| Flag | Default | Purpose |
-| --- | --- | --- |
-| `--preset` | `index-translate-2b` | `index-translate-2b`, `index-translate-9b`, `index-translate-35b` |
-| `--endpoint` | `http://127.0.0.1:8088` | Existing inference service |
-| `--model` | Preset alias | OpenAI model name |
-| `--target` | `中文` | Target language |
-| `--concurrency` | `32` | Concurrent translation requests |
-| `--serve` | Off | Start and stop an Orinfer Docker container |
-| `--image` | `ferryman-agent:standalone` | Image used by `--serve` |
-| `--host-model-dir` | `$HOME/model/<preset directory>` | Host weights |
-| `--host-cache-dir` | `$HOME/model/orinfer-cache` | Runtime cache |
-| `--container-name` | `ferryman-orinfer` | Managed container name |
-| `--host-port` | `8088` | Host port mapped to container 8088 |
-| `--no-cache` | Off | Disable translation caching |
-| `--health-timeout` | `600` | Startup timeout in seconds |
-
-Run `ferryman --help` for document, batching, output and cache options.
 
 ## Resumability & interruption
 
@@ -418,12 +325,6 @@ Run `ferryman --help` for document, batching, output and cache options.
   ID across retries and page reloads in the same tab; retrying the same request
   returns its original job IDs, even if the source directory has since changed.
   History is periodically reconciled, and open details poll the individual job.
-- **Local models are checked before use.** Detection validates JSON metadata,
-  safetensors headers, tensor offsets and shard lengths. Downloaded models also
-  use recorded file sizes and available hashes; damaged files can be downloaded
-  again. Startup verification runs in the background so the controller's health
-  endpoint stays available; models remain `Verifying` and cannot be loaded or
-  deleted until the scan completes. Orinfer handles memory admission and execution-package validation.
 
 ## Notes / limitations
 
@@ -433,18 +334,15 @@ Run `ferryman --help` for document, batching, output and cache options.
 - `<pre>`/`<code>`/`<script>`/`<style>`/`<svg>`/`<head>` content is not translated.
 - Table cells (`td`/`th`) and `<div>` wrappers are intentionally not translated
   (to avoid duplicating nested content and to keep XHTML valid).
-- Translation batches use a conservative 8192-token input/output planning budget.
-  Orinfer derives the output limit from the remaining model context, up to 8192
-  output tokens. Context errors and truncated responses trigger bounded splitting
+- Web translation budgets follow the selected connection's served context and
+  output limit. Configure these to match the actual service, rather than the
+  model architecture's theoretical maximum. Context errors and truncated responses trigger bounded splitting
   and retries; incomplete translations are not cached as successful results.
 
 ### Shared implementation primitives
 
-- Agent pairing uses the shared RustCrypto HMAC implementation in `src/auth.rs`.
-  Its wire protocol remains `HMAC-SHA256(SHA256(token), nonce)`; verification uses
-  the library's MAC comparison and token hashes use `subtle`.
-- Axum request-part extraction authenticates Web users; an agent route middleware
-  protects runtime/model/proxy endpoints while health and pairing remain public.
+- Axum request-part extraction authenticates Web users; model sources, credentials
+  and jobs are scoped to that identity.
 - `tokio-rusqlite` serializes database work on a dedicated thread. Existing SQL,
   transactions, WAL, ownership and cursor pagination remain authoritative.
 - Markdown uses CommonMark events and original byte ranges. Code, link targets,

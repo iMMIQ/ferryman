@@ -23,7 +23,7 @@ export type Phase = "all" | JobPhase;
 export type RequestData = Required<
   Pick<
     CreateDirectoryJobsRequest,
-    "sources" | "save_strategy" | "preset" | "target" | "mode" | "settings"
+    "sources" | "save_strategy" | "model_id" | "target" | "mode" | "settings"
   >
 > &
   Partial<Pick<CreateDirectoryJobsRequest, "save_storage" | "save_path">>;

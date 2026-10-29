@@ -21,8 +21,7 @@ FONTS = ["NotoSansCJK-Regular.ttc", "DejaVuSans.ttf"] + [
     f"{name}-Regular.ttf" for name in
     ("NotoSans", "NotoSansArabic", "NotoSansHebrew", "NotoSansDevanagari", "NotoSansThai")
 ]
-TARGETS = {"web": (62, "x86_64-unknown-linux-gnu"),
-           "aipod": (183, "aarch64-unknown-linux-gnu")}
+TARGETS = {"web": (62, "x86_64-unknown-linux-gnu")}
 
 
 def require(condition, message):
@@ -49,72 +48,36 @@ def elf_info(data):
 
 
 def validate_payload(kind, files):
-    binary = "ferryman-web" if kind == "web" else "agxorin/ferryman-agent"
+    require(not any(PurePosixPath(p).name in {"discovery-api-auth.json", "api-auth-token"}
+                    for p in files), "debug credentials must not be packaged")
+    binary = "ferryman-web"
     data, mode = files[binary]
     require(mode & 0o111, f"{binary} is not executable")
     elf(data, TARGETS[kind][0])
     info = elf_info(data)
     needed = set(re.findall(r"Shared library: \[(.*?)\]", info))
     versions = set(re.findall(r"GLIBC_[0-9.]+", info))
-    if kind == "web":
-        require(needed <= {p.removeprefix("web-libs/") for p in files if p.startswith("web-libs/")},
-                f"unbundled shared library: {needed}")
-        for name in FONTS:
-            require(bool(files[f"fonts/{name}"][0]), f"empty font: {name}")
-        for name in ("fonts-noto-cjk", "fonts-noto-core", "fonts-dejavu-core"):
-            require(bool(files[f"fonts/{name}.copyright"][0]), f"missing font license: {name}")
-        require(b"BEGIN CERTIFICATE" in files["ca-certificates.crt"][0], "missing CA bundle")
-        require(b"dns" in files["nsswitch.conf"][0], "missing DNS configuration")
-        require(b"/assets/" in files["assets/index.html"][0], "missing built frontend")
-        require(any(p.startswith("assets/assets/") and p.endswith(".js") for p in files),
-                "missing frontend JavaScript")
-        for path, (library, _) in files.items():
-            if path.startswith("web-libs/"):
-                elf(library, 62)
-        available = set(re.findall(r"GLIBC_[0-9.]+", elf_info(files["web-libs/libc.so.6"][0])))
-        require(versions <= available, f"sysroot cannot provide {versions - available}")
-    else:
-        require(needed <= {"libgcc_s.so.1", "libm.so.6", "libc.so.6", "ld-linux-aarch64.so.1"},
-                f"unexpected Agent dependency: {needed}")
-        require(all(tuple(map(int, v[6:].split('.'))) <= (2, 35) for v in versions),
-                "Agent requires glibc newer than the release baseline glibc 2.35; use Ubuntu 22.04 sysroot")
-        compose = yaml.safe_load(files["agxorin/docker-compose.yml"][0])
-        service = compose["services"]["ferryman-agent"]
-        require(re.search(r"@sha256:[0-9a-f]{64}$", service["image"].removeprefix("${FERRYMAN_RUNTIME_IMAGE:-").removesuffix("}")), "Agent base image must be digest pinned")
-        require("/healthz" in str(service["healthcheck"]["test"]), "missing Agent healthcheck")
-        require("./ferryman-agent:/usr/local/bin/ferryman-agent:ro" in service["volumes"],
-                "Agent executable must be mounted read-only beside compose")
-        require(compose["networks"]["default"]["name"] == "traefik-shared-network", "wrong AI Pod network")
-        require(any("Host(`ferryman-agent-ai`)" in label for label in service["labels"]), "wrong AI host")
-        require(not service.get("ports") and service.get("network_mode") != "host", "inference must stay inside the Agent container")
-        require(service["environment"]["FERRYMAN_ORINFER_ENDPOINT"] == "http://127.0.0.1:18088", "inference must use container loopback")
-        require("./orinfer:/opt/orinfer:ro" in service["volumes"], "missing read-only Orinfer runtime")
-        require(service["environment"]["ORINFER_EXECUTION_CACHE"] == "/opt/orinfer/packages", "wrong execution package path")
-        lock = json.loads(files["agxorin/orinfer/release-lock.json"][0])
-        require(lock == json.loads(Path(__file__).with_name("orinfer-release.json").read_text()), "unexpected Orinfer release")
-        engine = files["agxorin/orinfer/bin/orinfer"][0]
-        elf(engine, 183)
-        require(files["agxorin/orinfer/bin/orinfer"][1] & 0o111, "Orinfer is not executable")
-        for name, digest in lock["assets"].items():
-            archive = files[f"agxorin/orinfer/releases/{name}"][0]
-            require(sha(archive) == digest, f"Orinfer release checksum mismatch: {name}")
-            contents = archive_files(archive)
-            if name == lock["engine"]:
-                require(contents["orinfer-v0.2.0-linux-aarch64/bin/orinfer"][0] == engine, "engine differs from release")
-            else:
-                # The build-time installer verifies package identity. Compare every
-                # installed file with the pinned release when validating the LPK.
-                for relative, (expected, _) in contents.items():
-                    installed = f"agxorin/orinfer/packages/{relative}"
-                    require(installed in files and files[installed][0] == expected, f"installed execution package differs: {relative}")
-        require(len([name for name in files if name.startswith("agxorin/orinfer/packages/") and name.endswith("/package.json")]) == 3, "expected three installed Index packages")
-        config = yaml.safe_load(files["config/aipod.yml"][0])
-        require("ferryman-agent-ai" in config["depends_on_hosts"], "missing host dependency")
+    require(needed <= {p.removeprefix("web-libs/") for p in files if p.startswith("web-libs/")},
+            f"unbundled shared library: {needed}")
+    for name in FONTS:
+        require(bool(files[f"fonts/{name}"][0]), f"empty font: {name}")
+    for name in ("fonts-noto-cjk", "fonts-noto-core", "fonts-dejavu-core"):
+        require(bool(files[f"fonts/{name}.copyright"][0]), f"missing font license: {name}")
+    require(b"BEGIN CERTIFICATE" in files["ca-certificates.crt"][0], "missing CA bundle")
+    require(b"dns" in files["nsswitch.conf"][0], "missing DNS configuration")
+    require(b"/assets/" in files["assets/index.html"][0], "missing built frontend")
+    require(any(p.startswith("assets/assets/") and p.endswith(".js") for p in files),
+            "missing frontend JavaScript")
+    for path, (library, _) in files.items():
+        if path.startswith("web-libs/"):
+            elf(library, 62)
+    available = set(re.findall(r"GLIBC_[0-9.]+", elf_info(files["web-libs/libc.so.6"][0])))
+    require(versions <= available, f"sysroot cannot provide {versions - available}")
     return {"target": TARGETS[kind][1], "needed": sorted(needed), "glibc": sorted(versions)}
 
 
 def manifest_path(kind):
-    return "artifacts.json" if kind == "web" else "agxorin/artifacts.json"
+    return "artifacts.json"
 
 
 def verify_manifest(kind, files):
@@ -144,6 +107,8 @@ def archive_files(data):
     for name, content, mode in entries:
         path = PurePosixPath(name)
         require(not path.is_absolute() and ".." not in path.parts, f"invalid archive path {name}")
+        require(path.name not in {"discovery-api-auth.json", "api-auth-token"},
+                "debug credentials must not be packaged")
         require(path.as_posix() not in result, f"duplicate archive path {name}")
         result[path.as_posix()] = (content, mode)
     return result
@@ -152,65 +117,64 @@ def archive_files(data):
 def check_lpk(kind, path):
     files = archive_files(path.read_bytes())
     package = yaml.safe_load(files["package.yml"][0])
-    expected = "cloud.lazycat.aipod.ferryman" if kind == "aipod" else "cloud.lazycat.app.ferryman"
-    require(package["package"] == expected, "wrong release package identity")
-    if kind == "aipod":
-        require(tuple(map(int, str(package["min_os_version"]).split('.'))) >= (1, 5, 2), "resource exports require LZCOS >= 1.5.2")
-        require("manifest.yml" not in files and "images.lock" not in files, "expected resource-only LPK")
-        payload = {p.removeprefix("exports/aipod/"): v for p, v in files.items()
-                   if p.startswith("exports/aipod/")}
-    else:
-        manifest = yaml.safe_load(files["manifest.yml"][0])
-        require(manifest["services"]["web"]["image"].startswith("embed:ferryman-web"), "wrong embedded image alias")
-        lock = yaml.safe_load(files["images.lock"][0])["images"]["ferryman-web"]
-        require(not lock.get("upstream"), "scratch Web image must be fully embedded")
-        index = json.loads(files["images/index.json"][0])
-        descriptor = next(item for item in index["manifests"]
-                          if item.get("annotations", {}).get("org.opencontainers.image.ref.name") == "ferryman-web")
+    require(package["package"] == "cloud.lazycat.app.ferryman", "wrong release package identity")
+    require("lzcapp.user_delegate" in package.get("permissions", {}).get("required", []), "missing required discovery delegation permission")
+    require("net.lan" in package.get("permissions", {}).get("required", []), "missing LAN API permission")
+    require(not any(p.startswith("exports/aipod/") for p in files), "unexpected AI Pod resource")
+    manifest = yaml.safe_load(files["manifest.yml"][0])
+    require(manifest["services"]["web"]["image"].startswith("embed:ferryman-web"), "wrong embedded image alias")
+    require(set(manifest["services"]) == {"web"}, "release must contain only the Web service")
+    images = yaml.safe_load(files["images.lock"][0])["images"]
+    require(set(images) == {"ferryman-web"}, "release must embed exactly one image")
+    lock = images["ferryman-web"]
+    require(not lock.get("upstream"), "scratch Web image must be fully embedded")
+    index = json.loads(files["images/index.json"][0])
+    descriptor = next(item for item in index["manifests"]
+                      if item.get("annotations", {}).get("org.opencontainers.image.ref.name") == "ferryman-web")
 
-        def oci_json(reference):
-            digest = reference["digest"].removeprefix("sha256:")
-            blob = files[f"images/blobs/sha256/{digest}"][0]
-            require(sha(blob) == digest, "corrupted OCI metadata")
-            return json.loads(blob)
+    def oci_json(reference):
+        digest = reference["digest"].removeprefix("sha256:")
+        blob = files[f"images/blobs/sha256/{digest}"][0]
+        require(sha(blob) == digest, "corrupted OCI metadata")
+        return json.loads(blob)
 
-        image_manifest = oci_json(descriptor)
-        config = oci_json(image_manifest["config"])
-        require(config["architecture"] == "amd64" and config["os"] == "linux", "wrong Web image platform")
-        require(config["config"]["Entrypoint"] == ["/usr/local/bin/ferryman-web"], "wrong Web entrypoint")
-        require([layer["digest"] for layer in image_manifest["layers"]] ==
-                [layer["digest"] for layer in lock["layers"]], "OCI manifest and images.lock disagree")
-        rootfs = {}
-        require(len(config["rootfs"]["diff_ids"]) == len(lock["layers"]), "wrong OCI layer count")
-        for index, layer in enumerate(lock["layers"]):
-            require(layer["source"] == "embed", "missing embedded layer")
-            digest = layer["digest"].removeprefix("sha256:")
-            blob = files[f"images/blobs/sha256/{digest}"][0]
-            require(sha(blob) == digest, "corrupted OCI layer")
-            raw = gzip.decompress(blob) if blob.startswith(b"\x1f\x8b") else blob
-            require("sha256:" + sha(raw) == config["rootfs"]["diff_ids"][index], "OCI layer content does not match its diff ID")
-            contents = archive_files(raw)
-            require(not any(PurePosixPath(p).name.startswith('.wh.') for p in contents), "unexpected whiteout in scratch image")
-            rootfs.update(contents)
-        metadata = json.loads(rootfs["app/artifacts.json"][0])
-        payload = {"artifacts.json": rootfs["app/artifacts.json"]}
-        for name in metadata["sha256"]:
-            if name == "ferryman-web":
-                image_path = "usr/local/bin/ferryman-web"
-            elif name.startswith("web-libs/"):
-                image_path = "lib/x86_64-linux-gnu/" + name.removeprefix("web-libs/")
-            elif name.startswith("fonts/"):
-                image_path = "app/" + name
-            elif name.startswith("assets/"):
-                image_path = "app/web/" + name.removeprefix("assets/")
-            elif name == "nsswitch.conf":
-                image_path = "etc/nsswitch.conf"
-            elif name == "ca-certificates.crt":
-                image_path = "etc/ssl/certs/ca-certificates.crt"
-            else:
-                raise ValueError(f"unexpected artifact {name}")
-            payload[name] = rootfs[image_path]
-        require(rootfs["lib64/ld-linux-x86-64.so.2"][0] == payload["web-libs/ld-linux-x86-64.so.2"][0], "wrong ELF loader")
+    image_manifest = oci_json(descriptor)
+    config = oci_json(image_manifest["config"])
+    require(config["architecture"] == "amd64" and config["os"] == "linux", "wrong Web image platform")
+    require(config["config"]["Entrypoint"] == ["/usr/local/bin/ferryman-web"], "wrong Web entrypoint")
+    require([layer["digest"] for layer in image_manifest["layers"]] ==
+            [layer["digest"] for layer in lock["layers"]], "OCI manifest and images.lock disagree")
+    rootfs = {}
+    require(len(config["rootfs"]["diff_ids"]) == len(lock["layers"]), "wrong OCI layer count")
+    for index, layer in enumerate(lock["layers"]):
+        require(layer["source"] == "embed", "missing embedded layer")
+        digest = layer["digest"].removeprefix("sha256:")
+        blob = files[f"images/blobs/sha256/{digest}"][0]
+        require(sha(blob) == digest, "corrupted OCI layer")
+        raw = gzip.decompress(blob) if blob.startswith(b"\x1f\x8b") else blob
+        require("sha256:" + sha(raw) == config["rootfs"]["diff_ids"][index], "OCI layer content does not match its diff ID")
+        contents = archive_files(raw)
+        require(not any(PurePosixPath(p).name.startswith('.wh.') for p in contents), "unexpected whiteout in scratch image")
+        rootfs.update(contents)
+    metadata = json.loads(rootfs["app/artifacts.json"][0])
+    payload = {"artifacts.json": rootfs["app/artifacts.json"]}
+    for name in metadata["sha256"]:
+        if name == "ferryman-web":
+            image_path = "usr/local/bin/ferryman-web"
+        elif name.startswith("web-libs/"):
+            image_path = "lib/x86_64-linux-gnu/" + name.removeprefix("web-libs/")
+        elif name.startswith("fonts/"):
+            image_path = "app/" + name
+        elif name.startswith("assets/"):
+            image_path = "app/web/" + name.removeprefix("assets/")
+        elif name == "nsswitch.conf":
+            image_path = "etc/nsswitch.conf"
+        elif name == "ca-certificates.crt":
+            image_path = "etc/ssl/certs/ca-certificates.crt"
+        else:
+            raise ValueError(f"unexpected artifact {name}")
+        payload[name] = rootfs[image_path]
+    require(rootfs["lib64/ld-linux-x86-64.so.2"][0] == payload["web-libs/ld-linux-x86-64.so.2"][0], "wrong ELF loader")
     verify_manifest(kind, payload)
     print(f"Validated {path}: {len(payload)} payload files, {path.stat().st_size} bytes")
 

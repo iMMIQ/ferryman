@@ -19,8 +19,6 @@ services:
       - FERRYMAN_DATA_DIR=/lzcapp/var/ferryman
       - FERRYMAN_USER_DOCUMENTS_DIR=/lzcapp/run/mnt/home
       - FERRYMAN_REMOTE_FS_DIR=/lzcapp/media/RemoteFS
-      - FERRYMAN_AGENT_URL=https://ferryman-agent-ai.{{ .S.BoxDomain }}
-      # Generated and persisted by Web on first startup; never embedded in the LPK.
-      - FERRYMAN_AGENT_PAIRING=true
+      - FERRYMAN_MODEL_DISCOVERY_URL=http://app.cloud.lazycat.app.ai.lzcx/api/v1/model-deployments
       - FERRYMAN_ALLOW_LOCAL_USER=false
       - RUST_LOG=info

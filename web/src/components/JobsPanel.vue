@@ -72,7 +72,7 @@ const fields = computed(() =>
     ? {
         文件名: job.value.filename,
         状态: statusLabel(job.value),
-        模型: modelNames[job.value.preset],
+        模型: job.value.model?.name || modelNames[job.value.preset],
         目标语言: job.value.target,
         输出方式: job.value.mode === "replace" ? "仅译文" : "双语对照",
         来源:
@@ -199,11 +199,7 @@ async function remove() {
             </td>
             <td>
               <span class="model-chip">{{
-                item.preset === "index-translate-2b"
-                  ? "2B"
-                  : item.preset === "index-translate-9b"
-                    ? "9B"
-                    : "35B"
+                item.model?.name || modelNames[item.preset]
               }}</span>
             </td>
             <td><StatusBadge :job="item" /></td>
@@ -234,13 +230,7 @@ async function remove() {
         <div class="card-meta">
           <span
             >{{ item.target }} ·
-            {{
-              item.preset === "index-translate-2b"
-                ? "2B"
-                : item.preset === "index-translate-9b"
-                  ? "9B"
-                  : "35B"
-            }}</span
+            {{ item.model?.name || modelNames[item.preset] }}</span
           ><StatusBadge :job="item" />
         </div>
         <p v-if="item.error" class="job-error-summary">{{ item.error }}</p>

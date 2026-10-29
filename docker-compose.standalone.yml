@@ -1,21 +1,8 @@
-# Ferryman single-machine Docker deployment: ferryman-web + ferryman-agent
+# Ferryman single-image deployment; inference uses an external model API.
 # on one host, no Lazycat platform required. Configure via .env (see
 # .env.example), then: docker compose -f docker-compose.standalone.yml up -d --build
 
 services:
-  # Creates the per-user storage directories the web app expects; storage is
-  # "unavailable" for a user until <root>/<uid>/ exists.
-  init-dirs:
-    image: debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
-    entrypoint: ["/bin/mkdir", "-p"]
-    command:
-      - /documents/local-development-user
-      - /remotefs/local-development-user
-    volumes:
-      - ${FERRYMAN_DOCS_DIR:-./documents}:/documents
-      - ${FERRYMAN_REMOTEFS_DIR:-./remotefs}:/remotefs
-    restart: "no"
-
   web:
     build:
       context: .
@@ -29,8 +16,6 @@ services:
       FERRYMAN_DATA_DIR: /data
       FERRYMAN_USER_DOCUMENTS_DIR: /documents
       FERRYMAN_REMOTE_FS_DIR: /remotefs
-      FERRYMAN_AGENT_URL: http://agent:8090
-      FERRYMAN_AGENT_TOKEN: ${FERRYMAN_AGENT_TOKEN:?set FERRYMAN_AGENT_TOKEN in .env}
       # Single-user mode: every visitor shares the local-development-user
       # identity. Keep the port off the public internet, or put an
       # authenticating reverse proxy in front that injects safe_uid.
@@ -40,40 +25,8 @@ services:
       - ${FERRYMAN_DATA_DIR:-./data}:/data
       - ${FERRYMAN_DOCS_DIR:-./documents}:/documents
       - ${FERRYMAN_REMOTEFS_DIR:-./remotefs}:/remotefs
-    depends_on:
-      init-dirs:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/config"]
-      interval: 30s
-      timeout: 5s
-      start_period: 10s
-      retries: 3
-
-  agent:
-    platform: linux/arm64
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-      target: agent
-    image: ferryman-agent:standalone
-    restart: unless-stopped
-    shm_size: 512m
-    gpus: all
-    environment:
-      FERRYMAN_AGENT_LISTEN: 0.0.0.0:8090
-      FERRYMAN_AGENT_TOKEN: ${FERRYMAN_AGENT_TOKEN:?set FERRYMAN_AGENT_TOKEN in .env}
-      FERRYMAN_MODEL_ROOT: /models
-      FERRYMAN_ORINFER_ENDPOINT: http://127.0.0.1:18088
-      FERRYMAN_CACHE_ROOT: /root/.cache/ferryman
-      FERRYMAN_IDLE_TIMEOUT_SECONDS: "600"
-      ORINFER_EXECUTION_CACHE: /opt/orinfer/packages
-      RUST_LOG: info
-    volumes:
-      - ${FERRYMAN_MODELS_DIR:-./models}:/models
-      - ${FERRYMAN_AGENT_CACHE_DIR:-./agent-cache}:/root/.cache
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8090/healthz"]
       interval: 30s
       timeout: 5s
       start_period: 10s

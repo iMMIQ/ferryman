@@ -48,7 +48,7 @@ export function statusLabel(job: Job) {
   return (
     (
       {
-        starting_model: "启动模型",
+        starting_model: "准备翻译",
         translating: "翻译中",
         writing: "写入结果",
       } as Record<string, string>

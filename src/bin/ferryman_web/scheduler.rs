@@ -3,7 +3,6 @@
 
 use super::{claim_queued_job, mutate_job, AppState, JobStatus, MAX_ACTIVE_JOBS};
 use crate::runner::run_job;
-use ferryman::preset::Preset;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
@@ -46,42 +45,29 @@ pub(super) async fn finalize_failed_job(
 }
 
 fn can_dispatch_job<'a>(
-    active_preset: Option<Preset>,
     active_outputs: impl IntoIterator<Item = &'a PathBuf>,
-    preset: Preset,
     output: Option<&PathBuf>,
 ) -> bool {
-    if active_preset.is_some_and(|current| current != preset) {
-        return false;
-    }
     !output.is_some_and(|candidate| active_outputs.into_iter().any(|active| active == candidate))
 }
 
-// Remove stale entries as we scan, so selection and removal use the same index.
+// Independent external model APIs share only the output-file exclusion.
 fn take_dispatchable<K>(
     pending: &mut VecDeque<Uuid>,
-    active_preset: Option<Preset>,
     active_outputs: &HashMap<K, PathBuf>,
-    mut lookup: impl FnMut(Uuid) -> Option<(Preset, Option<PathBuf>)>,
-) -> Option<(Uuid, Preset, Option<PathBuf>)> {
+    mut lookup: impl FnMut(Uuid) -> Option<Option<PathBuf>>,
+) -> Option<(Uuid, Option<PathBuf>)> {
     let mut index = 0;
     while let Some(&id) = pending.get(index) {
         match lookup(id) {
             None => {
                 pending.remove(index);
             }
-            Some((preset, output)) => {
-                if can_dispatch_job(
-                    active_preset,
-                    active_outputs.values(),
-                    preset,
-                    output.as_ref(),
-                ) {
-                    pending.remove(index);
-                    return Some((id, preset, output));
-                }
-                index += 1;
+            Some(output) if can_dispatch_job(active_outputs.values(), output.as_ref()) => {
+                pending.remove(index);
+                return Some((id, output));
             }
+            Some(_) => index += 1,
         }
     }
     None
@@ -91,27 +77,23 @@ pub(super) async fn job_worker(state: AppState, mut queue: mpsc::Receiver<Uuid>)
     let mut pending = VecDeque::new();
     let mut active = JoinSet::new();
     let mut active_outputs = HashMap::new();
-    let mut active_preset = None;
     let mut queue_open = true;
 
     loop {
         while active.len() < MAX_ACTIVE_JOBS {
-            // Scan for the first dispatchable job instead of only the queue
-            // head: a 30B job waiting at the head must not starve every 7B
-            // job behind it (and vice versa) while the active preset differs.
+            // A blocked output must not stall jobs writing elsewhere.
             let next = {
                 let jobs = state.active_jobs.read().await;
-                take_dispatchable(&mut pending, active_preset, &active_outputs, |id| {
+                take_dispatchable(&mut pending, &active_outputs, |id| {
                     jobs.get(&id)
                         .filter(|entry| entry.record.status == JobStatus::Queued)
-                        .map(|entry| (entry.record.preset, entry.save_to.clone()))
+                        .map(|entry| entry.save_to.clone())
                 })
             };
-            let Some((id, preset, output)) = next else {
+            let Some((id, output)) = next else {
                 break;
             };
 
-            active_preset = Some(preset);
             let job_state = state.clone();
             let task = active.spawn(async move {
                 process_queued_job(job_state, id).await;
@@ -143,9 +125,6 @@ pub(super) async fn job_worker(state: AppState, mut queue: mpsc::Receiver<Uuid>)
                     }
                     None => {}
                 }
-                if active.is_empty() {
-                    active_preset = None;
-                }
             }
         }
     }
@@ -154,60 +133,37 @@ pub(super) async fn job_worker(state: AppState, mut queue: mpsc::Receiver<Uuid>)
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn cancelled_jobs_do_not_shift_selected_job_or_output() {
         let cancelled = Uuid::new_v4();
-        let first = Uuid::new_v4();
-        let other_model = Uuid::new_v4();
         let blocked = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let other = Uuid::new_v4();
         let output = PathBuf::from("chosen.txt");
         let busy = PathBuf::from("busy.txt");
         let jobs = HashMap::from([
-            (first, (Preset::Index2B, Some(output.clone()))),
-            (other_model, (Preset::Index35B, None)),
-            (blocked, (Preset::Index2B, Some(busy.clone()))),
+            (first, Some(output.clone())),
+            (other, None),
+            (blocked, Some(busy.clone())),
         ]);
-        let mut pending = VecDeque::from([cancelled, blocked, first, other_model]);
+        let mut pending = VecDeque::from([cancelled, blocked, first, other]);
         let active = HashMap::from([(0, busy)]);
         assert_eq!(
-            take_dispatchable(&mut pending, Some(Preset::Index2B), &active, |id| jobs
-                .get(&id)
-                .cloned()),
-            Some((first, Preset::Index2B, Some(output)))
+            take_dispatchable(&mut pending, &active, |id| jobs.get(&id).cloned()),
+            Some((first, Some(output)))
         );
-        assert_eq!(pending, VecDeque::from([blocked, other_model]));
-        assert!(
-            take_dispatchable(&mut pending, Some(Preset::Index2B), &active, |id| jobs
-                .get(&id)
-                .cloned())
-            .is_none()
+        assert_eq!(
+            take_dispatchable(&mut pending, &active, |id| jobs.get(&id).cloned()),
+            Some((other, None))
         );
+        assert_eq!(pending, VecDeque::from([blocked]));
     }
-
     #[test]
-    fn dispatch_only_combines_compatible_jobs() {
-        let first = PathBuf::from("documents/result-a.txt");
-        let second = PathBuf::from("documents/result-b.txt");
-        let active_outputs = [first.clone()];
-
-        assert!(can_dispatch_job(
-            Some(Preset::Index2B),
-            active_outputs.iter(),
-            Preset::Index2B,
-            Some(&second),
-        ));
-        assert!(!can_dispatch_job(
-            Some(Preset::Index2B),
-            active_outputs.iter(),
-            Preset::Index35B,
-            Some(&second),
-        ));
-        assert!(!can_dispatch_job(
-            Some(Preset::Index2B),
-            active_outputs.iter(),
-            Preset::Index2B,
-            Some(&first),
-        ));
+    fn external_models_only_exclude_conflicting_outputs() {
+        let first = PathBuf::from("result-a.txt");
+        let second = PathBuf::from("result-b.txt");
+        assert!(can_dispatch_job([&first], Some(&second)));
+        assert!(can_dispatch_job([&first], None));
+        assert!(!can_dispatch_job([&first], Some(&first)));
     }
 }

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone)]
 pub(crate) struct JobStore {
@@ -45,6 +45,8 @@ impl JobStore {
                 .await
                 .with_context(|| format!("open job database {}", path.display()))?,
         };
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
         store
             .call(|connection| {
                 connection.execute_batch(
@@ -59,11 +61,17 @@ impl JobStore {
                     create_schema(connection)?;
                 } else if version == 1 {
                     migrate_index_presets(connection)?;
-                } else if version != SCHEMA_VERSION {
+                } else if version != 2 && version != SCHEMA_VERSION {
                     anyhow::bail!(
                         "unsupported job database schema {version}; expected {SCHEMA_VERSION}"
                     );
                 }
+                let has_model: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('jobs') WHERE name='model_json')", [], |row| row.get(0))?;
+                if !has_model { connection.execute_batch("ALTER TABLE jobs ADD COLUMN model_json TEXT;")?; }
+                connection.execute_batch("CREATE TABLE IF NOT EXISTS model_sources (
+                    owner TEXT NOT NULL, id TEXT NOT NULL, source TEXT NOT NULL, definition TEXT NOT NULL,
+                    PRIMARY KEY(owner,id)); PRAGMA user_version=3;")?;
                 connection.execute_batch(
                     "CREATE TABLE IF NOT EXISTS submissions (
                     owner TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL,
@@ -73,6 +81,52 @@ impl JobStore {
             })
             .await?;
         Ok(store)
+    }
+
+    pub(crate) async fn models(&self, owner: String) -> Result<Vec<super::models::StoredModel>> {
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare("SELECT definition FROM model_sources WHERE owner=?1 ORDER BY id")?;
+            let definitions = statement
+                .query_map([owner], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            definitions
+                .into_iter()
+                .map(|value| Ok(serde_json::from_str(&value)?))
+                .collect()
+        })
+        .await
+    }
+
+    pub(crate) async fn save_models(
+        &self,
+        owner: String,
+        models: Vec<super::models::StoredModel>,
+        discovery: bool,
+        complete: bool,
+    ) -> Result<()> {
+        self.call(move |connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if discovery && complete { tx.execute("DELETE FROM model_sources WHERE owner=?1 AND source='discovered'", [&owner])?; }
+            for model in models {
+                tx.execute("INSERT INTO model_sources(owner,id,source,definition) VALUES (?1,?2,?3,?4)
+                    ON CONFLICT(owner,id) DO UPDATE SET source=excluded.source, definition=excluded.definition",
+                    params![owner, model.info.target.id, model.info.source, serde_json::to_string(&model)?])?;
+            }
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
+    pub(crate) async fn delete_model(&self, owner: String, id: String) -> Result<()> {
+        self.call(move |connection| {
+            connection.execute(
+                "DELETE FROM model_sources WHERE owner=?1 AND id=?2 AND source='custom'",
+                params![owner, id],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     async fn call<T, F>(&self, operation: F) -> Result<T>
@@ -143,14 +197,14 @@ impl JobStore {
                     batch_size, context_segments, cache_enabled, result_available,
                     source_path, source_storage, save_path, save_storage,
                     job_dir, input_path, output_path, save_to, save_root, overwrite,
-                    created_at, updated_at
+                    created_at, updated_at, model_json
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                     ?8, ?9, ?10, ?11, ?12,
                     ?13, ?14, ?15, ?16,
                     ?17, ?18, ?19, ?20,
                     ?21, ?22, ?23, ?24, ?25, ?26,
-                    ?27, ?28
+                    ?27, ?28, ?29
                  )",
                 rusqlite::params_from_iter(entry_params(&entry)?),
             )?;
@@ -175,7 +229,7 @@ impl JobStore {
                     result_available=?16, source_path=?17, source_storage=?18,
                     save_path=?19, save_storage=?20, job_dir=?21, input_path=?22,
                     output_path=?23, save_to=?24, save_root=?25, overwrite=?26,
-                    created_at=?27, updated_at=?28
+                    created_at=?27, updated_at=?28, model_json=?29
                  WHERE id=?1",
                 rusqlite::params_from_iter(entry_params(&entry)?),
             )?;
@@ -581,6 +635,14 @@ fn entry_params(entry: &JobEntry) -> Result<Vec<rusqlite::types::Value>> {
         SqlValue::Integer(i64::from(entry.overwrite)),
         SqlValue::Integer(to_i64(entry.record.created_at)?),
         SqlValue::Integer(to_i64(entry.record.updated_at)?),
+        entry
+            .record
+            .model
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?
+            .map(SqlValue::Text)
+            .unwrap_or(SqlValue::Null),
     ])
 }
 
@@ -627,6 +689,12 @@ fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<JobEntry> {
             id,
             filename: row.get("filename")?,
             preset,
+            model: row
+                .get::<_, Option<String>>("model_json")?
+                .map(|value| {
+                    serde_json::from_str(&value).map_err(|error| parse_error(28, error.to_string()))
+                })
+                .transpose()?,
             target: row.get("target_language")?,
             mode,
             status,
@@ -705,6 +773,7 @@ mod tests {
                 id,
                 filename: "notes.txt".to_string(),
                 preset: Preset::Index2B,
+                model: None,
                 target: "中文".to_string(),
                 mode: OutputMode::Bilingual,
                 status,

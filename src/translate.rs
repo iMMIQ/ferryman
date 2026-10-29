@@ -1,4 +1,4 @@
-//! Orinfer OpenAI-compatible translation client.
+//! OpenAI-compatible translation client with model-specific prompt adapters.
 
 use anyhow::{anyhow, Result};
 use std::time::Duration;
@@ -61,16 +61,11 @@ async fn translate_single(
 ) -> Result<String> {
     // Trim leading/trailing whitespace; keep internal structure as-is.
     let trimmed = text.trim();
-    let prompt = format!(
-        "Translate the following text into {tgt}. Note that you should only \
-         output the translated result without any additional explanation:\n\n{text}",
-        tgt = target_lang,
-        text = trimmed
-    );
+    let prompt = client.single_prompt(trimmed, target_lang);
 
     let body = ChatReq::translation(model, prompt);
 
-    let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
+    let url = crate::model_api::chat_url(endpoint);
 
     let mut last_err = String::new();
     let mut retry_after = None;
@@ -344,10 +339,10 @@ async fn translate_one_batch(
     context: &[&str],
     target_lang: &str,
 ) -> SliceOutcome {
-    let prompt = build_batch_prompt(cues, context, target_lang);
+    let prompt = client.batch_prompt(cues, context, target_lang);
     let body = ChatReq::translation(model, prompt);
 
-    let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
+    let url = crate::model_api::chat_url(endpoint);
 
     let mut best: Vec<Option<String>> = (0..cues.len()).map(|_| None).collect();
     let mut best_count = 0;

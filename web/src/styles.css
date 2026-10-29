@@ -1491,3 +1491,41 @@ td {
   box-shadow: inset 3px 0 var(--accent);
   background: #f0f8f4;
 }
+
+.model-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+.api-model-list {
+  list-style: none;
+  padding: 0;
+}
+.api-model-list > li {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border, #e0e2df);
+}
+.api-address {
+  overflow-wrap: anywhere;
+}
+.api-model-form {
+  margin-top: 20px;
+}
+.api-model-form fieldset {
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+.api-model-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 12px 0;
+}
+.api-model-form input,
+.api-model-form select {
+  width: 100%;
+  min-height: 40px;
+  box-sizing: border-box;
+}

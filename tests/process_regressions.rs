@@ -469,9 +469,30 @@ async fn agent_engine_single_unit_uses_jsonl_without_an_http_model() {
 }
 
 #[tokio::test]
-async fn web_translates_with_every_preset_including_9b() {
-    let agent = Agent::start("jsonl").await;
-    let root = agent.root.path().join("web");
+async fn web_translates_with_external_models_and_official_prompt_adapters() {
+    use axum::{routing::post, Json, Router};
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("web");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let model_origin = format!("http://{}", listener.local_addr().unwrap());
+    let model_app = Router::new().route("/v1/chat/completions", post(|headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| async move {
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer regression-model-key");
+        assert!(headers.get("x-hc-user-ticket").is_none());
+        assert!(body.get("top_k").is_none());
+        let generic = body["model"] == "my-arbitrary-chat-v2";
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), if generic { 2 } else { 1 });
+        let prompt = messages.last().unwrap()["content"].as_str().unwrap();
+        if !generic {
+            assert!(prompt.starts_with("请将以下文本翻译成中文"));
+            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        }
+        let source = prompt.split("<c1>").nth(1).unwrap().split("</c1>").next().unwrap();
+        Json(serde_json::json!({"choices":[{"message":{"content":format!("<c1>译文:{source}</c1>")},"finish_reason":"stop"}]}))
+    }));
+    let model_server = tokio::spawn(async move {
+        axum::serve(listener, model_app).await.unwrap();
+    });
     fs::create_dir_all(root.join("documents")).unwrap();
     fs::create_dir_all(root.join("remote")).unwrap();
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -484,8 +505,7 @@ async fn web_translates_with_every_preset_including_9b() {
             .env("FERRYMAN_USER_DOCUMENTS_DIR", root.join("documents"))
             .env("FERRYMAN_REMOTE_FS_DIR", root.join("remote"))
             .env("FERRYMAN_ALLOW_LOCAL_USER", "true")
-            .env("FERRYMAN_AGENT_URL", &agent.origin)
-            .env("FERRYMAN_AGENT_TOKEN", "isolated-regression-token")
+            .env("FERRYMAN_MODEL_DISCOVERY_URL", "")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -508,12 +528,21 @@ async fn web_translates_with_every_preset_including_9b() {
     })
     .await
     .unwrap();
-    for preset in ferryman::preset::Preset::ALL {
-        let preset_id = preset.to_string();
+    for (model, adapter) in [
+        ("Index-Translate-2B", "index_translate"),
+        ("IndexTeam/Index-Translate-9B", "index_translate"),
+        ("Index-Translate-35B-A3B", "index_translate"),
+        ("my-arbitrary-chat-v2", "generic"),
+    ] {
+        let connection: serde_json::Value = client.post(format!("{origin}/api/models"))
+            .json(&serde_json::json!({"name":model,"base_url":format!("{model_origin}/v1"),"model_id":model,
+                "api_key":"regression-model-key","adapter":adapter,"context_length":2048,"max_output_tokens":768,"concurrency":2}))
+            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let selection = connection["target"]["id"].as_str().unwrap();
         let boundary = "ferryman-quality-regression";
         let mut body = String::new();
         for (name, value) in [
-            ("preset", preset_id.as_str()),
+            ("model_id", selection),
             ("target", "中文"),
             ("mode", "replace"),
             ("batch_size", "1"),
@@ -546,15 +575,15 @@ async fn web_translates_with_every_preset_including_9b() {
                     .unwrap();
                 match job["status"].as_str() {
                     Some("completed") => break job,
-                    Some("failed" | "cancelled") => panic!("{preset}: {job}"),
+                    Some("failed" | "cancelled") => panic!("{model}: {job}"),
                     _ => tokio::time::sleep(Duration::from_millis(30)).await,
                 }
             }
         })
         .await
         .unwrap();
-        assert_eq!(result["translated"], 2, "{preset}: {result}");
-        assert_eq!(result["failed_segments"], 0, "{preset}: {result}");
+        assert_eq!(result["translated"], 2, "{model}: {result}");
+        assert_eq!(result["failed_segments"], 0, "{model}: {result}");
         let text = client
             .get(format!("{origin}/api/jobs/{id}/result"))
             .send()
@@ -568,6 +597,7 @@ async fn web_translates_with_every_preset_including_9b() {
                 < text.find("译文:Second paragraph.").unwrap()
         );
     }
+    model_server.abort();
 }
 
 #[tokio::test]

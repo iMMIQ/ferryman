@@ -1,9 +1,11 @@
 use super::*;
 use axum::extract::{Path, State};
 
-async fn state_at(base: &FsPath) -> AppState {
+pub(super) async fn state_at(base: &FsPath) -> AppState {
     let store = JobStore::open(base.join("jobs.sqlite3")).await.unwrap();
     AppState {
+        #[cfg(feature = "lazycat")]
+        delegate_tickets: Arc::default(),
         active_jobs: Arc::new(RwLock::new(HashMap::new())),
         store: store.clone(),
         cancellations: Arc::new(Mutex::new(HashMap::new())),
@@ -14,16 +16,14 @@ async fn state_at(base: &FsPath) -> AppState {
             data_dir: base.join("data"),
             user_documents_dir: base.join("documents"),
             remote_fs_dir: base.join("remote"),
-            agent_url: String::new(),
-            agent_token: "audit-only-token".into(),
-            agent_pairing: false,
+            discovery_url: String::new(),
             allow_local_user: true,
             client: reqwest::Client::new(),
         }),
         persister: JobPersister::spawn(store),
     }
 }
-fn entry_at(base: &FsPath, status: JobStatus) -> JobEntry {
+pub(super) fn entry_at(base: &FsPath, status: JobStatus) -> JobEntry {
     let dir = base.join("job");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("input.txt"), "").unwrap();
@@ -39,6 +39,7 @@ fn entry_at(base: &FsPath, status: JobStatus) -> JobEntry {
             id: Uuid::new_v4(),
             filename: "x.txt".into(),
             preset: Preset::Index2B,
+            model: None,
             target: "中文".into(),
             mode: OutputMode::Bilingual,
             status,

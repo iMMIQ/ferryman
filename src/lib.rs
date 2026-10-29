@@ -10,6 +10,7 @@ pub mod format;
 pub mod html;
 pub mod http_client;
 pub mod jsonl;
+pub mod model_api;
 pub mod preset;
 pub mod settings;
 pub mod translate;

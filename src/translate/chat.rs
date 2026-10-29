@@ -6,6 +6,7 @@ use std::time::Duration;
 
 pub(crate) enum ChatClient<'a> {
     Http(&'a reqwest::Client),
+    Compatible(&'a reqwest::Client, &'a crate::model_api::ModelTarget),
     Jsonl(&'a crate::jsonl::JsonlSender),
 }
 
@@ -85,10 +86,68 @@ impl ChatAttempt {
 }
 
 impl ChatClient<'_> {
+    pub(super) fn single_prompt(&self, text: &str, target: &str) -> String {
+        if matches!(self, Self::Compatible(_, model) if model.adapter == crate::model_api::PromptAdapter::IndexTranslate)
+        {
+            // Official Index-Translate model card, source=auto; no system message.
+            // https://huggingface.co/IndexTeam/Index-Translate-2B#inference
+            format!("请将以下文本翻译为{target}，直接输出翻译结果，不要进行任何解释。\n\n{text}")
+        } else {
+            format!("Translate the following text into {target}. Note that you should only output the translated result without any additional explanation:\n\n{text}")
+        }
+    }
+
+    pub(super) fn batch_prompt(&self, cues: &[&str], context: &[&str], target: &str) -> String {
+        if matches!(self, Self::Compatible(_, model) if model.adapter == crate::model_api::PromptAdapter::IndexTranslate)
+        {
+            let source: Vec<_> = cues
+                .iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    let id = index + 1;
+                    format!("<c{id}>{}</c{id}>", super::sanitize_for_model(text))
+                })
+                .collect();
+            // Canonical instTrans template, with Ferryman's alignment constraints.
+            let mut prompt = format!("请将以下文本翻译成{target}，并且严格遵循所有约束要求。\n\n〖源文〗\n{}\n\n〖约束要求〗\n1. 〖硬性要求〗完整保留所有 <cN></cN> 标签的数量、编号和顺序，只翻译标签内的正文，不合并、拆分或遗漏条目。", source.join("\n"));
+            if !context.is_empty() {
+                prompt.push_str(&format!(
+                    "\n2. 〖注意〗以下内容仅供理解上下文，不翻译也不输出：\n{}",
+                    context.join("\n")
+                ));
+            }
+            prompt.push_str("\n\n只输出译文，不要有任何额外说明。");
+            prompt
+        } else {
+            super::build_batch_prompt(cues, context, target)
+        }
+    }
+
     pub(super) async fn post(&self, url: &str, body: &ChatReq<'_>) -> ChatAttempt {
         match self {
-            Self::Http(client) => {
-                let response = match client.post(url).json(body).send().await {
+            Self::Http(client) | Self::Compatible(client, _) => {
+                let mut value = serde_json::to_value(body).expect("serialize chat request");
+                let request_url;
+                let url = if let Self::Compatible(_, target) = self {
+                    value["max_tokens"] = target.max_output_tokens.into();
+                    let object = value.as_object_mut().expect("chat object");
+                    for key in ["top_k", "repetition_penalty", "enable_thinking", "top_p"] {
+                        object.remove(key);
+                    }
+                    if target.adapter == crate::model_api::PromptAdapter::Generic {
+                        value["messages"].as_array_mut().expect("messages").insert(0, serde_json::json!({
+                            "role":"system", "content":"You are a professional translator. Follow the user's translation instructions, preserve the requested output structure, and output only the requested translation."
+                        }));
+                    } else {
+                        value["chat_template_kwargs"] =
+                            serde_json::json!({"enable_thinking":false});
+                    }
+                    request_url = format!("{}/chat/completions", target.base_url);
+                    &request_url
+                } else {
+                    url
+                };
+                let response = match client.post(url).json(&value).send().await {
                     Ok(response) => response,
                     Err(error) => return ChatAttempt::transient(format!("request: {error}")),
                 };

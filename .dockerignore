@@ -14,10 +14,12 @@ documents
 remotefs
 models
 agent-cache
+**/discovery-api-auth.json
+**/api-auth-token
 ferryman-documents
 ferryman-remotefs
 playwright-report
 test-results
 **/__pycache__
 
-# build/web and build/aipod are required by the root Lazycat Dockerfiles.
+# build/web is required by Dockerfile.web.

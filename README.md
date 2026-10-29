@@ -177,15 +177,18 @@ continue working. This follows the platform's current
 which may evolve toward an explicit authorization flow.
 
 The model manager accepts an API base URL, optional API Key, model ID, prompt
-adapter, served context length, output limit and per-task concurrency. The
+adapter, served context length, output limit and request concurrency. The
 “Read model list” action queries `/models` under the chosen base URL; optional
 `/health` metadata supplies the served context limit. Models lacking that
 metadata default conservatively to 2048 context tokens. Base URLs may include
 `/v1`, a provider-specific path, or the full `/chat/completions` suffix.
-For discovered models, connection details separate client per-task request
-concurrency from the service's reported `scheduler.max_active` limit. Missing
-or invalid service limits remain unknown; client defaults are never used as
-discovered service capabilities.
+Discovered models use the service's reported `/health.scheduler.max_active` as
+the request concurrency limit. All jobs using the same API URL and model share
+that limit, including retries. Existing jobs resolve the current limit when
+starting. Missing or invalid limits remain unknown and require a refresh or an
+explicitly configured custom API before starting a job; there is no guessed
+concurrency fallback. Custom APIs accept any positive concurrency within the
+runtime's supported range.
 
 Discovery prioritizes `category: translation` while allowing other chat models;
 `runtimeStatus: unknown` and nullable accessibility do not automatically exclude

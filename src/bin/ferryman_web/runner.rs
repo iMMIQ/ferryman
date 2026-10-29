@@ -182,12 +182,15 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
     }
 
     let result = async {
-        let target = entry
+        let mut target = entry
             .record
             .model
-            .as_ref()
+            .clone()
             .context("此任务来自旧的自部署版本，请配置模型 API 后重新提交文档")?;
-        let key = super::models::credential(state, &entry.owner, target).await?;
+        let key = super::models::credential(state, &entry.owner, &target).await?;
+        target.concurrency =
+            super::models::request_concurrency(state, &entry.owner, &target).await?;
+        let request_limit = state.request_limits.for_model(&target, target.concurrency);
         let client = if key.is_empty() {
             state.translation_client.clone()
         } else {
@@ -221,6 +224,7 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
             target.concurrency,
             cache,
         )
+        .with_request_limit(request_limit)
         .with_model_target(target.clone())
         .with_checkpoint(Cache::open(Some(entry.dir.join("checkpoint"))));
 

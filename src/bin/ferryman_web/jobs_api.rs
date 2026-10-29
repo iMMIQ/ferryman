@@ -1342,6 +1342,7 @@ mod tests {
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             job_locks: Arc::default(),
             queue,
+            request_limits: Arc::default(),
             translation_client: reqwest::Client::new(),
             config: Arc::new(Config {
                 data_dir: base.join("data"),

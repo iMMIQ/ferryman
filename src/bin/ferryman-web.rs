@@ -70,6 +70,7 @@ struct AppState {
     cancellations: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
     job_locks: Arc<Mutex<HashMap<Uuid, std::sync::Weak<Mutex<()>>>>>,
     queue: mpsc::Sender<Uuid>,
+    request_limits: Arc<ferryman::model_api::RequestLimits>,
     translation_client: reqwest::Client,
     config: Arc<Config>,
     persister: JobPersister,
@@ -730,6 +731,7 @@ async fn main() -> Result<()> {
         job_locks: Arc::default(),
         queue,
         persister,
+        request_limits: Arc::default(),
         translation_client,
         config: runtime_config,
     };
@@ -846,6 +848,7 @@ mod tests {
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             job_locks: Arc::default(),
             queue: mpsc::channel(1).0,
+            request_limits: Arc::default(),
             translation_client: reqwest::Client::new(),
             config: Arc::new(Config {
                 data_dir: base.join("data"),

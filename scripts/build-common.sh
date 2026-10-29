@@ -34,19 +34,20 @@ init_build() {
 }
 
 build_binary() {
+    binary_output=$1
+    shift
     rustup target add "$RUST_TARGET"
-    # Keep host build-script compiler inputs identical across the two targets;
-    # changing these env vars between builds needlessly invalidates Cargo caches.
+    # Keep compiler selectors stable so release rebuilds reuse Cargo caches.
     env CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
         AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar \
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
         CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
         AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-        cargo build --locked --release --target "$RUST_TARGET" --bin "$BINARY"
-    cp "$CARGO_TARGET_DIR/$RUST_TARGET/release/$BINARY" "$1"
-    "$CROSS_PREFIX-strip" "$1"
-    chmod 755 "$1"
+        cargo build --locked --release --target "$RUST_TARGET" --bin "$BINARY" "$@"
+    cp "$CARGO_TARGET_DIR/$RUST_TARGET/release/$BINARY" "$binary_output"
+    "$CROSS_PREFIX-strip" "$binary_output"
+    chmod 755 "$binary_output"
 }
 
 publish_stage() {

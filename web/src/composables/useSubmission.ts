@@ -9,7 +9,6 @@ import type {
   Preview,
   Listing,
   CreatedJobs,
-  Preset,
 } from "../lib/types";
 export type SubmissionStage =
   "editing" | "previewing" | "confirming" | "submitting";
@@ -20,7 +19,6 @@ interface Snapshot {
   readonly preview: Preview;
 }
 export function useSubmission(
-  download: (preset: Preset) => Promise<void>,
   onSuccess: (ids: string[], message: string) => Promise<void>,
 ) {
   const s = reactive({
@@ -29,7 +27,7 @@ export function useSubmission(
     files: [] as File[],
     sources: [] as Source[],
     save: null as Source | null,
-    preset: "index-translate-2b" as Preset,
+    model_id: "",
     target: "中文",
     mode: "bilingual" as "bilingual" | "replace",
     strategy: "sibling_suffix" as RequestData["save_strategy"],
@@ -134,7 +132,7 @@ export function useSubmission(
       ...(save
         ? { save_storage: save.storage, save_path: save.path || "." }
         : {}),
-      preset: s.preset,
+      model_id: s.model_id,
       target: s.target.trim(),
       mode: hasDocx.value ? "bilingual" : s.mode,
       settings: {
@@ -158,6 +156,10 @@ export function useSubmission(
     }
     if (s.sourceMode === "mounted" && s.strategy === "directory" && !s.save) {
       s.error = "请选择保存目录。";
+      return;
+    }
+    if (!s.model_id) {
+      s.error = "请先选择翻译模型，或在模型与 API 中添加服务。";
       return;
     }
     const data = request(),
@@ -291,7 +293,7 @@ export function useSubmission(
       const form = new FormData();
       form.append("file", file);
       for (const key of [
-        "preset",
+        "model_id",
         "target",
         "mode",
         "save_storage",
@@ -325,7 +327,6 @@ export function useSubmission(
     let added = 0;
     const ids: string[] = [];
     try {
-      await download(captured.request.preset);
       if (cancelled) throw new Error("已停止提交；已加入队列的任务不会取消。");
       if (captured.sourceMode === "upload")
         for (const [index, file] of captured.files.entries()) {
@@ -361,7 +362,7 @@ export function useSubmission(
         if (skipped)
           s.result = `已加入 ${added} 个任务；提交时重新检查并跳过 ${skipped} 个文件。`;
       }
-      if (!s.result) s.result = `已加入 ${added} 个任务，模型就绪后自动执行。`;
+      if (!s.result) s.result = `已加入 ${added} 个任务，将自动开始翻译。`;
       if (captured.sourceMode === "mounted") {
         mountedAttempt = undefined;
         persistAttempt();

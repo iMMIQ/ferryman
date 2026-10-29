@@ -48,6 +48,32 @@ const defaultJobs = () =>
     source_path: "研究资料/" + j.filename,
     source_storage: "documents",
   }));
+const modelCatalogue = () => ({
+  discovery_enabled: true,
+  partial: false,
+  warnings: [],
+  models: ["index-translate-2b", "index-translate-35b", "general-chat"].map(
+    (id) => ({
+      target: {
+        id,
+        name: id === "general-chat" ? "通用聊天模型" : id,
+        model_id: id,
+        base_url: "http://models.test/v1",
+        adapter: id === "general-chat" ? "generic" : "index_translate",
+        context_length: 2048,
+        max_output_tokens: 768,
+        concurrency: 4,
+      },
+      source: "discovered",
+      category: id === "general-chat" ? "chat" : "translation",
+      available: true,
+      deployment_status: "succeeded",
+      runtime_status: "unknown",
+      devices: ["AI Pod"],
+      has_api_key: false,
+    }),
+  ),
+});
 async function withPage(
   page,
   fn,
@@ -61,6 +87,7 @@ async function withPage(
     posts: [],
     delayUpload: false,
     maxUploadBytes: 512 * 1024 * 1024,
+    catalogue: modelCatalogue(),
     ...initial,
   };
   await page.setViewportSize(viewport);
@@ -100,6 +127,7 @@ async function withPage(
             },
           ],
         };
+      else if (u.pathname === "/api/models/discover") data = state.catalogue;
       else if (u.pathname === "/api/jobs/selection") {
         if (state.failSelection) {
           await route.abort("failed");
@@ -160,24 +188,7 @@ async function withPage(
         active_requests: 12,
         leases: 2,
       };
-    else if (u.pathname === "/api/models")
-      data = {
-        models: [
-          {
-            preset: "index-translate-2b",
-            state: "ready",
-            downloaded_bytes: 8e9,
-            expected_bytes: 8e9,
-          },
-          {
-            preset: "index-translate-35b",
-            state: "absent",
-            expected_bytes: 32e9,
-          },
-        ],
-        available_bytes: 91e9,
-        benchmark: { state: "idle", results: [] },
-      };
+    else if (u.pathname === "/api/models") data = state.catalogue;
     else if (u.pathname === "/api/storage")
       data = {
         model_bytes: 8e9,
@@ -208,7 +219,9 @@ async function withPage(
   });
   {
     await page.goto("/");
-    await expect(page.locator("#runtime-label")).not.toHaveText("连接中");
+    await expect(page.locator("#translation-preset option")).toHaveCount(
+      state.catalogue.models.length + 1,
+    );
     await fn(page, state);
     assert.deepEqual(errors, []);
   }
@@ -284,10 +297,7 @@ test("offline errors persist without false empty history or model failure", asyn
     await page.locator('tr[data-id="one"]').waitFor();
     state.offline = true;
     await page.locator("#refresh-jobs").click();
-    await page.waitForFunction(
-      () => document.querySelector("#runtime-label").textContent === "连接中断",
-    );
-    await expect(page.locator("#runtime-label")).toHaveText("连接中断");
+    await expect(page.locator("#jobs-error")).toBeVisible();
     await expect(page.locator("#runtime-startup")).not.toBeVisible();
     await expect(page.locator("#jobs-error")).toBeVisible();
     await expect(page.locator('tr[data-id="one"]')).toBeVisible();
@@ -427,35 +437,90 @@ test("mounted preview shows skipped files and requires overwrite acknowledgement
     );
   }));
 
-test("runtime management is secondary and does not offer redundant start", async ({
+test("model management discovers chat models without local deployment controls", async ({
   page,
 }) =>
   withPage(page, async (page, state) => {
-    await expect(page.locator("#start-runtime")).not.toBeVisible();
-    await page.locator("#manage-models").click();
-    await expect(page.locator("#start-runtime")).toBeDisabled();
-    await expect(page.locator("#start-runtime")).toContainText(/运行中/);
-    await page.locator("#model-list button").first().focus();
-    await page.evaluate(() => {
-      window.modelAction = document.activeElement;
-    });
-    await page.waitForResponse((response) =>
-      response.url().endsWith("/api/models"),
-    );
-    assert.equal(
-      await page.evaluate(() => document.activeElement === window.modelAction),
-      true,
-    );
+    await page.locator("#models-open").click();
+    await expect(
+      page.getByRole("dialog", { name: "模型与 API", exact: true }),
+    ).toBeVisible();
+    await expect(page.locator("#start-runtime")).toHaveCount(0);
+    await expect(page.locator(".api-model-list")).toContainText("通用聊天模型");
+    await page.locator("#discover-models").click();
+    await expect
+      .poll(
+        () =>
+          state.posts.filter((p) => p.path === "/api/models/discover").length,
+      )
+      .toBeGreaterThan(0);
     await shot(page, "models");
     await page.setViewportSize({ width: 390, height: 844 });
-    const done = await page.locator("#done-model-dialog").boundingBox();
-    assert(done.y + done.height <= 844);
     await shot(page, "mobile-models");
     await page.keyboard.press("Escape");
     state.modelsOffline = true;
-    await expect(page.locator("#connection-error")).toContainText("模型目录");
-    await expect(page.locator("#runtime-label")).toHaveText("可用");
+    await page.locator("#models-open").click();
+    await page.route("**/api/models/discover", (route) =>
+      route.fulfill({ status: 502, json: { error: "尚未获得微服用户授权" } }),
+    );
+    await page.locator("#discover-models").click();
+    await expect(page.locator("#model-dialog")).toContainText(
+      "尚未获得微服用户授权",
+    );
+    await expect(page.locator("#add-custom-model")).toBeEnabled();
   }));
+
+test("standalone model manager only offers custom APIs and never starts discovery", async ({
+  page,
+}) =>
+  withPage(
+    page,
+    async (page, state) => {
+      await page.locator("#models-open").click();
+      await expect(page.locator("#discover-models")).toHaveCount(0);
+      await expect(page.locator("#model-dialog")).not.toContainText(
+        /微服|自动发现/,
+      );
+      await expect(page.locator("#model-dialog")).toContainText(
+        "暂无模型，请添加自定义 API",
+      );
+      await page.route("**/api/models/probe", (route) =>
+        route.fulfill({ json: { models: ["my-chat"], context_length: 4096 } }),
+      );
+      let saved;
+      await page.route("**/api/models", async (route) => {
+        if (route.request().method() === "POST") {
+          saved = route.request().postDataJSON();
+          await route.fulfill({ json: {} });
+        } else await route.fulfill({ json: state.catalogue });
+      });
+      await page.locator("#add-custom-model").click();
+      await page.locator('[name="api_name"]').fill("自定义模型");
+      await page
+        .locator('[name="api_base_url"]')
+        .fill("https://example.test/v1");
+      await page.locator("#read-api-models").click();
+      await expect(page.locator('[name="api_model_id"]')).toHaveValue(
+        "my-chat",
+      );
+      await page.getByRole("button", { name: "保存 API", exact: true }).click();
+      await expect(page.locator("#custom-api-form")).toHaveCount(0);
+      assert.equal(saved.model_id, "my-chat");
+      assert.equal(
+        state.posts.filter((p) => p.path === "/api/models/discover").length,
+        0,
+      );
+    },
+    undefined,
+    {
+      catalogue: {
+        discovery_enabled: false,
+        models: [],
+        partial: false,
+        warnings: [],
+      },
+    },
+  ));
 
 test("empty state hides pagination and offers creation", async ({ page }) =>
   withPage(
@@ -655,8 +720,11 @@ test("dialog traps keyboard focus and restores the opener on Escape", async ({
   page,
 }) =>
   withPage(page, async (page) => {
-    await page.locator("#manage-models").click();
-    const dialog = page.getByRole("dialog", { name: "模型管理", exact: true });
+    await page.locator("#models-open").click();
+    const dialog = page.getByRole("dialog", {
+      name: "模型与 API",
+      exact: true,
+    });
     await dialog.waitFor();
     for (let i = 0; i < 18; i++) {
       await page.keyboard.press("Tab");
@@ -671,7 +739,7 @@ test("dialog traps keyboard focus and restores the opener on Escape", async ({
     await expect(dialog).toHaveCount(0);
     assert.equal(
       await page.evaluate(() => document.activeElement.id),
-      "manage-models",
+      "models-open",
     );
   }));
 
@@ -692,41 +760,33 @@ test("job action failures stay local and preserve the list", async ({ page }) =>
     await expect(page.locator("#jobs-body tr")).toHaveCount(3);
   }));
 
-test("runtime mutation invalidates an older poll and refreshes the final state", async ({
+test("custom API configuration reads aliases and keeps saved keys out of the form", async ({
   page,
 }) =>
   withPage(page, async (page) => {
-    let current = "ready",
-      calls = 0,
-      oldResponded = false;
-    await page.route("**/api/runtime", async (route) => {
-      const snapshot = current,
-        call = ++calls;
-      if (call === 1) await new Promise((r) => setTimeout(r, 700));
-      try {
-        await route.fulfill({
-          json: {
-            state: snapshot,
-            preset: "index-translate-2b",
-            active_requests: 0,
-            leases: 0,
-          },
-        });
-      } catch {}
-      if (call === 1) oldResponded = true;
-    });
-    await page.route("**/api/runtime/stop", async (route) => {
-      current = "stopped";
-      await route.fulfill({ json: {} });
-    });
-    await page.locator("#manage-models").click();
-    await page.locator("#stop-runtime").click();
-    await page.waitForFunction(
-      () => document.querySelector("#runtime-label").textContent === "待机",
+    let saved;
+    await page.route("**/api/models/probe", (route) =>
+      route.fulfill({ json: { models: ["my-chat"], context_length: 4096 } }),
     );
-    await expect.poll(() => oldResponded).toBe(true);
-    await expect(page.locator("#runtime-label")).toHaveText("待机");
-    await expect(page.locator("#stop-runtime")).toBeDisabled();
+    await page.route("**/api/models", async (route) => {
+      if (route.request().method() === "POST") {
+        saved = route.request().postDataJSON();
+        await route.fulfill({ json: {} });
+      } else await route.fulfill({ json: modelCatalogue() });
+    });
+    await page.locator("#models-open").click();
+    await page.locator("#add-custom-model").click();
+    await page.locator('[name="api_name"]').fill("自定义聊天模型");
+    await page.locator('[name="api_base_url"]').fill("https://example.test/v1");
+    await page.locator('[name="api_key"]').fill("test-key");
+    await page.locator("#read-api-models").click();
+    await expect(page.locator('[name="api_model_id"]')).toHaveValue("my-chat");
+    await expect(page.locator('[name="api_context"]')).toHaveValue("4096");
+    await page.getByRole("button", { name: "保存 API", exact: true }).click();
+    await expect(page.locator("#custom-api-form")).toHaveCount(0);
+    assert.equal(saved.api_key, "test-key");
+    assert.equal(saved.adapter, "generic");
+    assert.equal(saved.max_output_tokens, 2048);
   }));
 
 test("design layouts preserve drafts and separate recent tasks from filters", async ({
@@ -749,7 +809,9 @@ test("design layouts preserve drafts and separate recent tasks from filters", as
     await page
       .locator("#translation-preset")
       .selectOption("index-translate-35b");
-    await expect(page.locator(".model-availability")).toContainText("未下载");
+    await expect(page.locator(".model-availability")).toContainText(
+      "2048 tokens",
+    );
     await shot(page, "desktop-create");
     await page.locator('button[data-workspace="jobs"]').click();
     await page.locator('[data-job-phase="failed"]').click();
@@ -764,7 +826,7 @@ test("design layouts preserve drafts and separate recent tasks from filters", as
     await page.setViewportSize({ width: 390, height: 844 });
     await page.locator('button[data-workspace="models"]').click();
     await expect(
-      page.getByRole("dialog", { name: "模型管理", exact: true }),
+      page.getByRole("dialog", { name: "模型与 API", exact: true }),
     ).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(page.locator('button[data-workspace="models"]')).toBeFocused();

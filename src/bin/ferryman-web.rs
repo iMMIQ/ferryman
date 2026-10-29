@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,14 +28,14 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-#[path = "ferryman_web/agent_proxy.rs"]
-mod agent_proxy;
 #[path = "ferryman_web/documents.rs"]
 mod documents;
 #[path = "ferryman_web/job_store.rs"]
 mod job_store;
 #[path = "ferryman_web/jobs_api.rs"]
 mod jobs_api;
+#[path = "ferryman_web/models.rs"]
+mod models;
 #[path = "ferryman_web/runner.rs"]
 mod runner;
 #[path = "ferryman_web/scheduler.rs"]
@@ -55,7 +54,6 @@ const MAX_TEXT_FIELD_BYTES: usize = 8 * 1024;
 const DEFAULT_JOB_PAGE_SIZE: usize = 50;
 const MAX_JOB_PAGE_SIZE: usize = 100;
 const MAX_USER_NONTERMINAL_JOBS: usize = 2000;
-const MAX_MODEL_START_ATTEMPTS: usize = 3;
 /// Terminal jobs (completed/failed/cancelled) older than this are swept: job
 /// directory and DB row both go. 0 disables the sweep via env
 /// `FERRYMAN_JOB_RETENTION_SECONDS`.
@@ -65,6 +63,8 @@ const JOB_SWEEP_BATCH: usize = 500;
 
 #[derive(Clone)]
 struct AppState {
+    #[cfg(feature = "lazycat")]
+    delegate_tickets: Arc<Mutex<HashMap<String, (HeaderValue, Instant)>>>,
     active_jobs: Arc<RwLock<HashMap<Uuid, JobEntry>>>,
     store: JobStore,
     cancellations: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
@@ -79,9 +79,7 @@ struct Config {
     data_dir: PathBuf,
     user_documents_dir: PathBuf,
     remote_fs_dir: PathBuf,
-    agent_url: String,
-    agent_token: String,
-    agent_pairing: bool,
+    discovery_url: String,
     allow_local_user: bool,
     client: reqwest::Client,
 }
@@ -147,6 +145,9 @@ struct JobRecord {
     id: Uuid,
     filename: String,
     preset: Preset,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    model: Option<ferryman::model_api::ModelTarget>,
     target: String,
     mode: OutputMode,
     status: JobStatus,
@@ -233,14 +234,6 @@ fn json_error(status: StatusCode, error: impl Into<String>) -> Response {
         .into_response()
 }
 
-fn agent_response(status: StatusCode, value: serde_json::Value) -> Response {
-    if status == StatusCode::NO_CONTENT {
-        status.into_response()
-    } else {
-        (status, Json(value)).into_response()
-    }
-}
-
 async fn require_cache_revalidation(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     response
@@ -258,6 +251,27 @@ impl axum::extract::FromRequestParts<AppState> for UserIdentity {
         user_identity(&parts.headers, state.config.allow_local_user)
             .map_err(|status| json_error(status, "missing or invalid user identity"))
     }
+}
+
+#[cfg(feature = "lazycat")]
+async fn capture_delegate_ticket(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let (Ok(identity), Some(ticket)) = (
+        user_identity(request.headers(), state.config.allow_local_user),
+        request.headers().get("x-hc-user-ticket"),
+    ) {
+        let mut tickets = state.delegate_tickets.lock().await;
+        tickets.retain(|_, (_, time)| time.elapsed() < Duration::from_secs(900));
+        if tickets.len() < 1024 || tickets.contains_key(&identity.owner) {
+            let mut ticket = ticket.clone();
+            ticket.set_sensitive(true);
+            tickets.insert(identity.owner, (ticket, Instant::now()));
+        }
+    }
+    next.run(request).await
 }
 
 fn user_identity(headers: &HeaderMap, allow_local: bool) -> Result<UserIdentity, StatusCode> {
@@ -507,7 +521,6 @@ struct TranslationLimits {
 }
 #[derive(Serialize, ts_rs::TS)]
 struct ClientConfig {
-    presets: Vec<Preset>,
     formats: Vec<&'static str>,
     storages: Vec<StorageKind>,
     max_upload_bytes: u64,
@@ -516,7 +529,6 @@ struct ClientConfig {
 }
 async fn config() -> Json<ClientConfig> {
     Json(ClientConfig {
-        presets: Preset::ALL.to_vec(),
         formats: vec![
             "epub", "docx", "pdf", "srt", "vtt", "ass", "ssa", "lrc", "txt", "md",
         ],
@@ -543,6 +555,10 @@ fn export_frontend_types() {
             }),
     );
     ClientConfig::export_all(&config).unwrap();
+    models::ModelsResponse::export_all(&config).unwrap();
+    models::CustomModelRequest::export_all(&config).unwrap();
+    models::ProbeRequest::export_all(&config).unwrap();
+    models::ProbeResponse::export_all(&config).unwrap();
 }
 
 /// One retention pass: remove the job directories of expired terminal jobs,
@@ -657,62 +673,34 @@ async fn main() -> Result<()> {
     );
     let web_dir =
         PathBuf::from(env::var("FERRYMAN_WEB_DIR").unwrap_or_else(|_| "./dist/web".into()));
-    let agent_url = env::var("FERRYMAN_AGENT_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8090".into())
-        .trim_end_matches('/')
-        .to_string();
-    let configured_agent_token = env::var("FERRYMAN_AGENT_TOKEN").ok();
     tokio::fs::create_dir_all(&data_dir).await?;
-    let agent_token = if let Some(token) = configured_agent_token {
-        token
-    } else {
-        let token_path = data_dir.join("agent-token");
-        let token = match tokio::fs::read_to_string(&token_path).await {
-            Ok(token) => token.trim().to_string(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let token = uuid::Uuid::new_v4().simple().to_string();
-                tokio::fs::write(&token_path, format!("{token}\n")).await?;
-                token
-            }
-            Err(error) => return Err(error.into()),
-        };
-        tokio::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).await?;
-        token
-    };
-    if agent_token.len() < 16 {
-        anyhow::bail!("FERRYMAN_AGENT_TOKEN must be at least 16 characters");
-    }
-    let agent_pairing = env::var("FERRYMAN_AGENT_PAIRING")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    #[cfg(feature = "lazycat")]
+    let discovery_url = env::var("FERRYMAN_MODEL_DISCOVERY_URL")
+        .unwrap_or_else(|_| "http://app.cloud.lazycat.app.ai.lzcx/api/v1/model-deployments".into());
+    #[cfg(not(feature = "lazycat"))]
+    let discovery_url = String::new();
     let allow_local_user = env::var("FERRYMAN_ALLOW_LOCAL_USER")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .build()?;
-    let translation_client = build_translation_client(
-        Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECONDS),
-        Some(&agent_token),
-    )?;
+    let translation_client =
+        build_translation_client(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECONDS), None)?;
+    if allow_local_user {
+        for root in [&user_documents_dir, &remote_fs_dir] {
+            tokio::fs::create_dir_all(root.join("local-development-user")).await?;
+        }
+    }
     let runtime_config = Arc::new(Config {
         data_dir: data_dir.clone(),
         user_documents_dir,
         remote_fs_dir,
-        agent_url,
-        agent_token,
-        agent_pairing,
+        discovery_url,
         allow_local_user,
         client,
     });
-    if runtime_config.agent_pairing {
-        let pairing_config = runtime_config.clone();
-        tokio::spawn(async move {
-            if let Err(error) = agent_proxy::pair_agent_with_retry(&pairing_config).await {
-                warn!(%error, "could not pair with AI Pod agent during startup");
-            }
-        });
-    }
     let store = JobStore::open(data_dir.join("jobs.sqlite3"))
         .await
         .context("open job database")?;
@@ -734,6 +722,8 @@ async fn main() -> Result<()> {
     let (queue, receiver) = mpsc::channel(256);
     let persister = JobPersister::spawn(store.clone());
     let state = AppState {
+        #[cfg(feature = "lazycat")]
+        delegate_tickets: Arc::default(),
         active_jobs: Arc::new(RwLock::new(active_jobs)),
         store,
         cancellations: Arc::new(Mutex::new(HashMap::new())),
@@ -791,35 +781,20 @@ async fn main() -> Result<()> {
         .route("/api/jobs/{id}/cancel", post(jobs_api::cancel_job))
         .route("/api/jobs/{id}/retry", post(jobs_api::retry_job))
         .route("/api/jobs/{id}/result", get(jobs_api::download_result))
-        .route("/api/runtime", get(agent_proxy::runtime_status))
-        .route("/api/runtime/start", post(agent_proxy::runtime_start))
-        .route("/api/runtime/stop", post(agent_proxy::runtime_stop))
-        .route("/api/models", get(agent_proxy::model_catalog))
-        .route(
-            "/api/models/{preset}",
-            axum::routing::delete(agent_proxy::delete_model),
-        )
-        .route(
-            "/api/models/{preset}/download",
-            post(agent_proxy::start_model_download),
-        )
-        .route(
-            "/api/models/{preset}/pause",
-            post(agent_proxy::pause_model_download),
-        )
-        .route(
-            "/api/model-sources/benchmark",
-            post(agent_proxy::start_source_benchmark).delete(agent_proxy::cancel_source_benchmark),
-        )
-        .route("/api/storage", get(agent_proxy::model_storage))
-        .route(
-            "/api/runtime-cache",
-            axum::routing::delete(agent_proxy::clear_runtime_cache),
-        )
+        .route("/api/models", get(models::list).post(models::save))
+        .route("/api/models/probe", post(models::probe))
+        .route("/api/models/{id}", axum::routing::delete(models::delete));
+    #[cfg(feature = "lazycat")]
+    let app = app.route("/api/models/discover", post(models::discover));
+    let app = app
         .fallback_service(ServeDir::new(web_dir).append_index_html_on_directories(true))
-        .layer(middleware::from_fn(require_cache_revalidation))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .layer(middleware::from_fn(require_cache_revalidation));
+    #[cfg(feature = "lazycat")]
+    let app = app.layer(middleware::from_fn_with_state(
+        state.clone(),
+        capture_delegate_ticket,
+    ));
+    let app = app.layer(TraceLayer::new_for_http()).with_state(state);
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!(%listen, "Ferryman Web listening");
     axum::serve(listener, app).await?;
@@ -831,9 +806,10 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn config_lists_every_supported_index_model() {
+    async fn config_exposes_document_formats_without_a_fixed_model_whitelist() {
         let Json(config) = config().await;
-        assert_eq!(config.presets, Preset::ALL);
+        assert!(config.formats.contains(&"txt"));
+        assert!(config.max_upload_bytes > 0);
     }
 
     #[test]
@@ -863,6 +839,8 @@ mod tests {
     async fn persister_test_state(base: &FsPath) -> AppState {
         let store = JobStore::open(base.join("jobs.sqlite3")).await.unwrap();
         AppState {
+            #[cfg(feature = "lazycat")]
+            delegate_tickets: Arc::default(),
             active_jobs: Arc::new(RwLock::new(HashMap::new())),
             store: store.clone(),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
@@ -873,9 +851,7 @@ mod tests {
                 data_dir: base.join("data"),
                 user_documents_dir: base.join("documents"),
                 remote_fs_dir: base.join("remote-fs"),
-                agent_url: String::new(),
-                agent_token: String::new(),
-                agent_pairing: false,
+                discovery_url: String::new(),
                 allow_local_user: true,
                 client: reqwest::Client::new(),
             }),
@@ -901,6 +877,7 @@ mod tests {
                 id,
                 filename: "notes.txt".to_string(),
                 preset: Preset::Index2B,
+                model: None,
                 target: "中文".to_string(),
                 mode: OutputMode::Bilingual,
                 status: JobStatus::Translating,
@@ -1009,6 +986,7 @@ mod tests {
                     id,
                     filename: "notes.txt".to_string(),
                     preset: Preset::Index2B,
+                    model: None,
                     target: "中文".to_string(),
                     mode: OutputMode::Bilingual,
                     status,
@@ -1137,9 +1115,7 @@ mod tests {
             data_dir: PathBuf::from("data"),
             user_documents_dir: PathBuf::from("documents"),
             remote_fs_dir: PathBuf::from("remote-fs"),
-            agent_url: String::new(),
-            agent_token: String::new(),
-            agent_pairing: false,
+            discovery_url: String::new(),
             allow_local_user: true,
             client: reqwest::Client::new(),
         };
@@ -1175,9 +1151,7 @@ mod tests {
             data_dir: base.join("data"),
             user_documents_dir: documents,
             remote_fs_dir: remote_fs,
-            agent_url: String::new(),
-            agent_token: String::new(),
-            agent_pairing: false,
+            discovery_url: String::new(),
             allow_local_user: false,
             client: reqwest::Client::new(),
         };

@@ -11,6 +11,9 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", "lazycat"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,17 +30,14 @@ jobs:
           node-version-file: .nvmrc
       - run: node scripts/check-generated-types.mjs
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --all-targets --locked
+      - run: cargo clippy --all-targets --locked --no-default-features --features "${{ matrix.features }}" -- -D warnings
+      - run: cargo test --all-targets --locked --no-default-features --features "${{ matrix.features }}"
         env:
           FERRYMAN_PDF_FONT: /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
 
-  # Build both actual delivery formats, without connecting to a user's box.
+  # Build the single MicroServer delivery package.
   packages:
     runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        product: [web, aipod]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,7 +45,7 @@ jobs:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
         with:
-          key: package-${{ matrix.product }}
+          key: package-web
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
@@ -54,24 +54,18 @@ jobs:
       - name: Install packaging dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-x86-64-linux-gnu gcc-aarch64-linux-gnu qemu-user fonts-noto-cjk fonts-noto-core fonts-dejavu-core
+          sudo apt-get install -y gcc-x86-64-linux-gnu fonts-noto-cjk fonts-noto-core fonts-dejavu-core
           python3 -m pip install -r scripts/requirements-build.txt
           npm install -g @lazycatcloud/lzc-cli@2.0.9
       - name: Build and check Web LPK
-        if: matrix.product == 'web'
         run: |
           sh scripts/lzc-ci-release.sh -o dist/ferryman-web.lpk
           python3 scripts/check-artifacts.py lpk web dist/ferryman-web.lpk
           docker build --platform linux/amd64 -f Dockerfile.web -t ferryman-web:package-check .
           python3 scripts/smoke-image.py web ferryman-web:package-check
-      - name: Build and check AI Pod LPK
-        if: matrix.product == 'aipod'
-        run: |
-          lzc-cli project release -f lzc-build.aipod.yml -o dist/ferryman-aipod.lpk
-          python3 scripts/check-artifacts.py lpk aipod dist/ferryman-aipod.lpk
       - uses: actions/upload-artifact@v4
         with:
-          name: lpk-${{ matrix.product }}
+          name: lpk-web
           path: dist/ferryman-*.lpk
 
   standalone-image:
@@ -89,14 +83,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - run: python3 scripts/smoke-image.py web ferryman-web:standalone-check
-      # Compile the Agent target too, without downloading the large GPU base.
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile
-          target: agent-binary
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   browser-ui:
     runs-on: ubuntu-latest

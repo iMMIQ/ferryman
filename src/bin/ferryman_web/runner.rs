@@ -2,7 +2,6 @@
 //! results back into user storage.
 
 use super::{mutate_job, AppState, JobEntry, JobStatus};
-use crate::agent_proxy::{acquire_agent, acquire_agent_with_retry, release_agent, wait_for_agent};
 use anyhow::{Context, Result};
 use ferryman::batch::{run_batch_controlled, BatchOpts, BatchProgress, ProgressCallback};
 use ferryman::cache::Cache;
@@ -13,8 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
-use tracing::warn;
 #[cfg(test)]
 use uuid::Uuid;
 
@@ -166,8 +163,6 @@ pub(crate) async fn files_are_identical(left: &FsPath, right: &FsPath) -> Result
 
 pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
     let id = entry.record.id;
-    let preset = entry.record.preset;
-    let lease_id = format!("job-{id}");
     let cancel = state
         .cancellations
         .lock()
@@ -186,32 +181,21 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
         return Ok(());
     }
 
-    release_agent(&state.config, &format!("manual-{}", entry.owner)).await;
-    if let Err(error) = acquire_agent_with_retry(&state.config, preset, &lease_id, &cancel).await {
-        state.cancellations.lock().await.remove(&id);
-        return Err(error);
-    }
-    let heartbeat_cancel = CancellationToken::new();
-    let heartbeat = {
-        let state = state.clone();
-        let lease_id = lease_id.clone();
-        let heartbeat_cancel = heartbeat_cancel.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = heartbeat_cancel.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                        if let Err(error) = acquire_agent(&state.config, preset, &lease_id).await {
-                            warn!(%error, "renew model lease");
-                        }
-                    }
-                }
-            }
-        })
-    };
-
     let result = async {
-        wait_for_agent(&state.config, preset, &lease_id, &cancel).await?;
+        let target = entry
+            .record
+            .model
+            .as_ref()
+            .context("此任务来自旧的自部署版本，请配置模型 API 后重新提交文档")?;
+        let key = super::models::credential(state, &entry.owner, target).await?;
+        let client = if key.is_empty() {
+            state.translation_client.clone()
+        } else {
+            ferryman::engine::build_translation_client(
+                Duration::from_secs(ferryman::settings::DEFAULT_REQUEST_TIMEOUT_SECONDS),
+                Some(&key),
+            )?
+        };
         {
             let _transition = super::lock_job(state, id).await;
             anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
@@ -229,14 +213,15 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
         } else {
             None
         };
-        let engine = Engine::for_agent(
-            state.translation_client.clone(),
-            state.config.agent_url.clone(),
-            preset,
+        let engine = Engine::new(
+            client,
+            target.base_url.clone(),
+            target.model_id.clone(),
             entry.record.target.clone(),
+            target.concurrency,
             cache,
-            lease_id.clone(),
         )
+        .with_model_target(target.clone())
         .with_checkpoint(Cache::open(Some(entry.dir.join("checkpoint"))));
 
         let (progress_tx, mut progress_rx) = watch::channel(BatchProgress::default());
@@ -267,7 +252,7 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
                 batch_size: entry.record.settings.batch_size,
                 context: entry.record.settings.context_segments,
                 limit: None,
-                prompt_char_budget: entry.record.preset.prompt_char_budget(),
+                prompt_char_budget: target.prompt_char_budget(),
             },
             cancel.clone(),
             callback,
@@ -310,9 +295,6 @@ pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
     }
     .await;
 
-    heartbeat_cancel.cancel();
-    heartbeat.abort();
-    release_agent(&state.config, &lease_id).await;
     state.cancellations.lock().await.remove(&id);
     result
 }
@@ -399,6 +381,7 @@ mod tests {
                 id: Uuid::new_v4(),
                 filename: "notes.txt".to_string(),
                 preset: Preset::Index2B,
+                model: None,
                 target: "中文".to_string(),
                 mode: OutputMode::Bilingual,
                 status: JobStatus::Writing,
@@ -472,6 +455,7 @@ mod tests {
                 id: Uuid::new_v4(),
                 filename: "notes.txt".to_string(),
                 preset: Preset::Index2B,
+                model: None,
                 target: "中文".to_string(),
                 mode: OutputMode::Bilingual,
                 status: JobStatus::Writing,

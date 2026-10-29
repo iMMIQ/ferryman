@@ -1,26 +1,25 @@
 <script setup lang="ts">
 import { ref, nextTick, computed } from "vue";
 import { useJobs } from "./composables/useJobs";
-import { useRuntime } from "./composables/useRuntime";
-import { runtimeNames } from "./lib/format";
+import { useModels } from "./composables/useModels";
 import JobsPanel from "./components/JobsPanel.vue";
 import SubmissionPanel from "./components/SubmissionPanel.vue";
-import RuntimePanel from "./components/RuntimePanel.vue";
+import ModelsPanel from "./components/ModelsPanel.vue";
 import AppIcon from "./components/ui/AppIcon.vue";
 const jobs = useJobs(),
-  runtime = useRuntime(),
+  models = useModels(),
   workspace = ref<"create" | "jobs">("create");
 const submission = ref<InstanceType<typeof SubmissionPanel>>();
-const runtimePanel = ref<InstanceType<typeof RuntimePanel>>();
+const runtimePanel = ref<InstanceType<typeof ModelsPanel>>();
 const heading = ref<HTMLElement>();
 const submitted = ref("");
 const createdIds = ref<string[]>([]);
 const connection = computed(() =>
-  !runtime.state.loaded
+  !models.loaded.value
     ? "连接中"
-    : !runtime.state.connected
+    : !models.connected.value
       ? "连接中断"
-      : `已连接 · ${runtimeNames[runtime.state.runtime.state] || "待机"}`,
+      : `${models.models.value.filter((m) => m.available).length} 个可选模型`,
 );
 async function navigate(view: "create" | "jobs") {
   workspace.value = view;
@@ -81,15 +80,15 @@ async function browse() {
           aria-haspopup="dialog"
           @click="runtimePanel?.manage()"
         >
-          <AppIcon name="model" /><span>模型与算力</span>
+          <AppIcon name="model" /><span>模型与 API</span>
         </button>
       </nav>
       <div class="sidebar-connection">
         <span
           class="status-dot"
-          :class="runtime.state.connected ? 'ready' : 'neutral'"
+          :class="models.connected.value ? 'ready' : 'neutral'"
         ></span
-        ><span>{{ connection }}</span>
+        ><span id="runtime-label">{{ connection }}</span>
       </div>
     </aside>
     <div class="app-main">
@@ -111,13 +110,13 @@ async function browse() {
             }}
           </p>
         </div>
-        <RuntimePanel ref="runtimePanel" :store="runtime" />
+        <ModelsPanel ref="runtimePanel" :store="models" />
       </header>
       <main class="workspace">
         <SubmissionPanel
           v-show="workspace === 'create'"
           ref="submission"
-          :runtime="runtime"
+          :models="models"
           :completed="completed"
         />
         <div class="jobs-workspace">

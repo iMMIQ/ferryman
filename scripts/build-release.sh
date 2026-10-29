@@ -37,6 +37,6 @@ done
 npm ci --prefer-offline --no-audit --no-fund
 npm run build
 cp -R dist/web "$STAGE/assets"
-build_binary "$STAGE/ferryman-web"
+build_binary "$STAGE/ferryman-web" --no-default-features --features lazycat
 python3 scripts/check-artifacts.py write web "$STAGE"
 publish_stage

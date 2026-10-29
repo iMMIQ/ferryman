@@ -1,22 +1,24 @@
 package: cloud.lazycat.app.ferryman
 version: 0.4.2
 name: Ferryman
-description: 使用 Index 翻译上传文件、用户文稿或网盘挂载目录，并保存双语或纯译文结果
+description: 通过已部署模型或自定义 API 翻译上传文件、用户文稿或网盘挂载目录，并保存双语或纯译文结果
 author: iMMIQ
 license: LGPL-3.0-or-later
 homepage: https://github.com/iMMIQ/ferryman
-min_os_version: 1.3.8
+min_os_version: 1.5.2
 permissions:
   required:
     - net.internet
+    - net.lan
     - document.read
     - document.write
     - media.read
     - media.write
+    - lzcapp.user_delegate
 locales:
   zh-CN:
     name: Ferryman 文档翻译
-    description: 使用 Index 翻译文件、用户文稿或网盘挂载目录
+    description: 通过已部署模型或自定义 API 翻译文件、用户文稿或网盘挂载目录
   en-US:
     name: Ferryman
-    description: Translate uploads, user documents, or mounted cloud drives with Index
+    description: Translate uploads, user documents, or mounted cloud drives with discovered models or custom APIs

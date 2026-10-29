@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, watch } from "vue";
-import type { RuntimeStore } from "../composables/useRuntime";
+import type { ModelsStore } from "../composables/useModels";
 import { useSubmission } from "../composables/useSubmission";
-import { bytes, pathLabel, outputName, modelStates } from "../lib/format";
+import { bytes, pathLabel, outputName } from "../lib/format";
 import AppIcon from "./ui/AppIcon.vue";
 import AppButton from "./ui/AppButton.vue";
 import AppNotice from "./ui/AppNotice.vue";
@@ -10,19 +10,10 @@ import AppDialog from "./ui/AppDialog.vue";
 import SegmentedControl from "./ui/SegmentedControl.vue";
 import FolderPicker from "./FolderPicker.vue";
 const props = defineProps<{
-  runtime: RuntimeStore;
+  models: ModelsStore;
   completed: (ids: string[], message: string) => Promise<void>;
 }>();
-const submission = useSubmission(async (preset) => {
-  const model = props.runtime.state.catalog.models.find(
-    (m) => m.preset === preset,
-  );
-  if (
-    !model ||
-    !["ready", "benchmarking", "downloading", "verifying"].includes(model.state)
-  )
-    await props.runtime.download(preset);
-}, props.completed);
+const submission = useSubmission(props.completed);
 const { s, locked, hasDocx, summary } = submission;
 const pickerOpen = ref(false),
   pickerPurpose = ref<"source" | "save">("source"),
@@ -41,7 +32,15 @@ const saveHint = computed(() =>
     : `保存副本，例如 ${outputName(s.files[0]?.name || "book.epub", s.mode)}。${s.save && (s.sourceMode === "upload" || s.strategy === "directory") ? pathLabel(s.save.storage, s.save.path) : s.sourceMode === "upload" ? "完成后下载" : "与来源文件放在同一目录"}`,
 );
 const selectedModel = computed(() =>
-  props.runtime.state.catalog.models.find((m) => m.preset === s.preset),
+  props.models.models.value.find((m) => m.target.id === s.model_id),
+);
+watch(
+  () => props.models.models.value,
+  (models) => {
+    if (!s.model_id && !locked.value)
+      s.model_id = models.find((m) => m.available)?.target.id || "";
+  },
+  { immediate: true },
 );
 const overwrite = computed(() =>
   s.preview?.files.some((f) => f.overwrite && !f.skip_reason),
@@ -181,24 +180,28 @@ defineExpose({ chooseFile });
               <label for="translation-preset" class="field-label"
                 >翻译模型</label
               >
-              <select id="translation-preset" v-model="s.preset">
-                <option value="index-translate-2b">Index 2B · 默认</option>
-                <option value="index-translate-9b">Index 9B</option>
-                <option value="index-translate-35b">
-                  Index 35B-A3B · 更大模型
+              <select id="translation-preset" v-model="s.model_id">
+                <option value="" disabled>请选择模型</option>
+                <option
+                  v-for="model in models.models.value"
+                  :key="model.target.id"
+                  :value="model.target.id"
+                  :disabled="!model.available"
+                >
+                  {{ model.target.name
+                  }}{{ model.source === "custom" ? " · 自定义" : ""
+                  }}{{ !model.available ? " · 不可用" : "" }}
                 </option>
               </select>
             </div>
           </div>
           <p class="helper-text model-availability">
             {{
-              !runtime.state.connected
-                ? "算力舱未连接，表单会保留。"
-                : !runtime.state.catalogConnected
-                  ? "模型状态待同步。"
-                  : selectedModel
-                    ? `${modelStates[selectedModel.state]} · 提交后按需准备，无需手动启动。`
-                    : "模型未下载，提交时将自动准备。"
+              selectedModel
+                ? `${selectedModel.target.context_length} tokens 上下文 · ${selectedModel.target.adapter === "index_translate" ? "Index-Translate 提示词" : "通用翻译提示词"}`
+                : models.discoveryEnabled.value
+                  ? "请在“模型与 API”中发现模型或添加自定义服务。"
+                  : "请在“模型与 API”中添加自定义 API。"
             }}
           </p>
           <SegmentedControl

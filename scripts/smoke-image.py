@@ -15,7 +15,7 @@ port, endpoint = (8080, "/api/config") if args.kind == "web" else (8090, "/healt
 container = subprocess.check_output([
     "docker", "run", "--rm", "-d", "--runtime=runc", "-p", f"127.0.0.1::{port}",
     "-e", "FERRYMAN_ALLOW_LOCAL_USER=true", "-e", "FERRYMAN_DATA_DIR=/tmp/ferryman",
-    "-e", "FERRYMAN_AGENT_TOKEN=ferryman-build-smoke-token", "-e", "LD_PRELOAD=",
+    "-e", "FERRYMAN_MODEL_DISCOVERY_URL=", "-e", "LD_PRELOAD=",
     args.image,
 ], text=True).strip()
 try:

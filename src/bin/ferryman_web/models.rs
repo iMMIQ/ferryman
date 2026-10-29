@@ -36,6 +36,9 @@ pub(crate) struct ModelInfo {
     pub available: bool,
     pub has_api_key: bool,
     pub devices: Vec<String>,
+    // Only a value actually reported by the service; never a client default.
+    #[serde(default)]
+    pub server_max_active: Option<u32>,
 }
 
 #[derive(Serialize, ts_rs::TS)]
@@ -145,6 +148,7 @@ pub(super) async fn save(
             available: true,
             has_api_key: !api_key.is_empty(),
             devices: vec![],
+            server_max_active: None,
         },
         api_key,
     };
@@ -396,6 +400,12 @@ mod tests {
         let info = response_json(response).await;
         assert_eq!(info["has_api_key"], true);
         assert!(!info.to_string().contains("private-key"));
+        let mut legacy = info.clone();
+        legacy.as_object_mut().unwrap().remove("server_max_active");
+        assert!(serde_json::from_value::<ModelInfo>(legacy)
+            .unwrap()
+            .server_max_active
+            .is_none());
         let target = selected(&state, "alice", "custom:test").await.unwrap();
         assert_eq!(
             credential(&state, "alice", &target).await.unwrap(),
@@ -682,7 +692,7 @@ mod tests {
             assert!(headers.get("lzc-api-auth-token").is_none());
             assert!(headers.get("cookie").is_none());
             assert_eq!(headers.get("authorization").unwrap(),"Bearer inference-key");
-            Json(serde_json::json!({"status":"ready","max_context":4096}))
+            Json(serde_json::json!({"status":"ready","max_context":4096,"scheduler":{"max_active":128}}))
         }));
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -707,6 +717,8 @@ mod tests {
         assert!(!response.partial);
         assert_eq!(response.models.len(), 1);
         assert_eq!(response.models[0].target.context_length, 4096);
+        assert_eq!(response.models[0].server_max_active, Some(128));
+        assert_eq!(response.models[0].target.concurrency, 4);
         assert_eq!(response.models[0].target.adapter, PromptAdapter::Generic);
         assert!(!serde_json::to_string(&response)
             .unwrap()

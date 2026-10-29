@@ -71,6 +71,7 @@ const modelCatalogue = () => ({
       runtime_status: "unknown",
       devices: ["AI Pod"],
       has_api_key: false,
+      server_max_active: id === "index-translate-2b" ? 128 : null,
     }),
   ),
 });
@@ -524,6 +525,26 @@ test("mounted preview shows skipped files and requires overwrite acknowledgement
       state.posts.filter((p) => p.path === "/api/jobs/selection").length,
       1,
     );
+  }));
+
+test("model details separate reported scheduler limits from client request concurrency", async ({
+  page,
+}) =>
+  withPage(page, async (page) => {
+    await page.locator("#models-open").click();
+    const reported = page.locator(".model-details").first();
+    await reported.locator("summary").click();
+    await expect(
+      reported.locator('dt:has-text("每任务请求并发") + dd'),
+    ).toHaveText("4");
+    await expect(
+      reported.locator('dt:has-text("服务端调度上限") + dd'),
+    ).toHaveText("128");
+    const unknown = page.locator(".model-details").last();
+    await unknown.locator("summary").click();
+    await expect(
+      unknown.locator('dt:has-text("服务端调度上限") + dd'),
+    ).toHaveText("未知");
   }));
 
 test("model management discovers chat models without local deployment controls", async ({

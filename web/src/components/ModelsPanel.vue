@@ -183,12 +183,14 @@ defineExpose({ manage });
                     : "通用翻译"
                 }}
               </dd>
-              <dt>上下文</dt>
+              <dt>上下文预算</dt>
               <dd>{{ model.target.context_length }} tokens</dd>
-              <dt>输出上限</dt>
+              <dt>输出预算</dt>
               <dd>{{ model.target.max_output_tokens }} tokens</dd>
-              <dt>并发数</dt>
+              <dt>每任务请求并发</dt>
               <dd>{{ model.target.concurrency }}</dd>
+              <dt>服务端调度上限</dt>
+              <dd>{{ model.server_max_active ?? "未知" }}</dd>
               <template v-if="model.devices.length"
                 ><dt>设备</dt>
                 <dd>{{ model.devices.join("、") }}</dd></template
@@ -295,7 +297,7 @@ defineExpose({ manage });
                   required
               /></label>
               <label
-                >每任务并发数<input
+                >每任务请求并发<input
                   v-model.number="draft.concurrency"
                   name="api_concurrency"
                   type="number"

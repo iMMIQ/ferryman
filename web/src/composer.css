@@ -285,6 +285,7 @@
   color: var(--muted);
 }
 .model-details .detail-fields {
+  grid-template-columns: 128px minmax(0, 1fr);
   margin-top: 16px;
   margin-bottom: 16px;
   color: var(--ink);

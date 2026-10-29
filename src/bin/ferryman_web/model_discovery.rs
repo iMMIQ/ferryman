@@ -89,6 +89,7 @@ pub(super) fn deployment_model(deployment: Deployment) -> Result<Option<StoredMo
             runtime_status: deployment.runtime_status,
             available,
             has_api_key: !deployment.api.api_key.is_empty(),
+            server_max_active: None,
             devices: deployment
                 .devices
                 .into_iter()
@@ -237,6 +238,7 @@ pub(super) async fn discover_models(
                 if let Ok(health) =
                     health_metadata(client, &model.info.target, &model.api_key).await
                 {
+                    model.info.server_max_active = reported_max_active(&health);
                     if let Some(context) = health
                         .get("max_context")
                         .and_then(Value::as_u64)
@@ -263,4 +265,36 @@ pub(super) async fn discover_models(
         partial,
         warnings,
     })
+}
+
+fn reported_max_active(health: &Value) -> Option<u32> {
+    health
+        .pointer("/scheduler/max_active")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduler_limit_requires_a_positive_reported_integer() {
+        assert_eq!(
+            reported_max_active(&serde_json::json!({"scheduler":{"max_active":128}})),
+            Some(128)
+        );
+        for health in [
+            serde_json::json!({}),
+            serde_json::json!({"scheduler":{"max_batch_tokens":128}}),
+            serde_json::json!({"scheduler":{"max_active":null}}),
+            serde_json::json!({"scheduler":{"max_active":0}}),
+            serde_json::json!({"scheduler":{"max_active":-1}}),
+            serde_json::json!({"scheduler":{"max_active":"128"}}),
+            serde_json::json!({"scheduler":{"max_active":4294967296_u64}}),
+        ] {
+            assert_eq!(reported_max_active(&health), None);
+        }
+    }
 }

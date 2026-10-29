@@ -1,6 +1,9 @@
 //! OpenAI-compatible endpoint normalization and versioned translation adapters.
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
+use tokio::sync::{Notify, Semaphore};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
@@ -39,8 +42,10 @@ impl ModelTarget {
         {
             bail!("上下文至少为 512 tokens，输出上限须大于 0 且不超过上下文的一半");
         }
-        if !(1..=32).contains(&self.concurrency) {
-            bail!("并发数须在 1 到 32 之间");
+        // Zero is an unresolved discovered limit. It cannot be used to run a
+        // job; custom connections require an explicit positive value.
+        if self.concurrency > Semaphore::MAX_PERMITS {
+            bail!("并发上限超出运行时支持范围");
         }
         Ok(())
     }
@@ -57,6 +62,88 @@ impl ModelTarget {
             "chat-adapter-v1:{:?}:{}:{}",
             self.adapter, self.context_length, self.max_output_tokens
         )
+    }
+}
+
+#[derive(Default)]
+pub struct RequestLimits {
+    models: Mutex<HashMap<(String, String), Weak<RequestLimit>>>,
+}
+
+impl RequestLimits {
+    pub fn for_model(&self, target: &ModelTarget, limit: usize) -> Arc<RequestLimit> {
+        let mut models = self.models.lock().expect("request limit registry");
+        models.retain(|_, limiter| limiter.strong_count() > 0);
+        let key = (target.base_url.clone(), target.model_id.clone());
+        if let Some(limiter) = models.get(&key).and_then(Weak::upgrade) {
+            limiter.set_limit(limit);
+            return limiter;
+        }
+        let limiter = Arc::new(RequestLimit::new(limit));
+        models.insert(key, Arc::downgrade(&limiter));
+        limiter
+    }
+}
+
+struct LimitState {
+    limit: usize,
+    in_flight: usize,
+}
+
+pub struct RequestLimit {
+    state: Mutex<LimitState>,
+    changed: Notify,
+}
+
+impl RequestLimit {
+    fn new(limit: usize) -> Self {
+        assert!(limit > 0 && limit <= Semaphore::MAX_PERMITS);
+        Self {
+            state: Mutex::new(LimitState {
+                limit,
+                in_flight: 0,
+            }),
+            changed: Notify::new(),
+        }
+    }
+
+    fn set_limit(&self, limit: usize) {
+        assert!(limit > 0 && limit <= Semaphore::MAX_PERMITS);
+        self.state.lock().expect("request limit state").limit = limit;
+        self.changed.notify_waiters();
+    }
+
+    pub async fn acquire(self: &Arc<Self>) -> RequestPermit {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.state.lock().expect("request limit state");
+                if state.in_flight < state.limit {
+                    state.in_flight += 1;
+                    return RequestPermit {
+                        limiter: self.clone(),
+                    };
+                }
+            }
+            changed.await;
+        }
+    }
+}
+
+pub struct RequestPermit {
+    limiter: Arc<RequestLimit>,
+}
+
+impl Drop for RequestPermit {
+    fn drop(&mut self) {
+        self.limiter
+            .state
+            .lock()
+            .expect("request limit state")
+            .in_flight -= 1;
+        self.limiter.changed.notify_waiters();
     }
 }
 
@@ -91,6 +178,68 @@ pub fn chat_url(endpoint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn target() -> ModelTarget {
+        ModelTarget {
+            id: "test".into(),
+            name: "test".into(),
+            base_url: "http://test/v1".into(),
+            model_id: "model".into(),
+            adapter: PromptAdapter::Generic,
+            context_length: 2048,
+            max_output_tokens: 768,
+            concurrency: 128,
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_share_reported_capacity_and_release_on_cancellation() {
+        use futures::FutureExt;
+        let registry = RequestLimits::default();
+        let first = registry.for_model(&target(), 128);
+        let second = registry.for_model(&target(), 128);
+        assert!(Arc::ptr_eq(&first, &second));
+        let mut leases = Vec::new();
+        for _ in 0..128 {
+            leases.push(first.acquire().now_or_never().unwrap());
+        }
+        assert!(second.acquire().now_or_never().is_none());
+        leases.pop();
+        let replacement = second.acquire().now_or_never().unwrap();
+        drop(replacement);
+        drop(leases);
+        assert_eq!(first.state.lock().unwrap().in_flight, 0);
+        let mut other = target();
+        other.model_id = "other".into();
+        assert!(!Arc::ptr_eq(&first, &registry.for_model(&other, 128)));
+    }
+
+    #[tokio::test]
+    async fn resized_limit_drains_active_requests_and_wakes_waiters() {
+        use futures::FutureExt;
+        let registry = RequestLimits::default();
+        let limit = registry.for_model(&target(), 3);
+        let a = limit.acquire().await;
+        let b = limit.acquire().await;
+        let c = limit.acquire().await;
+        registry.for_model(&target(), 1);
+        drop(a);
+        drop(b);
+        assert!(limit.acquire().now_or_never().is_none());
+        drop(c);
+        let held = limit.acquire().await;
+        let waiter_limit = limit.clone();
+        let waiter = tokio::spawn(async move { waiter_limit.acquire().await });
+        tokio::task::yield_now().await;
+        registry.for_model(&target(), 2);
+        let lease = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(lease);
+        drop(held);
+        assert_eq!(limit.state.lock().unwrap().in_flight, 0);
+    }
+
     #[test]
     fn endpoints_preserve_provider_paths_without_duplicate_versions() {
         assert_eq!(

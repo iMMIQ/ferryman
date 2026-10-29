@@ -6,7 +6,11 @@ use std::time::Duration;
 
 pub(crate) enum ChatClient<'a> {
     Http(&'a reqwest::Client),
-    Compatible(&'a reqwest::Client, &'a crate::model_api::ModelTarget),
+    Compatible(
+        &'a reqwest::Client,
+        &'a crate::model_api::ModelTarget,
+        Option<&'a std::sync::Arc<crate::model_api::RequestLimit>>,
+    ),
     Jsonl(&'a crate::jsonl::JsonlSender),
 }
 
@@ -87,7 +91,7 @@ impl ChatAttempt {
 
 impl ChatClient<'_> {
     pub(super) fn single_prompt(&self, text: &str, target: &str) -> String {
-        if matches!(self, Self::Compatible(_, model) if model.adapter == crate::model_api::PromptAdapter::IndexTranslate)
+        if matches!(self, Self::Compatible(_, model, _) if model.adapter == crate::model_api::PromptAdapter::IndexTranslate)
         {
             // Official Index-Translate model card, source=auto; no system message.
             // https://huggingface.co/IndexTeam/Index-Translate-2B#inference
@@ -98,7 +102,7 @@ impl ChatClient<'_> {
     }
 
     pub(super) fn batch_prompt(&self, cues: &[&str], context: &[&str], target: &str) -> String {
-        if matches!(self, Self::Compatible(_, model) if model.adapter == crate::model_api::PromptAdapter::IndexTranslate)
+        if matches!(self, Self::Compatible(_, model, _) if model.adapter == crate::model_api::PromptAdapter::IndexTranslate)
         {
             let source: Vec<_> = cues
                 .iter()
@@ -124,11 +128,17 @@ impl ChatClient<'_> {
     }
 
     pub(super) async fn post(&self, url: &str, body: &ChatReq<'_>) -> ChatAttempt {
+        // A lease covers an actual HTTP attempt, including its response body.
+        // Backoff does not occupy a slot; cancellation drops the lease.
+        let _permit = match self {
+            Self::Compatible(_, _, Some(limit)) => Some(limit.acquire().await),
+            _ => None,
+        };
         match self {
-            Self::Http(client) | Self::Compatible(client, _) => {
+            Self::Http(client) | Self::Compatible(client, _, _) => {
                 let mut value = serde_json::to_value(body).expect("serialize chat request");
                 let request_url;
-                let url = if let Self::Compatible(_, target) = self {
+                let url = if let Self::Compatible(_, target, _) = self {
                     value["max_tokens"] = target.max_output_tokens.into();
                     let object = value.as_object_mut().expect("chat object");
                     for key in ["top_k", "repetition_penalty", "enable_thinking", "top_p"] {

@@ -62,7 +62,12 @@ const modelCatalogue = () => ({
         adapter: id === "general-chat" ? "generic" : "index_translate",
         context_length: 2048,
         max_output_tokens: 768,
-        concurrency: 4,
+        concurrency:
+          id === "index-translate-2b"
+            ? 128
+            : id === "index-translate-35b"
+              ? 64
+              : 0,
       },
       source: "discovered",
       category: id === "general-chat" ? "chat" : "translation",
@@ -71,7 +76,12 @@ const modelCatalogue = () => ({
       runtime_status: "unknown",
       devices: ["AI Pod"],
       has_api_key: false,
-      server_max_active: id === "index-translate-2b" ? 128 : null,
+      server_max_active:
+        id === "index-translate-2b"
+          ? 128
+          : id === "index-translate-35b"
+            ? 64
+            : null,
     }),
   ),
 });
@@ -527,23 +537,23 @@ test("mounted preview shows skipped files and requires overwrite acknowledgement
     );
   }));
 
-test("model details separate reported scheduler limits from client request concurrency", async ({
+test("discovered model details show the reported request limit without a client default", async ({
   page,
 }) =>
   withPage(page, async (page) => {
     await page.locator("#models-open").click();
     const reported = page.locator(".model-details").first();
     await reported.locator("summary").click();
+    await expect(reported.locator('dt:has-text("每任务请求并发")')).toHaveCount(
+      0,
+    );
     await expect(
-      reported.locator('dt:has-text("每任务请求并发") + dd'),
-    ).toHaveText("4");
-    await expect(
-      reported.locator('dt:has-text("服务端调度上限") + dd'),
+      reported.locator('dt:has-text("服务端并发上限") + dd'),
     ).toHaveText("128");
     const unknown = page.locator(".model-details").last();
     await unknown.locator("summary").click();
     await expect(
-      unknown.locator('dt:has-text("服务端调度上限") + dd'),
+      unknown.locator('dt:has-text("服务端并发上限") + dd'),
     ).toHaveText("未知");
   }));
 

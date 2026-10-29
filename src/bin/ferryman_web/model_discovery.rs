@@ -70,7 +70,7 @@ pub(super) fn deployment_model(deployment: Deployment) -> Result<Option<StoredMo
         adapter,
         context_length: 2048,
         max_output_tokens: 768,
-        concurrency: 4,
+        concurrency: 0,
     };
     target.validate()?;
     let available = deployment.deployment_status == "succeeded"
@@ -239,6 +239,12 @@ pub(super) async fn discover_models(
                     health_metadata(client, &model.info.target, &model.api_key).await
                 {
                     model.info.server_max_active = reported_max_active(&health);
+                    if let Some(limit) = model.info.server_max_active {
+                        model.info.target.concurrency = limit as usize;
+                        state
+                            .request_limits
+                            .for_model(&model.info.target, limit as usize);
+                    }
                     if let Some(context) = health
                         .get("max_context")
                         .and_then(Value::as_u64)

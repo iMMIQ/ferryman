@@ -187,10 +187,20 @@ defineExpose({ manage });
               <dd>{{ model.target.context_length }} tokens</dd>
               <dt>输出预算</dt>
               <dd>{{ model.target.max_output_tokens }} tokens</dd>
-              <dt>每任务请求并发</dt>
-              <dd>{{ model.target.concurrency }}</dd>
-              <dt>服务端调度上限</dt>
-              <dd>{{ model.server_max_active ?? "未知" }}</dd>
+              <dt>
+                {{
+                  model.source === "discovered"
+                    ? "服务端并发上限"
+                    : "自定义并发上限"
+                }}
+              </dt>
+              <dd>
+                {{
+                  model.source === "discovered"
+                    ? (model.server_max_active ?? "未知")
+                    : model.target.concurrency
+                }}
+              </dd>
               <template v-if="model.devices.length"
                 ><dt>设备</dt>
                 <dd>{{ model.devices.join("、") }}</dd></template
@@ -297,12 +307,11 @@ defineExpose({ manage });
                   required
               /></label>
               <label
-                >每任务请求并发<input
+                >请求并发上限<input
                   v-model.number="draft.concurrency"
                   name="api_concurrency"
                   type="number"
                   min="1"
-                  max="32"
                   required
               /></label>
             </div>

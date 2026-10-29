@@ -9,6 +9,7 @@ use crate::format::SegmentId;
 use crate::translate;
 use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub fn build_translation_client(
@@ -45,6 +46,7 @@ pub struct Engine {
     checkpoint: Option<Cache>,
     backend: Backend,
     model_target: Option<crate::model_api::ModelTarget>,
+    request_limit: Option<Arc<crate::model_api::RequestLimit>>,
 }
 
 enum Backend {
@@ -119,11 +121,17 @@ impl Engine {
             checkpoint: None,
             backend: Backend::Http,
             model_target: None,
+            request_limit: None,
         }
     }
 
     pub fn with_model_target(mut self, target: crate::model_api::ModelTarget) -> Self {
         self.model_target = Some(target);
+        self
+    }
+
+    pub fn with_request_limit(mut self, limit: Arc<crate::model_api::RequestLimit>) -> Self {
+        self.request_limit = Some(limit);
         self
     }
 
@@ -265,7 +273,11 @@ impl Engine {
             done.expect("an uncancelled unit always reports completion")
         } else {
             let client = match &self.model_target {
-                Some(target) => translate::ChatClient::Compatible(&self.client, target),
+                Some(target) => translate::ChatClient::Compatible(
+                    &self.client,
+                    target,
+                    self.request_limit.as_ref(),
+                ),
                 None => translate::ChatClient::Http(&self.client),
             };
             self.exec_unit_using(unit, &client).await
@@ -505,6 +517,90 @@ mod tests {
         }
 
         std::fs::remove_dir_all(cache_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn independent_jobs_share_actual_http_request_limit_above_four() {
+        use crate::model_api::{ModelTarget, PromptAdapter, RequestLimits};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Semaphore;
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let (handler_active, handler_peak, handler_release) =
+            (active.clone(), peak.clone(), release.clone());
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move || {
+            let (active, peak, release) =
+                (handler_active.clone(), handler_peak.clone(), handler_release.clone());
+            async move {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                release.acquire().await.unwrap().forget();
+                active.fetch_sub(1, Ordering::SeqCst);
+                axum::Json(serde_json::json!({"choices":[{"message":{"content":"translated"},"finish_reason":"stop"}]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = ModelTarget {
+            id: "test".into(),
+            name: "test".into(),
+            base_url: base.clone(),
+            model_id: "model".into(),
+            adapter: PromptAdapter::Generic,
+            context_length: 2048,
+            max_output_tokens: 768,
+            concurrency: 6,
+        };
+        let registry = RequestLimits::default();
+        let engines: Vec<_> = (0..2)
+            .map(|_| {
+                Arc::new(
+                    Engine::new(
+                        reqwest::Client::new(),
+                        base.clone(),
+                        "model".into(),
+                        "Chinese".into(),
+                        6,
+                        None,
+                    )
+                    .with_request_limit(registry.for_model(&target, 6))
+                    .with_model_target(target.clone()),
+                )
+            })
+            .collect();
+        let mut jobs = Vec::new();
+        for i in 0..12 {
+            let engine = engines[i % 2].clone();
+            jobs.push(tokio::spawn(async move {
+                engine
+                    .exec_unit(Unit::Single {
+                        file: i % 2,
+                        id: i,
+                        text: format!("text {i}"),
+                    })
+                    .await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while active.load(Ordering::SeqCst) < 6 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 6);
+        release.add_permits(12);
+        for job in jobs {
+            let done = tokio::time::timeout(Duration::from_secs(3), job)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(done.pairs.len(), 1);
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 6);
+        server.abort();
     }
 
     fn uuid() -> String {

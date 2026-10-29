@@ -101,6 +101,9 @@ pub(super) async fn save(
     identity: UserIdentity,
     Json(request): Json<CustomModelRequest>,
 ) -> Response {
+    if request.concurrency == 0 {
+        return json_error(StatusCode::BAD_REQUEST, "请指定大于 0 的请求并发上限");
+    }
     let id = request
         .id
         .unwrap_or_else(|| format!("custom:{}", Uuid::new_v4()));
@@ -176,6 +179,25 @@ pub(super) async fn delete(
     }
 }
 
+fn effective_concurrency(model: &StoredModel) -> Result<usize> {
+    let limit = if model.info.source == "discovered" {
+        model
+            .info
+            .server_max_active
+            .map(|value| value as usize)
+            .context(
+                "服务端未报告并发上限，请刷新发现；仍无法获取时请添加自定义 API 并指定请求并发",
+            )?
+    } else {
+        model.info.target.concurrency
+    };
+    anyhow::ensure!(
+        limit > 0 && limit <= tokio::sync::Semaphore::MAX_PERMITS,
+        "请求并发上限无效"
+    );
+    Ok(limit)
+}
+
 pub(crate) async fn selected(state: &AppState, owner: &str, id: &str) -> Result<ModelTarget> {
     let model = state
         .store
@@ -187,7 +209,29 @@ pub(crate) async fn selected(state: &AppState, owner: &str, id: &str) -> Result<
     if !model.info.available {
         bail!("所选模型当前不可用，请选择其他模型");
     }
-    Ok(model.info.target)
+    let limit = effective_concurrency(&model)?;
+    let mut target = model.info.target;
+    target.concurrency = limit;
+    Ok(target)
+}
+
+pub(crate) async fn request_concurrency(
+    state: &AppState,
+    owner: &str,
+    target: &ModelTarget,
+) -> Result<usize> {
+    let model = state
+        .store
+        .models(owner.to_string())
+        .await?
+        .into_iter()
+        .find(|model| {
+            model_supported(model)
+                && model.info.target.id == target.id
+                && model.info.target.base_url == target.base_url
+        })
+        .context("模型配置已变更，请重新选择模型")?;
+    effective_concurrency(&model)
 }
 
 pub(crate) async fn credential(
@@ -270,7 +314,7 @@ pub(super) async fn probe(
             adapter: PromptAdapter::Generic,
             context_length: 2048,
             max_output_tokens: 768,
-            concurrency: 4,
+            concurrency: 0,
         };
         let context_length = health_metadata(&state.config.client, &target, &key)
             .await
@@ -386,6 +430,64 @@ mod tests {
         )
         .unwrap()
     }
+    #[tokio::test]
+    async fn concurrency_uses_current_reported_limit_and_never_guesses() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::regression_tests::state_at(root.path()).await;
+        let mut request = custom("https://one.test/v1", None);
+        request.concurrency = 128;
+        let response = save(State(state.clone()), identity("alice"), Json(request)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut model = state.store.models("alice".into()).await.unwrap().remove(0);
+        #[cfg(feature = "lazycat")]
+        let old_snapshot = model.info.target.clone();
+        assert_eq!(
+            selected(&state, "alice", "custom:test")
+                .await
+                .unwrap()
+                .concurrency,
+            128
+        );
+        model.info.source = "discovered".into();
+        model.info.target.concurrency = 4; // Legacy records cannot override reported capacity.
+        model.info.server_max_active = Some(128);
+        assert_eq!(effective_concurrency(&model).unwrap(), 128);
+        #[cfg(feature = "lazycat")]
+        {
+            state
+                .store
+                .save_models("alice".into(), vec![model.clone()], false, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                selected(&state, "alice", "custom:test")
+                    .await
+                    .unwrap()
+                    .concurrency,
+                128
+            );
+            assert_eq!(
+                request_concurrency(&state, "alice", &old_snapshot)
+                    .await
+                    .unwrap(),
+                128
+            );
+        }
+        model.info.server_max_active = None;
+        assert!(effective_concurrency(&model)
+            .unwrap_err()
+            .to_string()
+            .contains("未报告"));
+        let mut request = custom("https://one.test/v1", None);
+        request.concurrency = 0;
+        assert_eq!(
+            save(State(state), identity("alice"), Json(request))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     #[tokio::test]
     async fn keys_are_private_user_scoped_and_never_inherited_by_changed_destinations() {
         let root = tempfile::tempdir().unwrap();
@@ -718,7 +820,7 @@ mod tests {
         assert_eq!(response.models.len(), 1);
         assert_eq!(response.models[0].target.context_length, 4096);
         assert_eq!(response.models[0].server_max_active, Some(128));
-        assert_eq!(response.models[0].target.concurrency, 4);
+        assert_eq!(response.models[0].target.concurrency, 128);
         assert_eq!(response.models[0].target.adapter, PromptAdapter::Generic);
         assert!(!serde_json::to_string(&response)
             .unwrap()

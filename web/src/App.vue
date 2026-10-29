@@ -10,7 +10,7 @@ const jobs = useJobs(),
   models = useModels(),
   workspace = ref<"create" | "jobs">("create");
 const submission = ref<InstanceType<typeof SubmissionPanel>>();
-const runtimePanel = ref<InstanceType<typeof ModelsPanel>>();
+const modelPanel = ref<InstanceType<typeof ModelsPanel>>();
 const heading = ref<HTMLElement>();
 const submitted = ref("");
 const createdIds = ref<string[]>([]);
@@ -41,6 +41,12 @@ async function browse() {
   await jobs.first();
   await navigate("jobs");
 }
+function activateView(element: Element) {
+  (element as HTMLElement).inert = false;
+}
+function deactivateView(element: Element) {
+  (element as HTMLElement).inert = true;
+}
 </script>
 <template>
   <div class="app" :data-workspace="workspace">
@@ -50,7 +56,6 @@ async function browse() {
         <span class="brand-mark" aria-hidden="true">F</span>
         <div>
           <strong>Ferryman</strong>
-          <p>文档翻译</p>
         </div>
       </div>
       <nav class="workspace-tabs" aria-label="工作区">
@@ -76,9 +81,10 @@ async function browse() {
           >
         </button>
         <button
+          id="models-open"
           data-workspace="models"
           aria-haspopup="dialog"
-          @click="runtimePanel?.manage()"
+          @click="modelPanel?.manage()"
         >
           <AppIcon name="model" /><span>模型与 API</span>
         </button>
@@ -102,40 +108,47 @@ async function browse() {
           <h1 id="workspace-title" ref="heading" tabindex="-1">
             {{ workspace === "create" ? "新建翻译" : "翻译任务" }}
           </h1>
-          <p>
-            {{
-              workspace === "create"
-                ? "文档、电子书与字幕，一处翻译。"
-                : `${jobs.state.active} 个进行中 · 所有翻译记录，一目了然。`
-            }}
-          </p>
         </div>
-        <ModelsPanel ref="runtimePanel" :store="models" />
       </header>
       <main class="workspace">
-        <SubmissionPanel
-          v-show="workspace === 'create'"
-          ref="submission"
-          :models="models"
-          :completed="completed"
-        />
-        <div class="jobs-workspace">
-          <p
-            v-if="submitted && workspace === 'jobs'"
-            class="submission-success"
-            role="status"
-          >
-            {{ submitted }} 进度会自动更新。
-          </p>
-          <JobsPanel
-            :store="jobs"
-            :created-ids="createdIds"
-            :compact="workspace === 'create'"
-            @create="create"
-            @browse="browse"
+        <Transition
+          name="workspace"
+          @before-enter="activateView"
+          @before-leave="deactivateView"
+          @leave-cancelled="activateView"
+        >
+          <SubmissionPanel
+            v-show="workspace === 'create'"
+            ref="submission"
+            :models="models"
+            :completed="completed"
+            @manage-models="modelPanel?.manage()"
           />
-        </div>
+        </Transition>
+        <Transition
+          name="workspace"
+          @before-enter="activateView"
+          @before-leave="deactivateView"
+          @leave-cancelled="activateView"
+        >
+          <div v-show="workspace === 'jobs'" class="jobs-workspace">
+            <p
+              v-if="submitted && workspace === 'jobs'"
+              class="submission-success"
+              role="status"
+            >
+              {{ submitted }}
+            </p>
+            <JobsPanel
+              :store="jobs"
+              :created-ids="createdIds"
+              @create="create"
+              @browse="browse"
+            />
+          </div>
+        </Transition>
       </main>
     </div>
+    <ModelsPanel ref="modelPanel" :store="models" />
   </div>
 </template>

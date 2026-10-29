@@ -28,9 +28,21 @@ watch(
 );
 function restore(event: Event) {
   event.preventDefault();
-  if (returnFocus?.isConnected && returnFocus.getClientRects().length)
-    returnFocus.focus();
-  else document.querySelector<HTMLElement>("#refresh-jobs")?.focus();
+  const candidates = [
+    returnFocus,
+    ...document.querySelectorAll<HTMLElement>(
+      "#refresh-jobs,#models-open,#target-language",
+    ),
+  ];
+  candidates
+    .find(
+      (element) =>
+        element?.isConnected &&
+        element.getClientRects().length &&
+        !element.matches(":disabled") &&
+        !element.closest("[inert]"),
+    )
+    ?.focus();
 }
 </script>
 <template>

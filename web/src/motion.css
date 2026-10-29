@@ -1,0 +1,181 @@
+/* Brief feedback for deliberate actions; polling never restarts a list. */
+.button,
+.workspace-tabs button,
+.filter-bar button,
+.segment {
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard),
+    transform var(--motion-fast) var(--ease-standard);
+}
+.button:active:not(:disabled) {
+  transform: scale(0.98);
+}
+.settings > summary::before {
+  transition: rotate var(--motion-standard) var(--ease-standard);
+}
+.settings[open] > :not(summary),
+.model-details[open] > :not(summary) {
+  animation: content-reveal var(--motion-standard) var(--ease-enter);
+}
+.workspace-enter-active {
+  transition: opacity var(--motion-standard) var(--ease-enter);
+}
+.workspace-leave-active {
+  position: absolute;
+  inset: 0 0 auto;
+  pointer-events: none;
+  transition: none;
+}
+.workspace-enter-from,
+.workspace-leave-to {
+  opacity: 0;
+}
+.file-list-move,
+.model-list-move,
+.task-list-move {
+  transition: transform var(--motion-standard) var(--ease-standard);
+}
+.file-list-enter-active,
+.model-list-enter-active,
+.task-list-enter-active,
+.panel-enter-active {
+  transition:
+    opacity var(--motion-standard) var(--ease-enter),
+    transform var(--motion-standard) var(--ease-enter);
+}
+.file-list-leave-active,
+.model-list-leave-active {
+  position: absolute;
+  width: 100%;
+}
+.file-list-leave-active,
+.model-list-leave-active,
+.task-list-leave-active,
+.panel-leave-active {
+  pointer-events: none;
+  transition:
+    opacity var(--motion-exit) var(--ease-exit),
+    transform var(--motion-exit) var(--ease-exit);
+}
+.file-list-enter-from,
+.model-list-enter-from,
+.task-list-enter-from,
+.panel-enter-from {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.file-list-leave-to,
+.model-list-leave-to,
+.task-list-leave-to,
+.panel-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+.status-enter-active,
+.status-leave-active {
+  transition:
+    opacity var(--motion-fast) var(--ease-standard),
+    transform var(--motion-fast) var(--ease-standard);
+}
+.status-enter-from {
+  opacity: 0;
+  transform: translateY(3px);
+}
+.status-leave-to {
+  opacity: 0;
+  transform: translateY(-3px);
+}
+.dialog-overlay[data-state="open"] {
+  animation: overlay-enter var(--motion-standard) var(--ease-enter);
+}
+.dialog-overlay[data-state="closed"] {
+  animation: overlay-exit var(--motion-exit) var(--ease-exit);
+}
+.app-dialog[data-state="open"] {
+  animation: dialog-enter var(--motion-panel) var(--ease-enter);
+}
+.app-dialog[data-state="closed"] {
+  animation: dialog-exit var(--motion-exit) var(--ease-exit);
+}
+.app-dialog[data-state="closed"],
+.dialog-overlay[data-state="closed"] {
+  pointer-events: none;
+}
+.job-progress-fill {
+  transition:
+    transform var(--motion-progress) var(--ease-standard),
+    background-color var(--motion-fast) var(--ease-standard);
+}
+.new-job {
+  animation: job-highlight 800ms var(--ease-standard);
+}
+@keyframes content-reveal {
+  from {
+    opacity: 0;
+    translate: 0 -3px;
+  }
+  to {
+    opacity: 1;
+    translate: 0 0;
+  }
+}
+@keyframes overlay-enter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes overlay-exit {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+@keyframes dialog-enter {
+  from {
+    opacity: 0;
+    scale: 0.98;
+    translate: 0 8px;
+  }
+  to {
+    opacity: 1;
+    scale: 1;
+    translate: 0 0;
+  }
+}
+@keyframes dialog-exit {
+  from {
+    opacity: 1;
+    scale: 1;
+  }
+  to {
+    opacity: 0;
+    scale: 0.99;
+  }
+}
+@keyframes job-highlight {
+  from {
+    background-color: var(--accent-soft);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+  .button:active:not(:disabled) {
+    transform: none;
+  }
+}

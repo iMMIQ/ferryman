@@ -130,7 +130,7 @@ test("built frontend uses real Rust config, storage, preview and job lifecycle A
     const errors = [];
     page.on("pageerror", (e) => errors.push(e.message));
     await page.goto(origin);
-    await page.locator("#empty-create").waitFor();
+    await page.locator("#submit-job").waitFor();
     await page.locator("#models-open").click();
     await expect(page.locator("#discover-models")).toHaveCount(0);
     await page.locator("#add-custom-model").click();

@@ -104,7 +104,6 @@ async function create() {
     id="folder-dialog"
     :open="open"
     :title="purpose === 'source' ? '选择文件或目录' : '选择保存目录'"
-    description="切换存储位置浏览文件。来源可多选，保存位置为当前目录。"
     :busy="s.creating"
     @update:open="$emit('update:open', $event)"
   >

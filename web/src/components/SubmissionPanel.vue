@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, nextTick } from "vue";
 import type { ModelsStore } from "../composables/useModels";
 import { useSubmission } from "../composables/useSubmission";
-import { bytes, pathLabel, outputName } from "../lib/format";
+import { bytes, pathLabel } from "../lib/format";
 import AppIcon from "./ui/AppIcon.vue";
 import AppButton from "./ui/AppButton.vue";
 import AppNotice from "./ui/AppNotice.vue";
@@ -13,6 +13,7 @@ const props = defineProps<{
   models: ModelsStore;
   completed: (ids: string[], message: string) => Promise<void>;
 }>();
+defineEmits<{ "manage-models": [] }>();
 const submission = useSubmission(props.completed);
 const { s, locked, hasDocx, summary } = submission;
 const pickerOpen = ref(false),
@@ -25,11 +26,6 @@ watch(
     if (hasDocx.value) s.mode = "bilingual";
     s.validation = "";
   },
-);
-const saveHint = computed(() =>
-  s.sourceMode === "mounted" && s.strategy === "sibling_overwrite"
-    ? "覆盖原文件：提交前将列出受影响文件并要求确认。"
-    : `保存副本，例如 ${outputName(s.files[0]?.name || "book.epub", s.mode)}。${s.save && (s.sourceMode === "upload" || s.strategy === "directory") ? pathLabel(s.save.storage, s.save.path) : s.sourceMode === "upload" ? "完成后下载" : "与来源文件放在同一目录"}`,
 );
 const selectedModel = computed(() =>
   props.models.models.value.find((m) => m.target.id === s.model_id),
@@ -64,18 +60,52 @@ function chooseFile() {
   s.sourceMode = "upload";
   fileInput.value?.click();
 }
+async function removeFile(index: number) {
+  const focused = document.activeElement?.matches("[data-remove-file]");
+  s.files.splice(index, 1);
+  await nextTick();
+  if (focused) {
+    const buttons = document.querySelectorAll<HTMLButtonElement>(
+      "#upload-list li:not(.file-list-leave-active) [data-remove-file]",
+    );
+    (
+      buttons[Math.min(index, buttons.length - 1)] ||
+      document.querySelector<HTMLButtonElement>("#add-files")
+    )?.focus();
+  }
+}
+function revealInvalid(event: Event) {
+  const details = (event.target as HTMLElement).closest("details");
+  if (details) details.open = true;
+}
 defineExpose({ chooseFile });
 </script>
 <template>
-  <aside class="submit-panel">
+  <section class="submit-panel" aria-label="新建翻译">
     <form
       id="job-form"
       :aria-busy="locked"
       @submit.prevent="submission.preview"
+      @invalid.capture="revealInvalid"
     >
       <fieldset class="draft-fields" :disabled="locked">
         <section class="source-section">
-          <h2 class="form-section-title"><span>1</span> 选择文件</h2>
+          <div class="source-heading">
+            <h2 class="form-section-title">
+              {{
+                s.sourceMode === "upload" && s.files.length
+                  ? `${s.files.length} 个文件`
+                  : "选择文件"
+              }}
+            </h2>
+            <AppButton
+              v-if="s.sourceMode === 'upload'"
+              id="add-files"
+              variant="ghost"
+              @click="chooseFile"
+              ><AppIcon name="plus" :size="16" />添加文件</AppButton
+            >
+          </div>
           <SegmentedControl
             v-model="s.sourceMode"
             name="source"
@@ -85,29 +115,48 @@ defineExpose({ chooseFile });
               { value: 'mounted', label: '文稿与网盘' },
             ]"
           />
-          <div v-show="s.sourceMode === 'upload'">
+          <div
+            v-show="s.sourceMode === 'upload'"
+            class="upload-area"
+            :class="{ dragging }"
+            @dragover.prevent="dragging = !locked"
+            @dragleave.prevent="dragging = false"
+            @drop.prevent="drop"
+          >
+            <input
+              id="file-input"
+              ref="fileInput"
+              type="file"
+              multiple
+              class="visually-hidden"
+              accept=".epub,.docx,.pdf,.srt,.vtt,.ass,.ssa,.lrc,.txt,.md,.markdown"
+              @change="filesChanged"
+            />
             <label
+              v-if="!s.files.length"
               id="drop-zone"
+              for="file-input"
               class="drop-zone"
-              :class="{ dragging, populated: s.files.length > 0 }"
-              @dragover.prevent="dragging = !locked"
-              @dragleave.prevent="dragging = false"
-              @drop.prevent="drop"
-              ><input
-                id="file-input"
-                ref="fileInput"
-                type="file"
-                multiple
-                accept=".epub,.docx,.pdf,.srt,.vtt,.ass,.ssa,.lrc,.txt,.md,.markdown"
-                @change="filesChanged"
-              /><span aria-hidden="true" class="upload-icon">↑</span
-              ><strong>拖入文件，或点击选择</strong
-              ><span>EPUB、DOCX、PDF、字幕、TXT、Markdown</span></label
             >
-            <p id="upload-hint" class="helper-text">
-              支持多文件 · 单文件最大 {{ bytes(s.maxBytes) }}
-            </p>
-            <ul id="upload-list" class="upload-list" aria-label="待上传文件">
+              <AppIcon name="upload" :size="28" /><strong
+                >拖入文档，或选择文件</strong
+              >
+            </label>
+            <details v-if="!s.files.length" class="upload-help">
+              <summary>支持格式与大小</summary>
+              <p id="upload-hint">
+                EPUB、DOCX、PDF、TXT、Markdown、字幕 · 单文件最大
+                {{ bytes(s.maxBytes) }}
+              </p>
+            </details>
+            <TransitionGroup
+              tag="ul"
+              name="file-list"
+              id="upload-list"
+              class="upload-list"
+              aria-label="待上传文件"
+              @before-leave="(element) => element.setAttribute('inert', '')"
+            >
               <li
                 v-for="(file, index) in s.files"
                 :key="`${file.name}:${file.size}:${file.lastModified}`"
@@ -116,21 +165,19 @@ defineExpose({ chooseFile });
                   class="file-type"
                   :data-type="file.name.split('.').at(-1)?.toLowerCase()"
                   aria-hidden="true"
-                  ><AppIcon name="file" /><small>{{
-                    file.name.split(".").at(-1)?.slice(0, 4).toUpperCase()
-                  }}</small></span
-                >
+                  ><AppIcon name="file"
+                /></span>
                 <span class="upload-filename"
                   >{{ file.name }}<small>{{ bytes(file.size) }}</small></span
                 ><AppButton
                   variant="ghost"
                   :data-remove-file="index"
                   :aria-label="`移除 ${file.name}`"
-                  @click="s.files.splice(index, 1)"
+                  @click="removeFile(index)"
                   >×</AppButton
                 >
               </li>
-            </ul>
+            </TransitionGroup>
             <AppNotice id="upload-validation" :message="s.validation" />
           </div>
           <AppButton
@@ -148,7 +195,6 @@ defineExpose({ chooseFile });
           >
         </section>
         <section class="translation-section">
-          <h2 class="form-section-title"><span>2</span> 翻译设置</h2>
           <div class="translation-grid">
             <div>
               <label class="field-label" for="target-language">目标语言</label
@@ -193,17 +239,19 @@ defineExpose({ chooseFile });
                   }}{{ !model.available ? " · 不可用" : "" }}
                 </option>
               </select>
+              <AppButton
+                v-if="models.loaded.value && !models.models.value.length"
+                id="configure-models"
+                variant="ghost"
+                @click="$emit('manage-models')"
+                >添加模型</AppButton
+              >
             </div>
           </div>
-          <p class="helper-text model-availability">
-            {{
-              selectedModel
-                ? `${selectedModel.target.context_length} tokens 上下文 · ${selectedModel.target.adapter === "index_translate" ? "Index-Translate 提示词" : "通用翻译提示词"}`
-                : models.discoveryEnabled.value
-                  ? "请在“模型与 API”中发现模型或添加自定义服务。"
-                  : "请在“模型与 API”中添加自定义 API。"
-            }}
-          </p>
+          <AppNotice
+            v-if="selectedModel && !selectedModel.available"
+            message="所选模型当前不可用，请选择其他模型。"
+          />
           <SegmentedControl
             v-model="s.mode"
             name="mode"
@@ -213,18 +261,16 @@ defineExpose({ chooseFile });
               {
                 value: 'bilingual',
                 label: '双语对照',
-                description: '保留原文，逐段对照',
               },
               {
                 value: 'replace',
                 label: '仅译文',
-                description: '专注译后阅读',
                 disabled: hasDocx,
               },
             ]"
           />
           <p v-if="hasDocx" id="mode-hint" class="helper-text">
-            DOCX 仅支持双语对照，已为你选择兼容的输出方式。
+            DOCX 仅支持双语对照
           </p>
 
           <SegmentedControl
@@ -238,7 +284,7 @@ defineExpose({ chooseFile });
               { value: 'directory', label: '统一目录' },
             ]"
           />
-          <div v-if="s.sourceMode === 'upload' || s.strategy === 'directory'">
+          <div v-if="s.sourceMode === 'mounted' && s.strategy === 'directory'">
             <span class="field-label">保存位置</span>
             <div class="path-group">
               <AppButton
@@ -262,12 +308,46 @@ defineExpose({ chooseFile });
               >
             </div>
           </div>
-          <p id="save-hint" class="helper-text">{{ saveHint }}</p>
+          <p
+            v-if="
+              s.sourceMode === 'mounted' && s.strategy === 'sibling_overwrite'
+            "
+            id="save-hint"
+            class="job-warning"
+          >
+            将覆盖来源文件，提交前需确认
+          </p>
           <details class="settings">
             <summary>
-              高级设置
-              <span>批量 {{ s.batch }} 段 · 上下文 {{ s.context }} 段</span>
+              更多设置
+              <span v-if="s.save">{{
+                pathLabel(s.save.storage, s.save.path)
+              }}</span>
             </summary>
+            <div v-if="s.sourceMode === 'upload'" class="save-setting">
+              <span class="field-label">保存位置</span>
+              <div class="path-group">
+                <AppButton
+                  id="save-directory"
+                  class="path-picker"
+                  @click="pick('save')"
+                  ><span
+                    ><strong>{{
+                      s.save
+                        ? pathLabel(s.save.storage, s.save.path)
+                        : "完成后下载"
+                    }}</strong></span
+                  ><span aria-hidden="true">›</span></AppButton
+                >
+                <AppButton
+                  v-if="s.save"
+                  id="clear-save-directory"
+                  aria-label="清除保存位置"
+                  @click="s.save = null"
+                  >×</AppButton
+                >
+              </div>
+            </div>
             <div class="tuning-grid">
               <label
                 >每批段数<input
@@ -332,21 +412,7 @@ defineExpose({ chooseFile });
                 ? `${s.files.length} 个文件`
                 : `已选 ${s.sources.length} 项`
             }}
-            · {{ s.target || "选择语言" }} ·
-            {{ s.mode === "bilingual" ? "双语对照" : "仅译文" }}</strong
-          ><span
-            class="helper-text"
-            :class="{
-              'job-warning':
-                s.sourceMode === 'mounted' &&
-                s.strategy === 'sibling_overwrite',
-            }"
-            >{{
-              s.sourceMode === "mounted" && s.strategy === "sibling_overwrite"
-                ? "将覆盖原文件 · 提交前须确认"
-                : "原文件不会被修改 · 提交前可预览"
-            }}</span
-          >
+          </strong>
         </div>
         <AppButton
           id="submit-job"
@@ -380,7 +446,6 @@ defineExpose({ chooseFile });
       id="submission-dialog"
       :open="s.stage === 'confirming'"
       title="确认翻译任务"
-      description="未支持的格式与已生成的译文不加入任务。实际提交时会重新检查文件和保存位置。"
       @update:open="
         (value) => {
           if (!value) submission.edit();
@@ -427,5 +492,5 @@ defineExpose({ chooseFile });
         ></template
       >
     </AppDialog>
-  </aside>
+  </section>
 </template>

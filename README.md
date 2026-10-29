@@ -207,8 +207,13 @@ batch size, context window and translation-cache controls; the target language i
 free-form with common languages offered as suggestions. Cancelling a running job
 keeps any partial document available for download without overwriting a mounted
 source.
+The creation page focuses on the current files and translation settings; history
+has its own Tasks page. Selecting files replaces the large upload target with a
+compact queue. Connection details, model parameters, and advanced options expand
+on demand. Short transitions cover file changes, dialogs, navigation, and real
+progress updates, and honor the system's reduced-motion preference.
 On mobile, **New translation / Tasks** tabs keep the queue accessible and the
-submit action stays visible at the bottom. Uploads accept multiple files, show
+submit action stays above navigation. Uploads accept multiple files, show
 progress, and retain unsubmitted files after cancellation or errors. Every
 submission has a preview; mounted-directory previews list output paths and
 skip reasons, and overwriting requires an explicit acknowledgement. Previews

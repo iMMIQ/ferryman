@@ -99,6 +99,19 @@ function details(item: Job) {
   detailId.value = item.id;
   deleting.value = false;
 }
+function retireRow(element: Element) {
+  const focused = element.contains(document.activeElement);
+  element.setAttribute("inert", "");
+  if (focused) {
+    const fallback = [
+      ...document.querySelectorAll<HTMLElement>(".file-title,#refresh-jobs"),
+    ].find(
+      (candidate) =>
+        !element.contains(candidate) && candidate.getClientRects().length,
+    );
+    fallback?.focus({ preventScroll: true });
+  }
+}
 async function action(item: Job, action: "retry" | "cancel" | "delete") {
   if (action === "delete") {
     deleting.value = true;
@@ -119,12 +132,10 @@ async function remove() {
   >
     <div class="section-heading">
       <div>
-        <h2 id="jobs-title">
-          {{ compact ? "最近任务" : "翻译记录" }}
-          <small v-if="!compact" id="jobs-count">{{
-            s.loaded ? `${s.total} 项` : ""
-          }}</small>
-        </h2>
+        <h2 id="jobs-title" class="visually-hidden">翻译记录</h2>
+        <span v-if="!compact" id="jobs-count">{{
+          s.loaded ? `${s.total} 项` : ""
+        }}</span>
       </div>
       <AppButton v-if="compact" variant="ghost" @click="$emit('browse')"
         >查看全部</AppButton
@@ -160,9 +171,6 @@ async function remove() {
         >重试</AppButton
       ></AppNotice
     >
-    <p v-if="!compact" id="jobs-updated" class="helper-text">
-      {{ s.updated ? `列表最近更新 ${s.updated}` : "正在加载任务…" }}
-    </p>
     <div v-if="visibleJobs.length && !compact" class="table-shell desktop-jobs">
       <table>
         <thead>
@@ -174,7 +182,12 @@ async function remove() {
             <th>操作</th>
           </tr>
         </thead>
-        <tbody id="jobs-body">
+        <TransitionGroup
+          tag="tbody"
+          id="jobs-body"
+          name="task-list"
+          @before-leave="retireRow"
+        >
           <tr
             v-for="item in visibleJobs"
             :key="item.id"
@@ -193,7 +206,7 @@ async function remove() {
                 {{ item.mode === "replace" ? "仅译文" : "双语对照" }}</span
               >
               <p v-if="item.failed_segments" class="job-warning">
-                {{ item.failed_segments }} 段未翻译
+                {{ item.failed_segments }} 段未译
               </p>
               <AppNotice :message="s.errors[item.id]" />
             </td>
@@ -213,10 +226,15 @@ async function remove() {
               />
             </td>
           </tr>
-        </tbody>
+        </TransitionGroup>
       </table>
     </div>
-    <div class="mobile-jobs">
+    <TransitionGroup
+      tag="div"
+      class="mobile-jobs"
+      name="task-list"
+      @before-leave="retireRow"
+    >
       <article
         v-for="item in visibleJobs"
         :key="item.id"
@@ -235,11 +253,7 @@ async function remove() {
         </div>
         <p v-if="item.error" class="job-error-summary">{{ item.error }}</p>
         <p v-if="item.failed_segments" class="job-warning">
-          {{ item.failed_segments }} 段未翻译{{
-            item.result_available
-              ? "，可下载部分结果或补译。"
-              : "，请查看详情后重试。"
-          }}
+          {{ item.failed_segments }} 段未译
         </p>
         <JobProgress :job="item" /><AppNotice
           :message="s.errors[item.id]"
@@ -250,12 +264,11 @@ async function remove() {
           @details="details(item)"
         />
       </article>
-    </div>
+    </TransitionGroup>
     <EmptyState
       v-if="!visibleJobs.length && !error"
       id="empty-state"
       :title="loaded ? '暂无任务' : '正在加载任务…'"
-      description="选择文档后，翻译进度会显示在这里"
       ><AppButton
         v-if="loaded"
         id="empty-create"
@@ -282,7 +295,6 @@ async function remove() {
         >下一页</AppButton
       >
     </nav>
-    <p class="background-note">任务在后台继续，离开页面也不会中断。</p>
     <AppDialog
       id="job-detail-dialog"
       :open="!!job"
@@ -295,9 +307,6 @@ async function remove() {
           <dd>{{ value }}</dd></template
         >
       </dl>
-      <p class="helper-text">
-        重试会优先复用已完成的翻译；旧任务若缺少翻译记录，可能需要重新翻译。
-      </p>
       <AppNotice
         id="job-detail-error"
         :message="

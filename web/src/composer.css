@@ -1,0 +1,354 @@
+/* File-first composer. The empty upload target gives way to the file queue. */
+.submit-panel {
+  width: 100%;
+  max-width: 760px;
+  margin-inline: auto;
+  min-width: 0;
+}
+#job-form,
+.draft-fields {
+  display: grid;
+  gap: 28px;
+}
+.source-section,
+.translation-section {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.source-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+.form-section-title {
+  font-size: var(--text-lg);
+  font-weight: 600;
+}
+.source-section > .segmented-field {
+  max-width: 320px;
+}
+.source-section > .segmented-field > legend {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.upload-area {
+  min-width: 0;
+  border-radius: var(--radius-lg);
+}
+.upload-area.dragging {
+  outline: 3px solid var(--focus);
+  outline-offset: 4px;
+}
+.drop-zone {
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: 18px;
+  min-height: 180px;
+  padding: 24px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  cursor: pointer;
+}
+.drop-zone svg {
+  color: var(--accent);
+}
+.drop-zone strong {
+  font-weight: 500;
+}
+.upload-help {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+.upload-help summary,
+.model-details summary {
+  cursor: pointer;
+  padding-block: 8px;
+}
+.upload-help p {
+  padding: 8px 0;
+}
+.upload-list {
+  position: relative;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+.upload-list:empty {
+  display: none;
+}
+.upload-list li {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.upload-list li:last-child {
+  border-bottom: 0;
+}
+.file-type {
+  display: grid;
+  place-items: center;
+  flex: 0 0 34px;
+  height: 38px;
+  color: var(--accent);
+}
+.upload-filename {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 500;
+}
+.upload-filename small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+}
+.translation-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 24px;
+}
+.translation-grid .field-label,
+.output-options legend {
+  color: var(--ink);
+  font-size: var(--text-md);
+}
+.output-options .segmented {
+  justify-content: flex-start;
+  background: transparent;
+  padding: 0;
+  gap: 24px;
+  border: 0;
+}
+.output-options .segment {
+  flex: 0 1 auto;
+  justify-content: flex-start;
+  gap: 9px;
+  padding: 4px 0;
+  text-align: left;
+  background: transparent;
+  box-shadow: none;
+  font-size: var(--text-md);
+  font-weight: 400;
+}
+.output-options .segment input {
+  position: static;
+  opacity: 1;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+}
+.path-group {
+  display: flex;
+  gap: var(--space-2);
+}
+.path-picker {
+  width: 100%;
+  justify-content: space-between;
+  text-align: left;
+  white-space: normal;
+  min-width: 0;
+}
+.path-picker > span:first-child {
+  min-width: 0;
+  color: var(--muted);
+}
+.path-picker strong {
+  display: block;
+  font-weight: 500;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.settings {
+  min-width: 0;
+  color: var(--muted);
+}
+.settings > summary {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  gap: 10px;
+  cursor: pointer;
+}
+.settings > summary::before {
+  content: "›";
+  display: inline-block;
+  font-size: 20px;
+}
+.settings[open] > summary::before {
+  rotate: 90deg;
+}
+.settings > summary > span {
+  margin-left: auto;
+  max-width: 70%;
+  overflow-wrap: anywhere;
+  font-size: var(--text-sm);
+}
+.settings[open] > :not(summary) {
+  margin-top: 16px;
+}
+.tuning-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+}
+.tuning-grid label {
+  display: grid;
+  gap: 8px;
+}
+.check-setting {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+}
+.submit-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-top: 8px;
+}
+.submit-summary {
+  flex: 1;
+  color: var(--muted);
+}
+.submit-summary strong {
+  font-weight: 400;
+}
+#submit-job {
+  min-width: 144px;
+  font-weight: 600;
+}
+#submit-job::after {
+  content: "→";
+  margin-left: 8px;
+}
+.upload-progress {
+  display: grid;
+  gap: 12px;
+  overflow-wrap: anywhere;
+}
+/* Model connections expose names and availability first, details on demand. */
+.model-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 16px;
+}
+.api-model-list {
+  position: relative;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.api-model-list > li {
+  padding: 20px 0;
+  border-bottom: 1px solid var(--line);
+}
+.api-model-list > li:first-child {
+  padding-top: 8px;
+}
+.model-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.model-heading strong {
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+.model-connection-state {
+  color: var(--accent);
+  font-size: var(--text-sm);
+}
+.model-connection-state.unavailable {
+  color: var(--muted);
+}
+.model-details {
+  margin-top: 6px;
+  color: var(--muted);
+}
+.model-details .detail-fields {
+  margin-top: 16px;
+  margin-bottom: 16px;
+  color: var(--ink);
+}
+.api-model-list .model-toolbar {
+  margin: 8px 0 0;
+}
+.api-model-form {
+  margin-top: 24px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line);
+}
+.api-model-form legend {
+  margin-bottom: 8px;
+  color: var(--ink);
+  font-size: var(--text-lg);
+}
+.api-model-form label {
+  display: grid;
+  gap: 8px;
+  margin: 16px 0;
+}
+.api-model-form .tuning-grid label {
+  margin: 0;
+}
+.api-model-form .model-toolbar {
+  margin: 24px 0 0;
+}
+@media (max-width: 760px) {
+  .draft-fields {
+    gap: 24px;
+  }
+  .translation-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+  .drop-zone {
+    min-height: 150px;
+  }
+  .upload-list li {
+    padding: 12px;
+    gap: 8px;
+  }
+  .submit-bar {
+    position: sticky;
+    bottom: calc(var(--nav-height) + env(safe-area-inset-bottom) + 8px);
+    margin-top: 4px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    box-shadow: 0 4px 20px #17211d0c;
+    z-index: 2;
+    flex-wrap: wrap;
+  }
+  #submit-job {
+    min-width: 132px;
+  }
+  .tuning-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (max-width: 760px) and (max-height: 520px) {
+  .submit-bar {
+    position: static;
+  }
+}

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { reactive, ref } from "vue";
+import { reactive, ref, nextTick } from "vue";
 import type { ModelsStore } from "../composables/useModels";
 import type { ModelInfo } from "../lib/generated/ModelInfo";
 import type { PromptAdapter } from "../lib/generated/PromptAdapter";
@@ -13,6 +13,8 @@ const open = ref(false),
   busy = ref(false),
   error = ref("");
 const aliases = ref<string[]>([]);
+const form = ref<HTMLFormElement>();
+let editTrigger: HTMLElement | null = null;
 const draft = reactive({
   id: null as string | null,
   name: "",
@@ -27,7 +29,8 @@ const draft = reactive({
 function manage() {
   open.value = true;
 }
-function edit(model?: ModelInfo) {
+async function edit(model?: ModelInfo) {
+  editTrigger = document.activeElement as HTMLElement;
   Object.assign(
     draft,
     model
@@ -47,6 +50,22 @@ function edit(model?: ModelInfo) {
   aliases.value = [];
   error.value = "";
   editing.value = true;
+  await nextTick();
+  form.value
+    ?.querySelector<HTMLInputElement>('input[name="api_name"]')
+    ?.focus();
+}
+async function finishEdit() {
+  editing.value = false;
+  await nextTick();
+  (editTrigger?.isConnected
+    ? editTrigger
+    : document.getElementById("add-custom-model")
+  )?.focus();
+}
+function revealInvalid(event: Event) {
+  const details = (event.target as HTMLElement).closest("details");
+  if (details) details.open = true;
 }
 async function readModels() {
   busy.value = true;
@@ -78,7 +97,8 @@ async function save() {
   error.value = "";
   try {
     await props.store.save({ ...draft, api_key: draft.api_key || null });
-    editing.value = false;
+    busy.value = false;
+    await finishEdit();
   } catch (e) {
     error.value = errorText(e);
   } finally {
@@ -99,20 +119,12 @@ async function remove(id: string) {
 defineExpose({ manage });
 </script>
 <template>
-  <AppButton id="models-open" @click="manage">模型与 API</AppButton>
   <AppDialog
     v-model:open="open"
     id="model-dialog"
     title="模型与 API"
     :busy="busy"
   >
-    <p class="helper-text">
-      {{
-        store.discoveryEnabled.value
-          ? "由微服发现已部署模型，或连接兼容 OpenAI Chat 的 API。"
-          : "连接兼容 OpenAI Chat 的 API，配置用于翻译的模型。"
-      }}
-    </p>
     <div class="model-toolbar">
       <AppButton
         v-if="store.discoveryEnabled.value"
@@ -135,20 +147,54 @@ defineExpose({ manage });
         {{ warning }}
       </li>
     </ul>
-    <ul class="api-model-list" aria-label="可选模型">
+    <TransitionGroup
+      tag="ul"
+      name="model-list"
+      class="api-model-list"
+      aria-label="可选模型"
+      @before-leave="(element) => element.setAttribute('inert', '')"
+    >
       <li v-for="model in store.models.value" :key="model.target.id">
         <div>
-          <strong>{{ model.target.name }}</strong>
-          <p class="helper-text">
-            {{ model.source === "custom" ? "自定义 API" : "自动发现" }} ·
-            {{ model.available ? "可选择" : "当前不可用" }}
-            <template v-if="model.devices.length">
-              · {{ model.devices.join("、") }}</template
+          <div class="model-heading">
+            <strong>{{ model.target.name }}</strong
+            ><span
+              class="model-connection-state"
+              :class="{ unavailable: !model.available }"
+              >{{ model.available ? "可用" : "不可用" }}</span
             >
-          </p>
-          <p class="helper-text api-address">
-            {{ model.target.model_id }} · {{ model.target.base_url }}
-          </p>
+          </div>
+          <details class="model-details">
+            <summary>连接详情</summary>
+            <dl class="detail-fields">
+              <dt>来源</dt>
+              <dd>
+                {{ model.source === "custom" ? "自定义 API" : "自动发现" }}
+              </dd>
+              <dt>模型 ID</dt>
+              <dd>{{ model.target.model_id }}</dd>
+              <dt>API 地址</dt>
+              <dd>{{ model.target.base_url }}</dd>
+              <dt>提示词</dt>
+              <dd>
+                {{
+                  model.target.adapter === "index_translate"
+                    ? "Index-Translate"
+                    : "通用翻译"
+                }}
+              </dd>
+              <dt>上下文</dt>
+              <dd>{{ model.target.context_length }} tokens</dd>
+              <dt>输出上限</dt>
+              <dd>{{ model.target.max_output_tokens }} tokens</dd>
+              <dt>并发数</dt>
+              <dd>{{ model.target.concurrency }}</dd>
+              <template v-if="model.devices.length"
+                ><dt>设备</dt>
+                <dd>{{ model.devices.join("、") }}</dd></template
+              >
+            </dl>
+          </details>
         </div>
         <div v-if="model.source === 'custom'" class="model-toolbar">
           <AppButton
@@ -165,104 +211,107 @@ defineExpose({ manage });
           >
         </div>
       </li>
-    </ul>
-    <p v-if="!store.models.value.length" class="helper-text">
-      {{
-        store.discoveryEnabled.value
-          ? "暂无模型。可以刷新自动发现，或添加自定义 API。"
-          : "暂无模型，请添加自定义 API。"
-      }}
-    </p>
-    <form
-      v-if="editing"
-      id="custom-api-form"
-      class="api-model-form"
-      @submit.prevent="save"
+    </TransitionGroup>
+    <p v-if="!store.models.value.length" class="helper-text">暂无模型</p>
+    <Transition
+      name="panel"
+      @before-leave="(element) => element.setAttribute('inert', '')"
     >
-      <fieldset :disabled="busy">
-        <legend>{{ draft.id ? "编辑 API" : "添加自定义 API" }}</legend>
-        <label
-          >名称<input
-            v-model="draft.name"
-            name="api_name"
-            required
-            maxlength="512"
-            placeholder="我的翻译模型"
-        /></label>
-        <label
-          >API 地址<input
-            v-model="draft.base_url"
-            name="api_base_url"
-            type="url"
-            required
-            placeholder="https://example.com/v1"
-        /></label>
-        <label
-          >API Key<input
-            v-model="draft.api_key"
-            name="api_key"
-            type="password"
-            autocomplete="new-password"
-            :placeholder="draft.id ? '留空保留已保存的 Key' : '本地服务可留空'"
-        /></label>
-        <AppButton id="read-api-models" @click="readModels"
-          >读取模型列表</AppButton
-        >
-        <label
-          >模型 ID<input
-            v-model="draft.model_id"
-            name="api_model_id"
-            list="api-model-aliases"
-            required
-            maxlength="512"
-        /></label>
-        <datalist id="api-model-aliases">
-          <option v-for="alias in aliases" :key="alias" :value="alias" />
-        </datalist>
-        <label
-          >翻译提示词<select v-model="draft.adapter" name="api_adapter">
-            <option value="generic">通用聊天模型</option>
-            <option value="index_translate">Index-Translate</option>
-          </select></label
-        >
-        <div class="tuning-grid">
+      <form
+        v-if="editing"
+        ref="form"
+        id="custom-api-form"
+        class="api-model-form"
+        @submit.prevent="save"
+        @invalid.capture="revealInvalid"
+      >
+        <fieldset :disabled="busy">
+          <legend>{{ draft.id ? "编辑 API" : "添加自定义 API" }}</legend>
           <label
-            >上下文上限<input
-              v-model.number="draft.context_length"
-              name="api_context"
-              type="number"
-              min="512"
-              max="2000000"
+            >名称<input
+              v-model="draft.name"
+              name="api_name"
               required
+              maxlength="512"
+              placeholder="我的翻译模型"
           /></label>
           <label
-            >译文输出上限<input
-              v-model.number="draft.max_output_tokens"
-              name="api_output"
-              type="number"
-              min="1"
-              :max="Math.floor(draft.context_length / 2)"
+            >API 地址<input
+              v-model="draft.base_url"
+              name="api_base_url"
+              type="url"
               required
+              placeholder="https://example.com/v1"
           /></label>
           <label
-            >每任务并发数<input
-              v-model.number="draft.concurrency"
-              name="api_concurrency"
-              type="number"
-              min="1"
-              max="32"
-              required
+            >API Key<input
+              v-model="draft.api_key"
+              name="api_key"
+              type="password"
+              autocomplete="new-password"
+              :placeholder="
+                draft.id ? '留空保留已保存的 Key' : '本地服务可留空'
+              "
           /></label>
-        </div>
-        <p class="helper-text">
-          API Key 仅保存在应用后端。上下文和输出上限以模型服务实际配置为准。
-        </p>
-        <div class="model-toolbar">
-          <AppButton type="submit" variant="primary">保存 API</AppButton
-          ><AppButton @click="editing = false">取消编辑</AppButton>
-        </div>
-      </fieldset>
-    </form>
+          <AppButton id="read-api-models" @click="readModels"
+            >读取模型列表</AppButton
+          >
+          <label
+            >模型 ID<input
+              v-model="draft.model_id"
+              name="api_model_id"
+              list="api-model-aliases"
+              required
+              maxlength="512"
+          /></label>
+          <datalist id="api-model-aliases">
+            <option v-for="alias in aliases" :key="alias" :value="alias" />
+          </datalist>
+          <details class="settings model-parameters">
+            <summary>模型参数</summary>
+            <label
+              >翻译提示词<select v-model="draft.adapter" name="api_adapter">
+                <option value="generic">通用聊天模型</option>
+                <option value="index_translate">Index-Translate</option>
+              </select></label
+            >
+            <div class="tuning-grid">
+              <label
+                >上下文上限<input
+                  v-model.number="draft.context_length"
+                  name="api_context"
+                  type="number"
+                  min="512"
+                  max="2000000"
+                  required
+              /></label>
+              <label
+                >译文输出上限<input
+                  v-model.number="draft.max_output_tokens"
+                  name="api_output"
+                  type="number"
+                  min="1"
+                  :max="Math.floor(draft.context_length / 2)"
+                  required
+              /></label>
+              <label
+                >每任务并发数<input
+                  v-model.number="draft.concurrency"
+                  name="api_concurrency"
+                  type="number"
+                  min="1"
+                  max="32"
+                  required
+              /></label>
+            </div>
+          </details>
+          <div class="model-toolbar">
+            <AppButton type="submit" variant="primary">保存 API</AppButton
+            ><AppButton @click="finishEdit">取消编辑</AppButton>
+          </div>
+        </fieldset>
+      </form>
+    </Transition>
     <AppNotice :message="error" />
   </AppDialog>
 </template>

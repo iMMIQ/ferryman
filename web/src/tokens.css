@@ -19,7 +19,7 @@
   --focus: #23846080;
   --text-xs: 12px;
   --text-sm: 13px;
-  --text-md: 14px;
+  --text-md: 15px;
   --text-lg: 18px;
   --text-xl: 24px;
   --space-1: 4px;
@@ -33,4 +33,12 @@
   --radius-sm: 5px;
   --radius-md: 8px;
   --radius-lg: 12px;
+  --motion-fast: 110ms;
+  --motion-standard: 180ms;
+  --motion-panel: 220ms;
+  --motion-exit: 120ms;
+  --motion-progress: 300ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0.38, 0.9);
+  --ease-enter: cubic-bezier(0, 0, 0.3, 1);
+  --ease-exit: cubic-bezier(0.2, 0, 1, 0.9);
 }

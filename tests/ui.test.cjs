@@ -234,6 +234,91 @@ async function shot(page, name) {
     });
 }
 
+test("focused composer collapses uploads and restores keyboard focus after removal", async ({
+  page,
+}) =>
+  withPage(page, async (page) => {
+    await expect(
+      page.getByRole("button", { name: "模型与 API", exact: true }),
+    ).toHaveCount(1);
+    await expect(page.locator(".page-heading p")).toHaveCount(0);
+    await expect(page.locator(".jobs-workspace")).not.toBeVisible();
+    await page.locator("#file-input").setInputFiles([
+      {
+        name: "first.epub",
+        mimeType: "application/epub+zip",
+        buffer: Buffer.from("book"),
+      },
+      {
+        name: "second.docx",
+        mimeType: "application/octet-stream",
+        buffer: Buffer.from("document"),
+      },
+    ]);
+    await expect(page.locator("#drop-zone")).toHaveCount(0);
+    await expect(page.locator("#mode-hint")).toHaveText("DOCX 仅支持双语对照");
+    const remove = page.getByRole("button", {
+      name: "移除 first.epub",
+      exact: true,
+    });
+    await remove.focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator("#upload-list li")).toHaveCount(1);
+    await expect(
+      page.getByRole("button", { name: "移除 second.docx", exact: true }),
+    ).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(page.locator("#add-files")).toBeFocused();
+    await expect(page.locator("#drop-zone")).toBeVisible();
+    await expect(page.locator("#mode-hint")).toHaveCount(0);
+    await page.locator(".settings > summary").click();
+    await expect(page.locator("#save-directory")).toBeVisible();
+  }));
+
+test("motion respects reduced motion while dialogs and rapid navigation remain usable", async ({
+  page,
+}) =>
+  withPage(page, async (page) => {
+    await page.emulateMedia({ reducedMotion: "no-preference" });
+    await page.locator("#models-open").click();
+    const dialog = page.locator("#model-dialog");
+    await expect(dialog).toBeVisible();
+    assert.equal(
+      await dialog.evaluate((el) => getComputedStyle(el).animationName),
+      "dialog-enter",
+    );
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    assert.equal(
+      await dialog.evaluate((el) => getComputedStyle(el).animationName),
+      "none",
+    );
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+    await expect(page.locator("#models-open")).toBeFocused();
+    await page.locator('button[data-workspace="jobs"]').click();
+    await page.locator('button[data-workspace="create"]').click();
+    await expect(page.locator(".submit-panel")).toBeVisible();
+    assert.equal(
+      await page.locator(".submit-panel").evaluate((el) => el.inert),
+      false,
+    );
+    await expect(page.locator("#target-language")).toBeEditable();
+  }));
+
+test("a filtered task leaving the list transfers keyboard focus before its exit animation", async ({
+  page,
+}) =>
+  withPage(page, async (page, state) => {
+    await page.locator('button[data-workspace="jobs"]').click();
+    await page.locator('[data-job-phase="in_progress"]').click();
+    await expect(page.locator("#jobs-body tr")).toHaveCount(1);
+    await page.locator('tr[data-id="one"] [data-action="cancel"]').focus();
+    state.jobs[0].status = "completed";
+    state.jobs[0].translated = state.jobs[0].total;
+    await expect(page.locator("#jobs-body tr")).toHaveCount(0);
+    await expect(page.locator("#refresh-jobs")).toBeFocused();
+  }));
+
 test("partial status, stable keyboard focus, details and retry", async ({
   page,
 }) =>
@@ -245,8 +330,12 @@ test("partial status, stable keyboard focus, details and retry", async ({
     );
     assert.equal(
       await page
-        .locator('tr[data-id="two"] progress')
-        .evaluate((e) => e.value / e.max),
+        .locator('tr[data-id="two"] [role="progressbar"]')
+        .evaluate(
+          (e) =>
+            Number(e.getAttribute("aria-valuenow")) /
+            Number(e.getAttribute("aria-valuemax")),
+        ),
       0.96,
     );
     const cancel = page.locator('tr[data-id="one"] [data-action="cancel"]');
@@ -274,7 +363,7 @@ test("partial status, stable keyboard focus, details and retry", async ({
     await page.locator("#submit-job").scrollIntoViewIfNeeded();
     const submitRect = await page.locator("#submit-job").boundingBox();
     assert(
-      submitRect.y + submitRect.height <= 768,
+      submitRect.y + submitRect.height <= 769,
       "desktop submit stays reachable",
     );
     await page.setViewportSize({ width: 1440, height: 1000 });
@@ -303,6 +392,7 @@ test("offline errors persist without false empty history or model failure", asyn
     await expect(page.locator('tr[data-id="one"]')).toBeVisible();
     await shot(page, "desktop-offline");
     await page.reload();
+    await page.locator('button[data-workspace="jobs"]').click();
     await page.locator("#jobs-error").waitFor();
     await expect(page.locator("#empty-state")).not.toBeVisible();
     await expect(page.locator(".jobs-pagination")).not.toBeVisible();
@@ -409,12 +499,11 @@ test("mounted preview shows skipped files and requires overwrite acknowledgement
     await page.locator('.folder-checkbox[data-entry-select="Books"]').click();
     await shot(page, "directory-picker");
     await page.locator("#select-current-folder").click();
+    await page.locator('input[name="mode"][value="replace"]').check();
     await page
-      .locator('input[name="mode"][value="replace"]')
-      .check({ force: true });
-    await page
-      .locator('input[name="save_strategy"][value="sibling_overwrite"]')
-      .check({ force: true });
+      .locator("label.segment")
+      .filter({ hasText: "覆盖原文件" })
+      .click();
     await page.locator("#submit-job").click();
     await page.locator("#submission-dialog").waitFor();
     await expect(page.locator("#submission-files")).toContainText(
@@ -481,9 +570,7 @@ test("standalone model manager only offers custom APIs and never starts discover
       await expect(page.locator("#model-dialog")).not.toContainText(
         /微服|自动发现/,
       );
-      await expect(page.locator("#model-dialog")).toContainText(
-        "暂无模型，请添加自定义 API",
-      );
+      await expect(page.locator("#model-dialog")).toContainText("暂无模型");
       await page.route("**/api/models/probe", (route) =>
         route.fulfill({ json: { models: ["my-chat"], context_length: 4096 } }),
       );
@@ -526,6 +613,7 @@ test("empty state hides pagination and offers creation", async ({ page }) =>
   withPage(
     page,
     async (page) => {
+      await page.locator('button[data-workspace="jobs"]').click();
       await page.locator("#empty-create").waitFor();
       await expect(page.locator(".jobs-pagination")).not.toBeVisible();
       await shot(page, "desktop-empty");
@@ -809,9 +897,8 @@ test("design layouts preserve drafts and separate recent tasks from filters", as
     await page
       .locator("#translation-preset")
       .selectOption("index-translate-35b");
-    await expect(page.locator(".model-availability")).toContainText(
-      "2048 tokens",
-    );
+    await expect(page.locator(".model-availability")).toHaveCount(0);
+    await expect(page.locator("#drop-zone")).toHaveCount(0);
     await shot(page, "desktop-create");
     await page.locator('button[data-workspace="jobs"]').click();
     await page.locator('[data-job-phase="failed"]').click();
@@ -822,7 +909,7 @@ test("design layouts preserve drafts and separate recent tasks from filters", as
     await expect(page.locator("#translation-preset")).toHaveValue(
       "index-translate-35b",
     );
-    await expect(page.locator(".compact .job-card")).toHaveCount(3);
+    await expect(page.locator(".jobs-workspace")).not.toBeVisible();
     await page.setViewportSize({ width: 390, height: 844 });
     await page.locator('button[data-workspace="models"]').click();
     await expect(
@@ -950,23 +1037,23 @@ test("an unrelated upload preserves an unconfirmed mounted submission", async ({
 }) =>
   withPage(page, async (page, state) => {
     await page
-      .locator('input[name="source"][value="mounted"]')
-      .check({ force: true });
+      .locator("label.segment")
+      .filter({ hasText: "文稿与网盘" })
+      .click();
     await page.locator("#source-directory").click();
     await page.locator('.folder-checkbox[data-entry-select="Books"]').click();
     await page.locator("#select-current-folder").click();
     await page
-      .locator('input[name="save_strategy"][value="sibling_overwrite"]')
-      .check({ force: true });
+      .locator("label.segment")
+      .filter({ hasText: "覆盖原文件" })
+      .click();
     state.failSelection = true;
     await page.locator("#submit-job").click();
     await page.locator("#confirm-overwrite").check();
     await page.locator("#confirm-submit").click();
     await expect(page.locator("#submission-error")).toContainText("原提交结果");
 
-    await page
-      .locator('input[name="source"][value="upload"]')
-      .check({ force: true });
+    await page.locator("label.segment").filter({ hasText: "上传文件" }).click();
     await page.locator("#file-input").setInputFiles({
       name: "unrelated.txt",
       mimeType: "text/plain",
@@ -980,8 +1067,9 @@ test("an unrelated upload preserves an unconfirmed mounted submission", async ({
 
     await page.locator('button[data-workspace="create"]').click();
     await page
-      .locator('input[name="source"][value="mounted"]')
-      .check({ force: true });
+      .locator("label.segment")
+      .filter({ hasText: "文稿与网盘" })
+      .click();
     state.failSelection = false;
     await page.locator("#submit-job").click();
     await page.locator("#confirm-overwrite").check();

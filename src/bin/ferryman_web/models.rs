@@ -741,7 +741,10 @@ mod tests {
                 "https://discovery.example.test/api/v1/model-deployments",
                 "private-debug-token\r\nInjected: header",
             ),
-            ("https://discovery.example.test/api/v1/model-deployments", " "),
+            (
+                "https://discovery.example.test/api/v1/model-deployments",
+                " ",
+            ),
         ] {
             tokio::fs::write(
                 state.config.data_dir.join("discovery-api-auth.json"),

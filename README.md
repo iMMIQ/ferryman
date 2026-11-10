@@ -4,7 +4,7 @@
 > *"渡船工": ferries content across the river between languages and formats.*
 >
 > **Status:** EPUB, DOCX, PDF, plain text, Markdown, SRT, VTT, ASS/SSA and LRC
-> ship today. Ferryman can run as a CLI or as a Lazycat MicroServer + AI Pod Web app.
+> ship today. Ferryman can run as a CLI or as a Lazycat MicroServer Web app.
 
 Produce a **bilingual (original + Chinese) EPUB** from any EPUB book by translating
 its content through an OpenAI-compatible model. The original formatting is preserved
@@ -369,3 +369,8 @@ OpenAI model alias; `--endpoint` selects a different server.
   replace traversal, raw OS wrappers, terminal-sequence filtering, download-name
   encoding and temporary-file lifecycle code. Symlink rules, selection limits,
   atomic no-clobber saves and overwrite checks remain enforced by the application.
+
+## License
+
+Ferryman is licensed under the LGPL-3.0-or-later. See [COPYING.LESSER](COPYING.LESSER)
+for the LGPL-3.0 text and [COPYING](COPYING) for the GPL-3.0 text it references.

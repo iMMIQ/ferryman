@@ -2,33 +2,36 @@
   "name": "ferryman-frontend",
   "private": true,
   "scripts": {
-    "test": "npm run build && playwright test --project=ui",
-    "dev": "vite --host 0.0.0.0",
-    "build": "vue-tsc --noEmit && vite build",
-    "typecheck": "vue-tsc --noEmit",
-    "test:unit": "tsx --test tests/frontend.test.ts",
-    "test:smoke": "playwright test --project=smoke",
-    "format": "prettier --write web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs playwright.config.ts scripts/check-generated-types.mjs",
-    "format:check": "prettier --check web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs playwright.config.ts scripts/check-generated-types.mjs",
+    "test": "bun run build && bun --bun playwright test --project=ui",
+    "dev": "bun --bun vite --host 0.0.0.0",
+    "build": "bun --bun vue-tsc --noEmit && bun --bun vite build",
+    "typecheck": "bun --bun vue-tsc --noEmit",
+    "test:unit": "bun test tests/frontend.test.ts tests/dependency-age.test.ts",
+    "test:smoke": "bun --bun playwright test --project=smoke",
+    "format": "bun --bun prettier --write web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs playwright.config.ts scripts/check-generated-types.mjs scripts/check-dependency-age.mjs tests/dependency-age.test.ts",
+    "format:check": "bun --bun prettier --check web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs playwright.config.ts scripts/check-generated-types.mjs scripts/check-dependency-age.mjs tests/dependency-age.test.ts",
     "types:generate": "cargo test --all-targets export_frontend_types -- --ignored",
-    "types:check": "node scripts/check-generated-types.mjs"
+    "types:check": "bun scripts/check-generated-types.mjs",
+    "deps:check-age": "bun scripts/check-dependency-age.mjs"
   },
   "devDependencies": {
-    "@playwright/test": "1.63.0",
-    "@vitejs/plugin-vue": "6.0.9",
-    "prettier": "3.9.9",
-    "tsx": "4.23.15",
-    "typescript": "5.9.3",
-    "vite": "8.3.1",
-    "vue-tsc": "3.3.11"
+    "@lazycatcloud/lzc-cli": "2.0.9",
+    "@playwright/test": "1.64.1",
+    "@vitejs/plugin-vue": "6.0.10",
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "vite": "8.3.5",
+    "vue-tsc": "3.3.14"
   },
   "dependencies": {
-    "@tanstack/vue-query": "5.103.3",
-    "reka-ui": "2.10.5",
-    "vue": "3.5.43"
+    "@tanstack/vue-query": "5.105.3",
+    "reka-ui": "2.11.0",
+    "vue": "3.5.44"
   },
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=26.12.1",
+    "bun": "1.4.4"
   },
-  "type": "module"
+  "type": "module",
+  "packageManager": "bun@1.4.4"
 }

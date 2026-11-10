@@ -1258,7 +1258,7 @@ async fn sha256_file(path: PathBuf) -> Result<String, String> {
         }
         hash.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(hex::encode(hash.finalize()))
 }
 
 async fn remove_path(path: &Path) -> Result<(), String> {
@@ -1457,7 +1457,7 @@ mod tests {
 
 #[cfg(test)]
 #[test]
-#[ignore = "run via npm run types:generate or types:check"]
+#[ignore = "run via bun run types:generate or types:check"]
 fn export_frontend_types() {
     use ts_rs::TS;
     let config = ts_rs::Config::new().with_large_int("number").with_out_dir(

@@ -1,9 +1,9 @@
-import { test, before, after } from "node:test";
+import { test, beforeAll, afterAll } from "bun:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { api, ApiError } from "../web/src/lib/api";
 let server: http.Server, origin: string;
-before(async () => {
+beforeAll(async () => {
   server = http.createServer((req, res) => {
     if (req.url === "/slow") {
       const timer = setTimeout(() => res.end("{}"), 500);
@@ -27,7 +27,7 @@ before(async () => {
   assert(address && typeof address !== "string");
   origin = `http://127.0.0.1:${address.port}`;
 });
-after(async () => {
+afterAll(async () => {
   server.closeAllConnections();
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });

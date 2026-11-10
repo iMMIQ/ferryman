@@ -80,6 +80,30 @@ clear error.
 cargo build --release
 ```
 
+## Dependency updates
+
+JavaScript tooling uses Bun 1.4.4 (`.bun-version`) and `bun.lock`; TypeScript stays
+at 6.0.3. Node.js 26.12.1 remains pinned in `.nvmrc` for Node compatibility.
+`bunfig.toml` requires every newly resolved package, including transitive
+packages, to have been published at least seven days ago. Install existing
+versions with `bun install --frozen-lockfile` and commit lockfile changes with
+any dependency update.
+
+`bun run deps:check-age` verifies publication dates and checksums for **both**
+`Cargo.lock` and `bun.lock` against the configured mirrors (`rsproxy.cn` and
+`mirrors.cloud.tencent.com/npm`). The audit requires Bun and curl. CI runs this check
+before dependency installation, compilation or tests;
+missing publication dates, yanked crates and checksum mismatches fail it.
+Stable Cargo does not yet enforce a minimum publication age, so Rust lockfile
+updates must also pass this check before they are accepted. This waiting period
+reduces exposure to newly compromised releases; it is not a guarantee of safety.
+
+The 2026-11-10 update uses the cutoff 2026-11-03T03:38:59Z. `rusqlite` remains on
+0.40 because `tokio-rusqlite` 0.8 requires that SQLite ABI; `lopdf` remains on
+0.42 because `pdf-extract` 0.12 exposes its types. Other direct dependencies use
+the latest stable releases available at that cutoff, except the explicitly
+pinned TypeScript version and the packaging CLI's supported 2.0.9 release.
+
 ## Tests and resource limits
 
 PDF tests require a CJK font and fail if it is missing. On Debian/Ubuntu,
@@ -103,9 +127,9 @@ successful translations; truncation triggers bounded splitting/retranslation.
 
 ### Browser UI regression tests
 
-The frontend uses Vue 3, TypeScript, Vite, Reka UI and TanStack Vue Query. Node 22.12+ is needed
-for development/builds; production still serves static files from Rust without
-a Node process. `npm run build` type-checks the frontend and writes fingerprinted
+The frontend uses Vue 3, TypeScript, Vite, Reka UI and TanStack Vue Query. Bun 1.4.4 (pinned in `.bun-version`) is used
+for dependency installation, development, builds and tests; production still serves static files from Rust without
+a Node process. `bun run build` type-checks the frontend and writes fingerprinted
 assets to `dist/web` (the default `FERRYMAN_WEB_DIR`).
 
 Browser regression tests serve the production assets and mock API responses.
@@ -114,17 +138,17 @@ checks config, directory selection, preview and job lifecycle contracts without 
 It configures a custom API against a local model fixture, exercises cancellation and deletion, and completes a translation task through the real Rust backend.
 
 ```bash
-npm ci
-npm run dev # Vite dev server; /api proxies to Rust on 127.0.0.1:8080
+bun install --frozen-lockfile
+bun run dev # Vite dev server; /api proxies to Rust on 127.0.0.1:8080
 # In another terminal, or stop the dev server before running tests:
-npx playwright install --with-deps chromium
-npm run types:check # regenerate Rust DTOs into a temporary directory and compare
-npm run test:unit
-npm test # type-check, production build, browser regression tests
+bun --bun playwright install --with-deps chromium
+bun run types:check # regenerate Rust DTOs into a temporary directory and compare
+bun run test:unit
+bun run test # type-check, production build, browser regression tests
 cargo build --locked --bin ferryman-web
-npm run test:smoke
+bun run test:smoke
 # Optional screenshot artifacts:
-UI_SCREENSHOT_DIR=/tmp/ferryman-ui npm test
+UI_SCREENSHOT_DIR=/tmp/ferryman-ui bun run test
 ```
 
 The suite covers mobile navigation, keyboard focus across polling/dialogs,
@@ -142,8 +166,8 @@ prevent duplicate actions. Request snapshots and overwrite acknowledgement remai
 in `useSubmission`.
 
 Wire types in `web/src/lib/generated` are generated from Rust with ts-rs; do not
-edit them manually. Run `npm run types:generate` after changing a DTO and include
-the generated changes. `npm run types:check` checks drift without modifying the
+edit them manually. Run `bun run types:generate` after changing a DTO and include
+the generated changes. `bun run types:check` checks drift without modifying the
 working tree. Rust numeric counters/timestamps use JSON numbers, so the exporter
 maps large integer types to TypeScript `number` (values must remain within JS safe
 integer precision); nullable and omitted fields retain their Serde semantics.
@@ -152,11 +176,11 @@ views live separately in `lib/types.ts`.
 
 Playwright Test manages browser fixtures, the Vite preview server, retrying DOM
 assertions and failure screenshots/traces. CI uploads failure artifacts from
-`test-results` and `playwright-report`; inspect traces with `npx playwright show-trace`.
+`test-results` and `playwright-report`; inspect traces with `bun --bun playwright show-trace`.
 
 UI tokens live in
 `tokens.css`, with shared buttons, notices, dialogs and empty states under
-`components/ui`. Run `npm run format` after editing frontend sources.
+`components/ui`. Run `bun run format` after editing frontend sources.
 
 ## Web app and Lazycat deployment
 
@@ -245,7 +269,7 @@ queue data under `/lzcapp/var/ferryman`.
 Run locally:
 
 ```bash
-npm ci && npm run build
+bun install --frozen-lockfile && bun run build
 mkdir -p ./ferryman-documents/local-development-user ./ferryman-remotefs/local-development-user
 FERRYMAN_ALLOW_LOCAL_USER=true \
 cargo run --bin ferryman-web

@@ -7,24 +7,24 @@ weights or Agent image is built or installed.
 
 ## Build prerequisites
 
-Use Rustup (version pinned by `rust-toolchain.toml`), the Node version in `.nvmrc`,
+Use Rustup (version pinned by `rust-toolchain.toml`), Bun (version pinned in `.bun-version`),
 Python 3.10+, `@lazycatcloud/lzc-cli@2.0.9`, and the x86 compiler/runtime:
 
 ```sh
 sudo apt-get install -y gcc-x86-64-linux-gnu fonts-noto-cjk fonts-noto-core fonts-dejavu-core ca-certificates
 python3 -m pip install -r scripts/requirements-build.txt
-nvm install && nvm use
-npm install -g @lazycatcloud/lzc-cli@2.0.9
+bun --version # must match .bun-version
+bun install --frozen-lockfile
 ```
 
 `build-release.sh` compiles `ferryman-web` for `x86_64-unknown-linux-gnu` with the
 `lazycat` Cargo feature, builds
 the frontend, bundles fonts and required runtime libraries, verifies all inputs,
-and atomically publishes `build/web`. Cargo/npm caches remain reusable.
+and atomically publishes `build/web`. Cargo/Bun caches remain reusable.
 Set `SOURCE_DATE_EPOCH` when building from an archive without Git.
 
 ```sh
-lzc-cli project release -o dist/ferryman-web.lpk
+bun --bun lzc-cli project release -o dist/ferryman-web.lpk
 python3 scripts/check-artifacts.py lpk web dist/ferryman-web.lpk
 
 # Local Buildx assembly without a connected MicroServer:

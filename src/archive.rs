@@ -49,7 +49,7 @@ pub(crate) fn read_entries<R: Read + Seek>(
         anyhow::ensure!(
             entry.size() <= limits.entry_bytes,
             "archive entry exceeds size limit: {}",
-            entry.name()
+            entry.name().context("decode archive entry name")?
         );
         advertised = advertised
             .checked_add(entry.size())
@@ -63,7 +63,10 @@ pub(crate) fn read_entries<R: Read + Seek>(
     let mut entries = Vec::with_capacity(za.len());
     for index in 0..za.len() {
         let mut entry = za.by_index(index)?;
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .context("decode archive entry name")?
+            .into_owned();
         let is_dir = entry.is_dir();
         let method = entry.compression();
         let data = read_bounded(&mut entry, limits.entry_bytes.min(remaining))

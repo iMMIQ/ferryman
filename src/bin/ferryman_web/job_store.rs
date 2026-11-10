@@ -137,7 +137,7 @@ impl JobStore {
         // Keep domain errors intact, while the library owns serialization and
         // the dedicated SQLite thread. A closed worker is reported, not panicked.
         self.connection
-            .call(move |connection| Ok(operation(connection)))
+            .call_raw(operation)
             .await
             .context("database worker")?
     }
@@ -184,10 +184,10 @@ impl JobStore {
         self.call(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if let Some(entry) = entries.first() {
-                let active: usize = transaction.query_row(
+                let active: i64 = transaction.query_row(
                     "SELECT COUNT(*) FROM jobs WHERE owner=?1 AND status IN ('queued','starting_model','translating','writing')",
                     [&entry.owner], |row| row.get(0))?;
-                anyhow::ensure!(active.saturating_add(entries.len()) <= active_limit, "too many queued or active jobs");
+                anyhow::ensure!(from_i64(active, "active job count")?.saturating_add(entries.len()) <= active_limit, "too many queued or active jobs");
             }
             for entry in entries {
             transaction.execute(

@@ -6,10 +6,9 @@ BINARY=ferryman-web
 RUST_TARGET=x86_64-unknown-linux-gnu
 CROSS_PREFIX=x86_64-linux-gnu
 init_build
-require_command npm
-require_command node
-test "$(node --version)" = "v$(cat .nvmrc)" || {
-    echo "use the Node version in .nvmrc (nvm install && nvm use)" >&2
+require_command bun
+test "$(bun --version)" = "$(cat .bun-version)" || {
+    echo "use the Bun version in .bun-version" >&2
     exit 1
 }
 
@@ -34,8 +33,8 @@ cp /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf "$STAGE/fonts/"
 for package in fonts-noto-cjk fonts-noto-core fonts-dejavu-core; do
     cp "/usr/share/doc/$package/copyright" "$STAGE/fonts/$package.copyright"
 done
-npm ci --prefer-offline --no-audit --no-fund
-npm run build
+bun install --frozen-lockfile
+bun run build
 cp -R dist/web "$STAGE/assets"
 build_binary "$STAGE/ferryman-web" --no-default-features --features lazycat
 python3 scripts/check-artifacts.py write web "$STAGE"

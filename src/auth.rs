@@ -1,5 +1,5 @@
 //! Shared agent pairing protocol. The key is SHA256(token), not the raw token.
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 pub fn hash_token(token: &str) -> [u8; 32] {

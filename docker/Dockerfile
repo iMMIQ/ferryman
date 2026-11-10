@@ -2,13 +2,13 @@
 # Standalone only. Lazycat keeps its native buildscript / embedded-image flow.
 # Model inference runs on a configured external HTTP API.
 
-FROM node:22.16.0-bookworm-slim@sha256:048ed02c5fd52e86fda6fbd2f6a76cf0d4492fd6c6fee9e2c463ed5108da0e34 AS frontend
+FROM oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4 AS frontend
 WORKDIR /frontend
-COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci --prefer-offline --no-audit --no-fund
+COPY package.json bun.lock bunfig.toml ./
+RUN --mount=type=cache,target=/root/.bun/install/cache bun install --frozen-lockfile
 COPY tsconfig.json vite.config.ts ./
 COPY web ./web
-RUN npm run build
+RUN bun run build
 
 # Both targets use musl binaries, independent of the runtime's glibc version.
 # Cache compilation separately by architecture; unrelated frontend/docs/data

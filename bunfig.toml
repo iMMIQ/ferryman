@@ -1,0 +1,5 @@
+[install]
+registry = "https://mirrors.cloud.tencent.com/npm/"
+# Only resolve releases published at least seven days ago (seconds).
+minimumReleaseAge = 604800
+minimumReleaseAgeExcludes = []

@@ -4,7 +4,7 @@ set -eu
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$REPO_ROOT"
 mkdir -p build dist
-CLI_SOURCE="$(npm root -g)/@lazycatcloud/lzc-cli"
+CLI_SOURCE="$REPO_ROOT/node_modules/@lazycatcloud/lzc-cli"
 CLI_STAGE=$(mktemp -d "$REPO_ROOT/build/.lzc-ci.XXXXXX")
 trap 'rm -rf "$CLI_STAGE"' EXIT
 trap 'exit 1' HUP INT TERM
@@ -19,7 +19,8 @@ version = json.loads((source / 'package.json').read_text())['version']
 if version != '2.0.9':
     raise SystemExit('This compatibility fix requires @lazycatcloud/lzc-cli@2.0.9; revalidate on upgrades')
 shutil.copytree(source, stage, dirs_exist_ok=True, ignore=shutil.ignore_patterns('node_modules'))
-(stage / 'node_modules').symlink_to(source / 'node_modules', target_is_directory=True)
+if (source / 'node_modules').is_dir():
+    (stage / 'node_modules').symlink_to(source / 'node_modules', target_is_directory=True)
 module = stage / 'lib/app/lpk_build_images_local.js'
 text = module.read_text()
 old = "const baseRef = resolveFinalExternalImageFromDockerfile(dockerfilePath);\n\tif (!baseRef) {"
@@ -47,4 +48,4 @@ if text.count(old) != 1:
     raise SystemExit('CLI package-cache compatibility patch no longer matches')
 module.write_text(text.replace(old, new))
 PY
-node "$CLI_STAGE/scripts/cli.js" project release -f lzc-build.ci.yml "$@"
+bun "$CLI_STAGE/scripts/cli.js" project release -f lzc-build.ci.yml "$@"

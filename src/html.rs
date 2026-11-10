@@ -16,7 +16,7 @@
 
 use anyhow::Result;
 use lol_html::html_content::ContentType;
-use lol_html::{element, rewrite_str, text, RewriteStrSettings};
+use lol_html::{element, end_tag, rewrite_str, text, RewriteStrSettings};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -72,82 +72,83 @@ pub fn extract(html: &str) -> Result<(String, Vec<Block>)> {
 
     let rewritten = rewrite_str(
         html,
-        RewriteStrSettings {
-            element_content_handlers: vec![
-                // Suppress collection inside non-content regions.
-                element!(SUPPRESS_SEL, move |el| {
-                    st_sup.borrow_mut().suppress += 1;
-                    let s = st_sup.clone();
-                    let _ = el.on_end_tag(move |_| {
-                        s.borrow_mut().suppress -= 1;
-                        Ok(())
-                    });
+        vec![
+            // Suppress collection inside non-content regions.
+            element!(SUPPRESS_SEL, move |el| {
+                st_sup.borrow_mut().suppress += 1;
+                let s = st_sup.clone();
+                let _ = el.on_end_tag(end_tag!(move |_| {
+                    s.borrow_mut().suppress -= 1;
                     Ok(())
-                }),
-                // Track block elements.
-                element!(BLOCK_SEL, move |el| {
-                    let mut s = st_blk.borrow_mut();
-                    if s.suppress > 0 {
-                        return Ok(());
-                    }
-                    // Mark the enclosing tracked block as a container.
-                    if let Some(top) = s.stack.last_mut() {
-                        top.1 = true;
-                    }
-                    let tag = el.tag_name().to_string();
-                    let id = s.blocks.len();
-                    s.blocks.push(Block {
-                        text: String::new(),
-                        tag,
-                        leaf: false,
-                    });
-                    s.stack.push((id, false));
+                }));
+                Ok(())
+            }),
+            // Track block elements.
+            element!(BLOCK_SEL, move |el| {
+                let mut s = st_blk.borrow_mut();
+                if s.suppress > 0 {
+                    return Ok(());
+                }
+                // Mark the enclosing tracked block as a container.
+                if let Some(top) = s.stack.last_mut() {
+                    top.1 = true;
+                }
+                let tag = el.tag_name().to_string();
+                let id = s.blocks.len();
+                s.blocks.push(Block {
+                    text: String::new(),
+                    tag,
+                    leaf: false,
+                });
+                s.stack.push((id, false));
 
-                    let s2 = st_blk.clone();
-                    let _ = el.on_end_tag(move |end| {
-                        let (id, is_leaf) = match s2.borrow_mut().stack.pop() {
-                            Some((id, nested)) => (id, !nested),
-                            None => return Ok(()),
-                        };
-                        let has_text = !s2.borrow().blocks[id].text.trim().is_empty();
-                        if is_leaf && has_text {
-                            s2.borrow_mut().blocks[id].leaf = true;
-                            end.after(&format!("<!--HYZH:{}-->", id), ContentType::Html);
-                        }
-                        Ok(())
-                    });
-                    Ok(())
-                }),
-                element!("br", move |_| {
-                    let mut s = st_break.borrow_mut();
-                    if s.suppress == 0 {
-                        if let Some(&(id, _)) = s.stack.last() {
-                            s.blocks[id].text.push('\n');
-                        }
+                let s2 = st_blk.clone();
+                let _ = el.on_end_tag(end_tag!(move |end| {
+                    let (id, is_leaf) = match s2.borrow_mut().stack.pop() {
+                        Some((id, nested)) => (id, !nested),
+                        None => return Ok(()),
+                    };
+                    let has_text = !s2.borrow().blocks[id].text.trim().is_empty();
+                    if is_leaf && has_text {
+                        s2.borrow_mut().blocks[id].leaf = true;
+                        end.after(&format!("<!--HYZH:{}-->", id), ContentType::Html);
                     }
                     Ok(())
-                }),
-                // Inject the translation style into <head>.
-                element!("head", |el| {
-                    el.append(STYLE_HTML, ContentType::Html);
-                    Ok(())
-                }),
-                // Accumulate text content of blocks (scoped to <body>, so <head>
-                // metadata is naturally excluded).
-                text!("body", move |tc| {
-                    let mut s = st_txt.borrow_mut();
-                    if s.suppress > 0 {
-                        return Ok(());
+                }));
+                Ok(())
+            }),
+            element!("br", move |_| {
+                let mut s = st_break.borrow_mut();
+                if s.suppress == 0 {
+                    if let Some(&(id, _)) = s.stack.last() {
+                        s.blocks[id].text.push('\n');
                     }
-                    if let Some(top) = s.stack.last() {
-                        let id = top.0;
-                        s.blocks[id].text.push_str(tc.as_str());
-                    }
-                    Ok(())
-                }),
-            ],
-            ..RewriteStrSettings::default()
-        },
+                }
+                Ok(())
+            }),
+            // Inject the translation style into <head>.
+            element!("head", |el| {
+                el.append(STYLE_HTML, ContentType::Html);
+                Ok(())
+            }),
+            // Accumulate text content of blocks (scoped to <body>, so <head>
+            // metadata is naturally excluded).
+            text!("body", move |tc| {
+                let mut s = st_txt.borrow_mut();
+                if s.suppress > 0 {
+                    return Ok(());
+                }
+                if let Some(top) = s.stack.last() {
+                    let id = top.0;
+                    s.blocks[id].text.push_str(tc.as_str());
+                }
+                Ok(())
+            }),
+        ]
+        .into_iter()
+        .fold(RewriteStrSettings::new(), |settings, handler| {
+            settings.append_element_content_handler(handler)
+        }),
     )?;
 
     let mut blocks = Rc::try_unwrap(st).ok().unwrap().into_inner().blocks;

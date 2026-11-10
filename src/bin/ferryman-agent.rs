@@ -1795,7 +1795,7 @@ mod tests {
 
 #[cfg(test)]
 #[test]
-#[ignore = "run via npm run types:generate or types:check"]
+#[ignore = "run via bun run types:generate or types:check"]
 fn export_frontend_types() {
     use ts_rs::TS;
     let config = ts_rs::Config::new().with_large_int("number").with_out_dir(

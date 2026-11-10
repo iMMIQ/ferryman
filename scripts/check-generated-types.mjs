@@ -35,7 +35,7 @@ try {
   }
   if (differences.length) {
     throw new Error(
-      `Generated API types differ: ${differences.join(", ")}. Run npm run types:generate.`,
+      `Generated API types differ: ${differences.join(", ")}. Run bun run types:generate.`,
     );
   }
   console.log(`API contracts match Rust (${expected.length} files).`);

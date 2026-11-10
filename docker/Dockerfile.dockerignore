@@ -10,7 +10,8 @@
 !src/
 !src/**
 !package.json
-!package-lock.json
+!bun.lock
+!bunfig.toml
 !tsconfig.json
 !vite.config.ts
 !web/

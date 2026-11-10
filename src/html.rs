@@ -18,7 +18,10 @@ use anyhow::Result;
 use lol_html::html_content::ContentType;
 use lol_html::{element, end_tag, rewrite_str, text, RewriteStrSettings};
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// CSS injected into every content document to style the appended translations.
 pub const STYLE_HTML: &str = concat!(
@@ -41,6 +44,8 @@ pub struct Block {
     pub tag: String,
     /// Set true for leaf blocks that carry non-empty text and got a placeholder.
     pub leaf: bool,
+    /// Original text-node byte ranges, excluding protected content and markup.
+    pub text_ranges: Vec<Range<usize>>,
 }
 
 struct State {
@@ -99,6 +104,7 @@ pub fn extract(html: &str) -> Result<(String, Vec<Block>)> {
                     text: String::new(),
                     tag,
                     leaf: false,
+                    text_ranges: Vec::new(),
                 });
                 s.stack.push((id, false));
 
@@ -141,6 +147,18 @@ pub fn extract(html: &str) -> Result<(String, Vec<Block>)> {
                 if let Some(top) = s.stack.last() {
                     let id = top.0;
                     s.blocks[id].text.push_str(tc.as_str());
+                    let range = tc.source_location().bytes();
+                    if !range.is_empty() {
+                        let ranges = &mut s.blocks[id].text_ranges;
+                        // Streaming chunks can split a text node or an entity.
+                        // Merge them before assigning translated text to runs.
+                        if let Some(last) = ranges.last_mut().filter(|last| last.end == range.start)
+                        {
+                            last.end = range.end;
+                        } else {
+                            ranges.push(range);
+                        }
+                    }
                 }
                 Ok(())
             }),
@@ -157,6 +175,66 @@ pub fn extract(html: &str) -> Result<(String, Vec<Block>)> {
         block.text = html_escape::decode_html_entities(&block.text).into_owned();
     }
     Ok((rewritten, blocks))
+}
+
+/// Replace translated leaf text while retaining the original XHTML bytes for
+/// tags, links, images, attributes, protected code and untranslated blocks.
+/// Without word alignment, inline styles are retained by distributing target
+/// graphemes proportionally across the original text runs.
+pub fn replace_translations(
+    source: &str,
+    blocks: &[Block],
+    translations: &[(usize, String)],
+) -> String {
+    let translations: HashMap<_, _> = translations.iter().map(|(id, text)| (*id, text)).collect();
+    let mut edits = Vec::new();
+    for (id, block) in blocks.iter().enumerate().filter(|(_, block)| block.leaf) {
+        let Some(translation) = translations.get(&id) else {
+            continue;
+        };
+        let runs: Vec<_> = block
+            .text_ranges
+            .iter()
+            .map(|range| {
+                let decoded = html_escape::decode_html_entities(&source[range.clone()]);
+                let weight = if decoded.trim().is_empty() {
+                    0
+                } else {
+                    decoded.graphemes(true).count()
+                };
+                (range, weight)
+            })
+            .collect();
+        let total: usize = runs.iter().map(|(_, weight)| weight).sum();
+        if total == 0 {
+            continue;
+        }
+        let mut boundaries: Vec<_> = translation
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .collect();
+        boundaries.push(translation.len());
+        let mut consumed = 0;
+        let mut start = 0;
+        for (range, weight) in runs {
+            consumed += weight;
+            let end =
+                ((consumed as u128 * (boundaries.len() - 1) as u128) / total as u128) as usize;
+            let text = html_escape(&translation[boundaries[start]..boundaries[end]]);
+            edits.push((range.clone(), text));
+            start = end;
+        }
+    }
+    edits.sort_unstable_by_key(|(range, _)| range.start);
+    let mut output = String::with_capacity(source.len());
+    let mut cursor = 0;
+    for (range, replacement) in edits {
+        output.push_str(&source[cursor..range.start]);
+        output.push_str(&replacement);
+        cursor = range.end;
+    }
+    output.push_str(&source[cursor..]);
+    output
 }
 
 /// Second pass: replace each placeholder with a styled, escaped translation.
@@ -224,6 +302,71 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replace_keeps_markup_assets_and_untranslated_blocks() {
+        let source = concat!(
+            "<?xml version=\"1.0\"?><html xmlns=\"http://www.w3.org/1999/xhtml\">",
+            "<head><title>Book title</title></head><body><div>",
+            "<p id=\"p1\" class=\"body\">Hello <em>world</em> &amp; <a href=\"#note\">friends</a>",
+            "<img src=\"figure.png\" alt=\"figure\"/></p>",
+            "<p id=\"note\">Untranslated <b>note</b>.</p>",
+            "<p>Keep <code>x &lt; y</code> code.</p>",
+            "</div></body></html>"
+        );
+        let (_, blocks) = extract(source).unwrap();
+        let ids: Vec<_> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.leaf)
+            .map(|(id, _)| id)
+            .collect();
+        let translation = "你好，世界与朋友们<&>";
+        let output = replace_translations(source, &blocks, &[(ids[0], translation.into())]);
+        let doc = roxmltree::Document::parse(&output).unwrap();
+        let paragraph = doc
+            .descendants()
+            .find(|n| n.attribute("id") == Some("p1"))
+            .unwrap();
+        let text: String = paragraph
+            .descendants()
+            .filter(|n| n.is_text())
+            .filter_map(|n| n.text())
+            .collect();
+        assert_eq!(text, translation);
+        assert!(output.contains("<em>") && output.contains("<a href=\"#note\">"));
+        assert!(output.contains("<img src=\"figure.png\" alt=\"figure\"/>"));
+        assert!(output.contains("<p id=\"note\">Untranslated <b>note</b>.</p>"));
+        assert!(output.contains("<p>Keep <code>x &lt; y</code> code.</p>"));
+        assert!(!output.contains("Hello") && !output.contains("HYZH") && !output.contains("hy-zh"));
+        assert_eq!(replace_translations(source, &blocks, &[]), source);
+    }
+
+    #[test]
+    fn replace_handles_large_entity_runs_and_keeps_graphemes_whole() {
+        let original = "a &amp; b ".repeat(2000);
+        let source = format!("<html><body><p>{original}<b>tail</b></p></body></html>");
+        let (_, blocks) = extract(&source).unwrap();
+        let translation = "👩🏽‍💻e\u{301}中文".repeat(300);
+        let output = replace_translations(&source, &blocks, &[(0, translation.clone())]);
+        let doc = roxmltree::Document::parse(&output).unwrap();
+        let text: String = doc
+            .descendants()
+            .filter(|n| n.is_text())
+            .filter_map(|n| n.text())
+            .collect();
+        assert_eq!(text, translation);
+        let boundaries: std::collections::HashSet<_> = translation
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .chain([translation.len()])
+            .collect();
+        let mut end = 0;
+        for node in doc.descendants().filter(|n| n.is_text()) {
+            end += node.text().unwrap().len();
+            assert!(boundaries.contains(&end));
+        }
+    }
 
     #[test]
     fn extracted_text_decodes_entities_and_preserves_breaks() {

@@ -332,6 +332,11 @@ require a JSONL server API.
 The endpoint defaults to `http://127.0.0.1:8088`. `--model` overrides the
 OpenAI model alias; `--endpoint` selects a different server.
 
+EPUB supports `--mode replace` (仅译文). It replaces translated leaf text while
+preserving chapter markup, links, images, styles and archive assets; missing
+translations retain their original text. Inline styling is distributed across
+the translated text by the relative lengths of the original text runs.
+
 ## Resumability & interruption
 
 - **Translation cache.** Every translated block is written to a content-addressed

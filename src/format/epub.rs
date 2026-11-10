@@ -10,7 +10,7 @@
 use crate::archive::{Entry, Epub};
 use crate::format::{Document, OutputMode, Segment, SegmentId};
 use crate::html::{self, Block};
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::path::Path;
 
 /// Per-content-document intermediate state produced by [`html::extract`].
@@ -116,10 +116,6 @@ impl Document for EpubDoc {
         out: &Path,
         mode: OutputMode,
     ) -> Result<()> {
-        if mode == OutputMode::Replace {
-            bail!("--mode replace is not yet supported for epub");
-        }
-
         // Route translations to their owning file, keyed by block id (as
         // html::apply_translations expects). Ids not in seg_index are ignored.
         let mut per_file: Vec<Vec<(usize, String)>> = vec![Vec::new(); self.files.len()];
@@ -134,8 +130,15 @@ impl Document for EpubDoc {
         // returning the rewritten HTML (placeholders for untranslated leaves
         // are removed by its strip_leftover_placeholders pass).
         for (fidx, file) in self.files.iter().enumerate() {
-            let final_html =
-                html::apply_translations(&file.rewritten_html, &file.blocks, &per_file[fidx]);
+            let final_html = match mode {
+                OutputMode::Bilingual => {
+                    html::apply_translations(&file.rewritten_html, &file.blocks, &per_file[fidx])
+                }
+                OutputMode::Replace => {
+                    let source = String::from_utf8_lossy(&self.entries[file.entry_idx].data);
+                    html::replace_translations(&source, &file.blocks, &per_file[fidx])
+                }
+            };
             self.entries[file.entry_idx].data = final_html.into_bytes();
         }
 
@@ -145,5 +148,70 @@ impl Document for EpubDoc {
             entries: std::mem::take(&mut self.entries),
         };
         out_epub.write(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zip::CompressionMethod;
+
+    #[test]
+    fn replace_writes_an_epub_preserving_assets_and_missing_translations() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.epub");
+        let output = root.path().join("translated.epub");
+        let file = |name: &str, bytes: &[u8]| Entry {
+            name: name.into(),
+            data: bytes.into(),
+            method: CompressionMethod::Deflated,
+            is_dir: false,
+        };
+        Epub { entries: vec![
+            file("mimetype", b"application/epub+zip"),
+            file("META-INF/container.xml", br#"<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>"#),
+            file("OEBPS/content.opf", br#"<package><manifest><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="chapter"/></spine></package>"#),
+            file("OEBPS/chapter.xhtml", br#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Title</title></head><body><h1 id="title">Original title</h1><p>A <em>paragraph</em>.</p><p>Untouched</p><img src="figure.png"/></body></html>"#),
+            file("OEBPS/figure.png", &[1, 2, 3, 4]),
+        ] }.write(&input).unwrap();
+        let mut document = EpubDoc::open(&input).unwrap();
+        assert_eq!(document.segments().len(), 3);
+        document
+            .write(
+                &[(0, "译文标题".into()), (1, "翻译后的段落。".into())],
+                &output,
+                OutputMode::Replace,
+            )
+            .unwrap();
+        let epub = Epub::load(&output).unwrap();
+        let html = epub.read_text("OEBPS/chapter.xhtml").unwrap();
+        assert!(html.contains("<h1 id=\"title\">译文标题</h1>"));
+        assert!(html.contains("<p>Untouched</p>"));
+        assert!(
+            !html.contains("Original title")
+                && !html.contains("paragraph")
+                && !html.contains("HYZH")
+        );
+        let parsed = roxmltree::Document::parse(&html).unwrap();
+        let paragraph = parsed
+            .descendants()
+            .find(|n| n.has_tag_name(("http://www.w3.org/1999/xhtml", "p")))
+            .unwrap();
+        assert_eq!(
+            paragraph
+                .descendants()
+                .filter(|n| n.is_text())
+                .filter_map(|n| n.text())
+                .collect::<String>(),
+            "翻译后的段落。"
+        );
+        assert_eq!(
+            epub.entries[epub.find("OEBPS/figure.png").unwrap()].data,
+            [1, 2, 3, 4]
+        );
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&output).unwrap()).unwrap();
+        let mimetype = archive.by_index(0).unwrap();
+        assert_eq!(mimetype.name().unwrap(), "mimetype");
+        assert_eq!(mimetype.compression(), CompressionMethod::Stored);
     }
 }

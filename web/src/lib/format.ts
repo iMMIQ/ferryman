@@ -3,27 +3,6 @@ export const storageNames: Record<Storage, string> = {
   documents: "用户文稿",
   remote_fs: "网盘挂载",
 };
-export const modelNames = {
-  "index-translate-2b": "Index 2B E8P Q4A8",
-  "index-translate-9b": "Index 9B E8P Q4A8",
-  "index-translate-35b": "Index 35B-A3B E8P Q4A8",
-};
-export const modelStates: Record<string, string> = {
-  absent: "未下载",
-  benchmarking: "正在测速",
-  downloading: "下载中",
-  paused: "已暂停",
-  verifying: "正在校验",
-  ready: "已安装",
-  failed: "准备失败",
-};
-export const runtimeNames: Record<string, string> = {
-  stopped: "待机",
-  starting: "启动中",
-  ready: "可用",
-  stopping: "卸载中",
-  failed: "启动失败",
-};
 export const phases: { value: Phase; label: string }[] = [
   { value: "all", label: "全部" },
   { value: "queued", label: "排队中" },

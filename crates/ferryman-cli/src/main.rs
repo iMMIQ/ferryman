@@ -1,68 +1,60 @@
-//! ferryman — translate documents into bilingual (original + translation)
-//! output via a orinfer-served model. EPUB, DOCX, PDF, SRT, VTT, ASS, LRC, TXT
-//! and MD ship today — plug a new format into `src/format/` and it just works.
-//!
-//! The original formatting is preserved byte-for-byte (via lol_html for EPUB;
-//! surgical paragraph splice for DOCX; cue timing/structure is preserved
-//! verbatim for subtitles); after each translated block a styled sibling
-//! carrying the translation is inserted.
-//!
-//! A single file or a whole directory goes through [`batch::run_batch`]: one
-//! shared concurrency pool, files opened lazily and written the moment they
-//! finish — so memory tracks the files *in flight*, not the size of the input.
+//! ferryman — translate documents into bilingual (original + translation) or
+//! translated-only output via an OpenAI-compatible HTTP API.
 
 use anyhow::Result;
 use clap::Parser;
-use ferryman::batch::{collect_inputs, run_batch, BatchOpts};
+use ferryman::batch::{collect_inputs, run_batch_controlled, BatchOpts, BatchProgress};
 use ferryman::cache::Cache;
-use ferryman::container;
 use ferryman::engine::{build_translation_client, Engine};
 use ferryman::format::{Format, OutputMode};
-use ferryman::preset::Preset;
+use ferryman::model_api::{ModelTarget, PromptAdapter};
 use ferryman::settings::{
     TranslationSettings, DEFAULT_BATCH_SIZE, DEFAULT_CONTEXT_SEGMENTS,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
 };
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
 #[command(
     name = "ferryman",
-    about = "Translate a document into a bilingual side-by-side output via orinfer (EPUB, DOCX, PDF, SRT, VTT, ASS, LRC, TXT, MD)"
+    about = "Translate documents into bilingual or translated-only output via an OpenAI-compatible API (EPUB, DOCX, PDF, SRT, VTT, ASS, LRC, TXT, MD)"
 )]
 struct Cli {
-    /// Input file or directory. A file is translated directly (format
-    /// auto-detected from the extension). A directory is walked recursively and
-    /// every supported file (epub, docx, pdf, srt, vtt, ass, lrc, txt, md) is
-    /// translated; unsupported files and ferryman's own suffixed outputs are
-    /// skipped. Files are opened lazily and written as they finish, so memory
-    /// stays bounded by the concurrency window — for a very large EPUB/DOCX
-    /// library, run it in subdirectory batches.
+    /// Input file or directory (walked recursively for supported formats).
     #[arg(long, short = 'i')]
     input: PathBuf,
 
     /// Output path (single-file mode only; rejected with a directory input).
-    /// If neither --output nor --in-place is given, each file is written to a
-    /// sibling named `<name>.bilingual.<ext>` next to the original.
     #[arg(long, short = 'o', conflicts_with = "in_place")]
     output: Option<PathBuf>,
 
-    /// Overwrite each input file in place (single file or directory). Mutually
-    /// exclusive with --output. Each file is written to a sibling temp file
-    /// first, then atomically renamed over the original, so a crash mid-write
-    /// can't truncate the source.
+    /// Overwrite each input file in place (single file or directory).
     #[arg(long)]
     in_place: bool,
 
-    /// Output mode: `bilingual` (default) keeps the original and appends the
-    /// translation; `replace` writes only the translation.
+    /// Output mode: `bilingual` (default) or `replace`.
     #[arg(long, value_enum, default_value_t = OutputMode::Bilingual)]
     mode: OutputMode,
 
-    /// orinfer OpenAI-compatible endpoint (used when --serve is NOT set).
-    #[arg(long, default_value = "http://127.0.0.1:8088")]
+    /// OpenAI-compatible API base URL.
+    #[arg(long, default_value = "http://127.0.0.1:8088/v1")]
     endpoint: String,
+
+    /// Served model id (OpenAI `model` field).
+    #[arg(long, default_value = "index-translate-2b")]
+    model: String,
+
+    /// Prompt adapter (`generic` or `index-translate`).
+    #[arg(long, value_enum, default_value_t = PromptAdapter::Generic)]
+    adapter: PromptAdapter,
+
+    /// Optional API key (falls back to FERRYMAN_API_KEY).
+    #[arg(long)]
+    api_key: Option<String>,
 
     /// Target language (full name, e.g. 中文 / English / 日本語).
     #[arg(long, default_value = "中文")]
@@ -72,22 +64,15 @@ struct Cli {
     #[arg(long)]
     limit: Option<usize>,
 
-    /// Segments per translation request when a format batches (subtitles, txt,
-    /// md, pdf). Batching keeps cross-segment context and orders the result strictly
-    /// one-to-one; the model returns one translation per segment, no merge/split.
-    /// (default: 25)
+    /// Segments per translation request when a format batches.
     #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
     subtitle_batch_size: usize,
 
-    /// Number of preceding segments sent as read-only context with each batch
-    /// (not translated, not emitted) — keeps the translation fluent across
-    /// boundaries. (default: 5)
+    /// Number of preceding segments sent as read-only context with each batch.
     #[arg(long, default_value_t = DEFAULT_CONTEXT_SEGMENTS)]
     subtitle_context: usize,
 
-    /// Disable the on-disk translation cache (retranslate everything). By
-    /// default completed translations are cached so re-runs skip them and a
-    /// Ctrl-C'd run keeps what finished.
+    /// Disable the on-disk translation cache (retranslate everything).
     #[arg(long)]
     no_cache: bool,
 
@@ -99,57 +84,19 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_REQUEST_TIMEOUT_SECONDS)]
     timeout: u64,
 
-    /// Quantized Index translation model.
-    #[arg(long, value_enum, default_value_t = Preset::Index2B)]
-    preset: Preset,
+    /// Model context window in tokens.
+    #[arg(long, default_value_t = 8192)]
+    context_length: u32,
 
-    /// Served model id (OpenAI `model` field) when NOT --serve. Defaults to the
-    /// preset's model (same id the container serves).
-    #[arg(long)]
-    model: Option<String>,
+    /// Max output tokens per request.
+    #[arg(long, default_value_t = 4096)]
+    max_output_tokens: u32,
 
-    // --- container management (self-hosted model deployment) ---
-    /// Launch & manage the orinfer container ourselves (shut it down afterwards).
-    #[arg(long)]
-    serve: bool,
-
-    /// Docker image to run when --serve.
-    #[arg(long, default_value = "ferryman-agent:standalone")]
-    image: String,
-
-    /// Host directory holding the model files (mounted into the container).
-    /// Defaults to the preset's model dir.
-    #[arg(long)]
-    host_model_dir: Option<String>,
-
-    /// Host directory for runtime caches (defaults to $MODEL_ROOT/orinfer-cache).
-    #[arg(long)]
-    host_cache_dir: Option<String>,
-
-    /// Model path inside the container.
-    /// Defaults to the preset's model.
-    #[arg(long)]
-    serve_model: Option<String>,
-
-    /// Container name (removed on exit).
-    #[arg(long, default_value = "ferryman-orinfer")]
-    container_name: String,
-
-    /// Host port to map to the container's 8088.
-    #[arg(long, default_value_t = 8088)]
-    host_port: u16,
-
-    /// Max concurrent translation requests (default: 32).
-    #[arg(long)]
-    concurrency: Option<usize>,
-
-    /// Seconds to wait for the container to become healthy.
-    #[arg(long, default_value_t = 600)]
-    health_timeout: u64,
+    /// Max concurrent translation requests.
+    #[arg(long, default_value_t = 32)]
+    concurrency: usize,
 }
 
-/// Default on-disk cache dir: `$XDG_CACHE_HOME/ferryman`, else
-/// `$HOME/.cache/ferryman`. Avoids pulling a `dirs`-style crate for one lookup.
 fn default_cache_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
         if !xdg.is_empty() {
@@ -158,16 +105,6 @@ fn default_cache_dir() -> PathBuf {
     }
     let home = std::env::var_os("HOME").unwrap_or_default();
     PathBuf::from(home).join(".cache").join("ferryman")
-}
-
-/// Default model root: `$HOME/model`. Resolved at runtime so the binary never
-/// bakes in a specific user's home path — the presets join a model subpath onto
-/// this. If `$HOME` is unset, falls back to a relative `model/` (will then fail
-/// clearly at the docker mount, which is the right place to surface it).
-fn model_root() -> String {
-    std::env::var("HOME")
-        .map(|h| format!("{h}/model"))
-        .unwrap_or_else(|_| "model".to_string())
 }
 
 #[tokio::main]
@@ -187,9 +124,6 @@ async fn main() -> Result<()> {
         cache_enabled: !cli.no_cache,
     };
 
-    // --- input enumeration ---
-    // A directory is walked recursively for supported files; a single file is
-    // processed as-is. --output (one path) can't be paired with a directory.
     if cli.input.is_dir() && cli.output.is_some() {
         anyhow::bail!(
             "--output cannot be combined with a directory input; use --in-place, \
@@ -209,47 +143,16 @@ async fn main() -> Result<()> {
         vec![cli.input.clone()]
     };
 
-    // Resolve the preset, then let any explicit --flag override it.
-    let p = cli.preset.config();
-    let host_model_dir = cli
-        .host_model_dir
-        .clone()
-        .unwrap_or_else(|| format!("{}/{}", model_root(), p.model_dir_name));
-    let host_cache_dir = cli
-        .host_cache_dir
-        .clone()
-        .unwrap_or_else(|| format!("{}/orinfer-cache", model_root()));
-    let serve_model = cli
-        .serve_model
-        .clone()
-        .unwrap_or_else(|| format!("/models/{}", p.model_dir_name));
-    let model = cli
-        .model
-        .clone()
-        .unwrap_or_else(|| cli.preset.api_model().to_string());
-    let concurrency = cli.concurrency.unwrap_or(p.concurrency);
-    let spec = container::ServeSpec {
-        image: cli.image.clone(),
-        host_model_dir,
-        host_cache_dir,
-        container_model: serve_model,
-        model: model.clone(),
-        host_port: cli.host_port,
-        container_name: cli.container_name.clone(),
-        concurrency,
-        health_timeout: cli.health_timeout,
-    };
-    // Guard stays alive until the end of main → container removed after translation
-    // (and on any error via `?`, since Drop runs on unwind/return).
-    let _guard = if cli.serve {
-        Some(container::ContainerGuard::launch(&spec).await?)
-    } else {
-        None
-    };
-    let endpoint = _guard
-        .as_ref()
-        .map(|g| g.endpoint().to_string())
-        .unwrap_or_else(|| cli.endpoint.clone());
+    let mut target = ModelTarget::from_endpoint(&cli.endpoint, &cli.model, cli.concurrency);
+    target.adapter = cli.adapter;
+    target.context_length = cli.context_length;
+    target.max_output_tokens = cli.max_output_tokens;
+    target.validate()?;
+
+    let api_key = cli
+        .api_key
+        .or_else(|| std::env::var("FERRYMAN_API_KEY").ok())
+        .filter(|key| !key.is_empty());
     let client = build_translation_client(Duration::from_secs(cli.timeout), None)?;
     let cache = if settings.cache_enabled {
         let dir = cli.cache_dir.clone().unwrap_or_else(default_cache_dir);
@@ -257,29 +160,55 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let prompt_char_budget = target.prompt_char_budget();
     let engine = Engine::new(
         client,
-        endpoint,
-        model,
+        target.base_url.clone(),
+        target.model_id.clone(),
         cli.target.clone(),
-        concurrency,
+        cli.concurrency,
         cache,
-    );
+    )
+    .with_model_target(target)
+    .with_api_key(api_key);
 
-    // --- run the queue: lazy open + shared pool + progressive write ---
-    // batch.rs opens files only as pool slots free up, and writes each file the
-    // instant it finishes (releasing its parsed IR). Memory therefore tracks the
-    // files in flight (~the concurrency window), not the whole directory.
-    let opts = BatchOpts {
-        mode: cli.mode,
-        in_place: cli.in_place,
-        output: cli.output.clone(),
-        batch_size: settings.batch_size,
-        context: settings.context_segments,
-        limit: cli.limit,
-        prompt_char_budget: cli.preset.prompt_char_budget(),
-    };
-    let summary = run_batch(&engine, inputs, opts).await;
+    let pb = ProgressBar::new(0);
+    pb.set_style(
+        ProgressStyle::with_template("  [{bar:20.cyan/blue}] {pos}/{len} ({elapsed}) {msg}")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    pb.set_message("translating");
+
+    let cancel = CancellationToken::new();
+    let signal_cancel = cancel.clone();
+    let signal_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancel.cancel();
+        }
+    });
+    let bar = pb.clone();
+    let summary = run_batch_controlled(
+        &engine,
+        inputs,
+        BatchOpts {
+            mode: cli.mode,
+            in_place: cli.in_place,
+            output: cli.output.clone(),
+            batch_size: settings.batch_size,
+            context: settings.context_segments,
+            limit: cli.limit,
+            prompt_char_budget,
+        },
+        cancel,
+        Arc::new(move |progress: BatchProgress| {
+            bar.set_length(progress.total as u64);
+            bar.set_position(progress.completed as u64);
+        }),
+    )
+    .await;
+    signal_task.abort();
+    pb.finish_and_clear();
 
     eprintln!(
         "\nbatch: {} file(s) ok, {} failed; {} segment(s) translated, {} failed{}",

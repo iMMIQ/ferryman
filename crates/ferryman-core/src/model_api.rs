@@ -6,10 +6,13 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Notify, Semaphore};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, ts_rs::TS)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum PromptAdapter {
     #[default]
+    #[cfg_attr(feature = "cli", value(name = "generic"))]
     Generic,
+    #[cfg_attr(feature = "cli", value(name = "index-translate"))]
     IndexTranslate,
 }
 
@@ -26,6 +29,21 @@ pub struct ModelTarget {
 }
 
 impl ModelTarget {
+    pub fn from_endpoint(endpoint: &str, model_id: &str, concurrency: usize) -> Self {
+        let base_url = normalize_base_url(endpoint)
+            .unwrap_or_else(|_| endpoint.trim_end_matches('/').to_string());
+        Self {
+            id: format!("endpoint:{model_id}"),
+            name: model_id.to_string(),
+            base_url,
+            model_id: model_id.to_string(),
+            adapter: PromptAdapter::Generic,
+            context_length: 8192,
+            max_output_tokens: 4096,
+            concurrency,
+        }
+    }
+
     pub fn validate(&mut self) -> Result<()> {
         self.base_url = normalize_base_url(&self.base_url)?;
         self.model_id = self.model_id.trim().to_string();

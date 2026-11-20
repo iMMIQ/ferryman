@@ -1,7 +1,6 @@
 export type { ClientConfig } from "./generated/ClientConfig";
 // Wire contracts are generated from the Rust DTOs. Only UI draft/view types live here.
 export type { StorageKind as Storage } from "./generated/StorageKind";
-export type { Preset } from "./generated/Preset";
 export type { OutputMode as Mode } from "./generated/OutputMode";
 export type { JobRecord as Job } from "./generated/JobRecord";
 export type { JobListResponse as JobPage } from "./generated/JobListResponse";

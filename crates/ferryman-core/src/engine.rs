@@ -1,11 +1,8 @@
-//! Cached translation of format-independent units through HTTP or JSONL.
-//!
-//! Both transports share the same cache/checkpoint path and prompt recovery.
-//! JSONL prepares bounded windows of units; file parsing, progress and writing
-//! belong to [`crate::batch`]. Model lifecycle belongs to the AI Pod Agent.
+//! Cached translation of format-independent units through OpenAI-compatible HTTP APIs.
 
 use crate::cache::Cache;
 use crate::format::SegmentId;
+use crate::model_api::{ModelTarget, RequestLimit};
 use crate::translate;
 use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
@@ -38,21 +35,13 @@ fn cache_scope(endpoint: &str, cues: &[&str], context: &[&str], index: Option<us
 
 pub struct Engine {
     client: reqwest::Client,
-    endpoint: String,
-    model: String,
+    model_target: ModelTarget,
     target: String,
     concurrency: usize,
     cache: Option<Cache>,
     checkpoint: Option<Cache>,
-    backend: Backend,
-    model_target: Option<crate::model_api::ModelTarget>,
     api_key: Option<String>,
-    request_limit: Option<Arc<crate::model_api::RequestLimit>>,
-}
-
-enum Backend {
-    Http,
-    Jsonl(crate::jsonl::JsonlBackend),
+    request_limit: Option<Arc<RequestLimit>>,
 }
 
 /// One self-contained unit of translation work. The caller ([`crate::batch`])
@@ -112,23 +101,21 @@ impl Engine {
         concurrency: usize,
         cache: Option<Cache>,
     ) -> Self {
+        let model_target = ModelTarget::from_endpoint(&endpoint, &model, concurrency);
         Engine {
             client,
-            endpoint,
-            model,
+            model_target,
             target,
             concurrency,
             cache,
             checkpoint: None,
-            backend: Backend::Http,
-            model_target: None,
             api_key: None,
             request_limit: None,
         }
     }
 
-    pub fn with_model_target(mut self, target: crate::model_api::ModelTarget) -> Self {
-        self.model_target = Some(target);
+    pub fn with_model_target(mut self, target: ModelTarget) -> Self {
+        self.model_target = target;
         self
     }
 
@@ -137,98 +124,9 @@ impl Engine {
         self
     }
 
-    pub fn with_request_limit(mut self, limit: Arc<crate::model_api::RequestLimit>) -> Self {
+    pub fn with_request_limit(mut self, limit: Arc<RequestLimit>) -> Self {
         self.request_limit = Some(limit);
         self
-    }
-
-    /// Model identity, concurrency and transport share a single Agent config.
-    pub fn for_agent(
-        client: reqwest::Client,
-        endpoint: String,
-        preset: crate::preset::Preset,
-        target: String,
-        cache: Option<Cache>,
-        lease_id: String,
-    ) -> Self {
-        let mut engine = Self::new(
-            client.clone(),
-            endpoint.clone(),
-            preset.api_model().into(),
-            target,
-            preset.config().concurrency,
-            cache,
-        );
-        engine.backend = Backend::Jsonl(crate::jsonl::JsonlBackend {
-            client,
-            endpoint,
-            preset,
-            lease_id,
-        });
-        engine
-    }
-
-    pub fn uses_jsonl(&self) -> bool {
-        matches!(self.backend, Backend::Jsonl(_))
-    }
-
-    /// Bound prepared requests as well as the files submitted to the Agent.
-    pub async fn exec_jsonl_units(
-        &self,
-        units: Vec<Unit>,
-        cancel: tokio_util::sync::CancellationToken,
-        mut on_done: impl FnMut(UnitDone),
-    ) {
-        let mut units = units.into_iter();
-        while !cancel.is_cancelled() {
-            let window: Vec<_> = units
-                .by_ref()
-                .take(crate::jsonl::MAX_BATCH_REQUESTS)
-                .collect();
-            if window.is_empty() {
-                break;
-            }
-            self.exec_jsonl_window(window, cancel.clone(), &mut on_done)
-                .await;
-        }
-    }
-
-    /// One immutable input file per round; retry/split requests form later
-    /// rounds. Completion callbacks keep existing progressive writes intact.
-    async fn exec_jsonl_window(
-        &self,
-        units: Vec<Unit>,
-        cancel: tokio_util::sync::CancellationToken,
-        mut on_done: impl FnMut(UnitDone),
-    ) {
-        use futures::stream::{FuturesUnordered, StreamExt};
-        let session_cancel = cancel.child_token();
-        let _cancel_on_drop = session_cancel.clone().drop_guard();
-        let Backend::Jsonl(backend) = &self.backend else {
-            unreachable!("JSONL execution needs an Agent backend");
-        };
-        let (sender, worker) = backend.start(session_cancel.clone(), units.len());
-        let mut pending: FuturesUnordered<_> = units
-            .into_iter()
-            .map(|unit| {
-                let sender = &sender;
-                async move {
-                    let unit_sender = sender.for_unit();
-                    self.exec_unit_using(unit, &translate::ChatClient::Jsonl(&unit_sender))
-                        .await
-                }
-            })
-            .collect();
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break,
-                done = pending.next() => match done { Some(done) => on_done(done), None => break },
-            }
-        }
-        drop(pending);
-        session_cancel.cancel();
-        let _ = worker.await;
     }
 
     /// Job-local progress survives retries even when shared caching is off.
@@ -269,30 +167,12 @@ impl Engine {
     /// is logged and counted (empty `pairs`), never bubbled, so one bad unit
     /// can't abort the batch.
     pub async fn exec_unit(&self, unit: Unit) -> UnitDone {
-        if self.uses_jsonl() {
-            let mut done = None;
-            self.exec_jsonl_units(
-                vec![unit],
-                tokio_util::sync::CancellationToken::new(),
-                |result| done = Some(result),
-            )
-            .await;
-            done.expect("an uncancelled unit always reports completion")
-        } else {
-            let client = match &self.model_target {
-                Some(target) => translate::ChatClient::Compatible {
-                    client: &self.client,
-                    target,
-                    api_key: self.api_key.as_deref(),
-                    limit: self.request_limit.as_ref(),
-                },
-                None => translate::ChatClient::Http(&self.client),
-            };
-            self.exec_unit_using(unit, &client).await
-        }
-    }
-
-    async fn exec_unit_using(&self, unit: Unit, client: &translate::ChatClient<'_>) -> UnitDone {
+        let client = translate::ChatClient {
+            client: &self.client,
+            target: &self.model_target,
+            api_key: self.api_key.as_deref(),
+            limit: self.request_limit.as_ref(),
+        };
         let file = unit.file();
         let single = matches!(unit, Unit::Single { .. });
         let (ids, cues, context) = match unit {
@@ -311,15 +191,17 @@ impl Engine {
             .map(|(index, text)| {
                 cache_enabled.then(|| {
                     let scope = if single {
-                        cache_scope(&self.endpoint, &[], &[], None)
+                        cache_scope(&self.model_target.base_url, &[], &[], None)
                     } else {
-                        cache_scope(&self.endpoint, &cue_refs, &ctx_refs, Some(index))
+                        cache_scope(
+                            &self.model_target.base_url,
+                            &cue_refs,
+                            &ctx_refs,
+                            Some(index),
+                        )
                     };
-                    let scope = match &self.model_target {
-                        Some(target) => format!("{}:{scope}", target.cache_identity()),
-                        None => scope,
-                    };
-                    Cache::key(&self.model, &self.target, text, &scope)
+                    let scope = format!("{}:{scope}", self.model_target.cache_identity());
+                    Cache::key(&self.model_target.model_id, &self.target, text, &scope)
                 })
             })
             .collect();
@@ -335,29 +217,14 @@ impl Engine {
             .collect();
         if !misses.is_empty() {
             let translations = if single {
-                let result = translate::translate_using(
-                    client,
-                    &self.endpoint,
-                    &self.model,
-                    &cues[0],
-                    &self.target,
-                )
-                .await;
+                let result = translate::translate_using(&client, &cues[0], &self.target).await;
                 if let Err(error) = &result {
                     tracing::warn!(segment = ids[0], %error, "segment translation failed");
                 }
                 vec![result.ok()]
             } else {
                 let texts: Vec<_> = misses.iter().map(|&index| cue_refs[index]).collect();
-                translate::translate_batch_using(
-                    client,
-                    &self.endpoint,
-                    &self.model,
-                    &texts,
-                    &ctx_refs,
-                    &self.target,
-                )
-                .await
+                translate::translate_batch_using(&client, &texts, &ctx_refs, &self.target).await
             };
             for (index, translation) in misses.into_iter().zip(translations) {
                 if let Some(translation) = translation {
@@ -415,7 +282,10 @@ mod tests {
             "/v1/chat/completions",
             post(
                 move |axum::Json(body): axum::Json<serde_json::Value>| async move {
-                    let content = body["messages"][0]["content"].as_str().unwrap().to_string();
+                    let content = body["messages"].as_array().unwrap().last().unwrap()["content"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
                     handler_prompts.lock().unwrap().push(content.clone());
                     handler_attempts.fetch_add(1, Ordering::Relaxed);
                     // Echo every <cN>…</cN> tag back with a translated marker so
@@ -439,19 +309,15 @@ mod tests {
 
         let cache_dir = std::env::temp_dir().join(format!("ferryman-cache-test-{}", uuid()));
         let cache = Cache::open(Some(cache_dir.clone())).unwrap();
+        let target = ModelTarget::from_endpoint(&format!("http://{addr}"), "model", 4);
         // Prime the cache for two of the three cues.
         for (index, text) in ["one", "two"].into_iter().enumerate() {
-            let key = Cache::key(
-                "model",
-                "target",
-                text,
-                &cache_scope(
-                    &format!("http://{addr}"),
-                    &["one", "two", "three"],
-                    &[],
-                    Some(index),
-                ),
+            let scope = format!(
+                "{}:{}",
+                target.cache_identity(),
+                cache_scope(&target.base_url, &["one", "two", "three"], &[], Some(index),)
             );
+            let key = Cache::key("model", "target", text, &scope);
             cache.put(&key, &format!("cached-{text}")).await;
         }
 

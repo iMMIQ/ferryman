@@ -8,7 +8,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferryman::engine::build_translation_client;
 use ferryman::format::OutputMode;
-use ferryman::preset::Preset;
 use ferryman::settings::{
     TranslationSettings, DEFAULT_REQUEST_TIMEOUT_SECONDS, MAX_WEB_BATCH_SIZE,
     MAX_WEB_CONTEXT_SEGMENTS,
@@ -161,7 +160,6 @@ impl JobStatus {
 struct JobRecord {
     id: Uuid,
     filename: String,
-    preset: Preset,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     model: Option<ferryman::model_api::ModelTarget>,
@@ -598,8 +596,12 @@ async fn main() -> Result<()> {
     let app = app.layer(TraceLayer::new_for_http()).with_state(state);
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!(%listen, "Ferryman Web listening");
+    let shutdown_events = shutdown_state.events.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_events.close();
+        })
         .await?;
 
     // Cancel all active jobs and drain durable writes before process exit.
@@ -693,7 +695,6 @@ mod tests {
             record: JobRecord {
                 id,
                 filename: "notes.txt".to_string(),
-                preset: Preset::Index2B,
                 model: None,
                 target: "中文".to_string(),
                 mode: OutputMode::Bilingual,
@@ -802,7 +803,6 @@ mod tests {
                 record: JobRecord {
                     id,
                     filename: "notes.txt".to_string(),
-                    preset: Preset::Index2B,
                     model: None,
                     target: "中文".to_string(),
                     mode: OutputMode::Bilingual,

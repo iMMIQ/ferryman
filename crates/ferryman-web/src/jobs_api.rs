@@ -15,7 +15,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use ferryman::batch::{is_generated_output, suffixed_output_path};
 use ferryman::format::{Format, OutputMode};
-use ferryman::preset::Preset;
 use ferryman::settings::TranslationSettings;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -40,15 +39,6 @@ pub(super) struct CreateDirectoryJobsRequest {
     #[ts(as = "Option<Vec<SourceSelection>>", optional)]
     sources: Vec<SourceSelection>,
     #[serde(default)]
-    #[ts(optional = nullable)]
-    source_storage: Option<StorageKind>,
-    #[serde(default)]
-    #[ts(as = "Option<Vec<String>>", optional)]
-    source_paths: Vec<String>,
-    #[serde(default)]
-    #[ts(optional = nullable)]
-    source_path: Option<String>,
-    #[serde(default)]
     #[ts(as = "Option<SaveStrategy>", optional)]
     save_strategy: SaveStrategy,
     #[serde(default)]
@@ -57,8 +47,6 @@ pub(super) struct CreateDirectoryJobsRequest {
     #[serde(default)]
     #[ts(optional = nullable)]
     save_path: Option<String>,
-    #[serde(default = "default_preset")]
-    preset: Preset,
     #[serde(default)]
     #[ts(optional = nullable)]
     model_id: Option<String>,
@@ -67,10 +55,6 @@ pub(super) struct CreateDirectoryJobsRequest {
     #[serde(default)]
     #[ts(as = "Option<TranslationSettings>", optional)]
     settings: TranslationSettings,
-}
-
-fn default_preset() -> Preset {
-    Preset::Index2B
 }
 
 #[derive(Serialize, ts_rs::TS)]
@@ -309,7 +293,6 @@ pub(super) async fn create_job(
 
     let upload = dir.join(".upload.tmp");
     let mut filename = None;
-    let mut preset = Preset::Index2B;
     let mut model_id: Option<String> = None;
     let mut target = "中文".to_string();
     let mut mode = OutputMode::Bilingual;
@@ -360,21 +343,6 @@ pub(super) async fn create_job(
                     }
                 };
                 match name.as_str() {
-                    "preset" => {
-                        preset = match value.as_str() {
-                            "index-translate-35b" | "30b-fp8" => Preset::Index35B,
-                            "index-translate-9b" => Preset::Index9B,
-                            "index-translate-2b" | "7b-fp8" => Preset::Index2B,
-                            _ => {
-                                return reject_upload(
-                                    &dir,
-                                    StatusCode::BAD_REQUEST,
-                                    format!("unknown model preset: {value}"),
-                                )
-                                .await
-                            }
-                        };
-                    }
                     "model_id" => {
                         model_id = Some(value);
                     }
@@ -506,7 +474,6 @@ pub(super) async fn create_job(
         record: JobRecord {
             id,
             filename,
-            preset,
             model,
             target,
             mode,
@@ -560,7 +527,6 @@ async fn prepare_document_job(
     save_path: String,
     save_storage: StorageKind,
     overwrite: bool,
-    preset: Preset,
     target: &str,
     mode: OutputMode,
     settings: TranslationSettings,
@@ -600,7 +566,6 @@ async fn prepare_document_job(
                 .file_name()
                 .map(|value| value.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "document".to_string()),
-            preset,
             model: None,
             target: target.to_string(),
             mode,
@@ -701,18 +666,6 @@ async fn directory_jobs(
         .iter()
         .map(|source| (source.storage, source.path.clone()))
         .collect();
-    if let Some(storage) = request.source_storage {
-        requested_paths.extend(
-            request
-                .source_paths
-                .iter()
-                .cloned()
-                .map(|path| (storage, path)),
-        );
-        if let Some(path) = request.source_path.as_deref() {
-            requested_paths.push((storage, path.to_string()));
-        }
-    }
     requested_paths.sort();
     requested_paths.dedup();
     if requested_paths.is_empty() {
@@ -914,7 +867,6 @@ async fn directory_jobs(
             save_path,
             save_storage,
             request.save_strategy == SaveStrategy::SiblingOverwrite,
-            request.preset,
             target,
             request.mode,
             settings,

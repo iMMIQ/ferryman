@@ -6,16 +6,18 @@ license.workspace = true
 repository.workspace = true
 description = "Core document parsing, batching and translation engine for Ferryman"
 
+[features]
+default = []
+cli = ["dep:clap"]
+
 [dependencies]
 anyhow.workspace = true
 backon.workspace = true
-clap.workspace = true
+clap = { workspace = true, optional = true }
 futures.workspace = true
 hex.workspace = true
-hmac.workspace = true
 html-escape.workspace = true
 httpdate.workspace = true
-indicatif.workspace = true
 lol_html.workspace = true
 lopdf.workspace = true
 pdf-extract.workspace = true
@@ -28,7 +30,6 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 subsetter.workspace = true
-subtle.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

@@ -163,18 +163,9 @@ async fn invalid_fonts_never_call_the_model_and_docx_replace_works_in_mixed_batc
     server.abort();
 }
 
-#[cfg(unix)]
 #[test]
-fn invalid_cli_formats_and_directory_options_do_not_start_containers() {
-    use std::os::unix::fs::PermissionsExt;
+fn invalid_cli_formats_and_directory_options_fail_before_translation() {
     let root = tempfile::tempdir().unwrap();
-    let docker = root.path().join("docker");
-    fs::write(
-        &docker,
-        "#!/bin/sh\ntouch \"$PREFLIGHT_FIXTURE/docker-called\"\nexit 1\n",
-    )
-    .unwrap();
-    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
     let source = root.path().join("input.rtf");
     fs::write(&source, "unsupported document").unwrap();
     for args in [
@@ -195,23 +186,9 @@ fn invalid_cli_formats_and_directory_options_do_not_start_containers() {
         ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_ferryman"))
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    root.path().display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .env("PREFLIGHT_FIXTURE", root.path())
-            .arg("--serve")
             .args(args)
             .output()
             .unwrap();
         assert!(!output.status.success());
-        assert!(
-            !root.path().join("docker-called").exists(),
-            "invalid CLI options started a model container"
-        );
     }
 }

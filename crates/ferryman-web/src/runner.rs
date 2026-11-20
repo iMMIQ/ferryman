@@ -329,7 +329,6 @@ mod tests {
 
     use crate::{now_epoch_seconds, JobRecord, StorageKind};
     use ferryman::format::OutputMode;
-    use ferryman::preset::Preset;
     use ferryman::settings::TranslationSettings;
     use std::env;
 
@@ -385,7 +384,6 @@ mod tests {
             record: JobRecord {
                 id: Uuid::new_v4(),
                 filename: "notes.txt".to_string(),
-                preset: Preset::Index2B,
                 model: None,
                 target: "中文".to_string(),
                 mode: OutputMode::Bilingual,
@@ -459,7 +457,6 @@ mod tests {
             record: JobRecord {
                 id: Uuid::new_v4(),
                 filename: "notes.txt".to_string(),
-                preset: Preset::Index2B,
                 model: None,
                 target: "中文".to_string(),
                 mode: OutputMode::Bilingual,

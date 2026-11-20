@@ -8,6 +8,7 @@ use serde::Serialize;
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
@@ -26,16 +27,24 @@ pub(crate) enum JobEventKind {
 #[derive(Clone)]
 pub(crate) struct JobEventHub {
     tx: broadcast::Sender<JobEvent>,
+    shutdown: CancellationToken,
 }
 
 impl Default for JobEventHub {
     fn default() -> Self {
         let (tx, _) = broadcast::channel(512);
-        Self { tx }
+        Self {
+            tx,
+            shutdown: CancellationToken::new(),
+        }
     }
 }
 
 impl JobEventHub {
+    pub(crate) fn close(&self) {
+        self.shutdown.cancel();
+    }
+
     pub(crate) fn emit_updated(&self, owner: &str, job: &JobRecord) {
         let _ = self.tx.send(JobEvent {
             owner: owner.to_string(),
@@ -62,25 +71,33 @@ pub(super) async fn job_events(
     identity: UserIdentity,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.events.subscribe();
+    let shutdown = state.events.shutdown.clone();
     let owner = identity.owner;
-    let stream = futures::stream::unfold((rx, owner), |(mut rx, owner)| async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) if event.owner == owner => {
-                    if let Ok(data) = serde_json::to_string(&event.kind) {
-                        let sse = Event::default().event("job").data(data);
-                        return Some((Ok(sse), (rx, owner)));
+    let stream = futures::stream::unfold(
+        (rx, shutdown, owner),
+        |(mut rx, shutdown, owner)| async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return None,
+                    result = rx.recv() => match result {
+                        Ok(event) if event.owner == owner => {
+                            if let Ok(data) = serde_json::to_string(&event.kind) {
+                                let sse = Event::default().event("job").data(data);
+                                return Some((Ok(sse), (rx, shutdown, owner)));
+                            }
+                        }
+                        Ok(_) => continue,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let sse = Event::default().event("resync").data("{}");
+                            return Some((Ok(sse), (rx, shutdown, owner)));
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return None,
                     }
                 }
-                Ok(_) => continue,
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let sse = Event::default().event("resync").data("{}");
-                    return Some((Ok(sse), (rx, owner)));
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
             }
-        }
-    });
+        },
+    );
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(20))

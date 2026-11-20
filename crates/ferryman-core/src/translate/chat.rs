@@ -1,33 +1,17 @@
-//! Chat transport and completion validation shared by HTTP and JSONL.
-use super::adapter::{build_compatible_request, strategy_for, Message};
+//! Unified OpenAI-compatible HTTP chat transport and completion validation.
+use super::adapter::{build_compatible_request, strategy_for};
 use crate::http_client::{is_transient_status, parse_retry_after};
-use serde::{Deserialize, Serialize};
+use crate::model_api::{chat_url, ModelTarget, RequestLimit};
+use serde::Deserialize;
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
 
-pub(crate) enum ChatClient<'a> {
-    Http(&'a reqwest::Client),
-    Compatible {
-        client: &'a reqwest::Client,
-        target: &'a crate::model_api::ModelTarget,
-        api_key: Option<&'a str>,
-        limit: Option<&'a std::sync::Arc<crate::model_api::RequestLimit>>,
-    },
-    Jsonl(&'a crate::jsonl::JsonlSender),
-}
-
-#[derive(Serialize)]
-pub(super) struct ChatReq<'a> {
-    model: &'a str,
-    messages: Vec<Message<'a>>,
-    temperature: f32,
-    top_p: f32,
-    top_k: i32,
-    repetition_penalty: f32,
-    enable_thinking: bool,
-    // Orinfer derives the output budget from the remaining context (up to 8192 tokens).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
+pub(crate) struct ChatClient<'a> {
+    pub(crate) client: &'a reqwest::Client,
+    pub(crate) target: &'a ModelTarget,
+    pub(crate) api_key: Option<&'a str>,
+    pub(crate) limit: Option<&'a Arc<RequestLimit>>,
 }
 
 #[derive(Deserialize)]
@@ -44,24 +28,6 @@ struct Choice {
 #[derive(Deserialize)]
 struct RespMsg {
     pub(super) content: Option<String>,
-}
-
-impl<'a> ChatReq<'a> {
-    pub(super) fn translation(model: &'a str, prompt: String) -> Self {
-        Self {
-            model,
-            messages: vec![Message {
-                role: "user",
-                content: prompt,
-            }],
-            temperature: 0.0,
-            top_p: 1.0,
-            top_k: 0,
-            repetition_penalty: 1.0,
-            enable_thinking: false,
-            max_tokens: None,
-        }
-    }
 }
 
 pub(super) enum ChatAttempt {
@@ -87,87 +53,27 @@ impl ChatAttempt {
 
 impl ChatClient<'_> {
     pub(super) fn single_prompt(&self, text: &str, target: &str) -> String {
-        match self {
-            Self::Compatible { target: model, .. } => {
-                strategy_for(model.adapter).single_prompt(text, target)
-            }
-            Self::Http(_) | Self::Jsonl(_) => {
-                strategy_for(crate::model_api::PromptAdapter::Generic).single_prompt(text, target)
-            }
-        }
+        strategy_for(self.target.adapter).single_prompt(text, target)
     }
 
     pub(super) fn batch_prompt(&self, cues: &[&str], context: &[&str], target: &str) -> String {
-        match self {
-            Self::Compatible { target: model, .. } => {
-                strategy_for(model.adapter).batch_prompt(cues, context, target)
-            }
-            Self::Http(_) | Self::Jsonl(_) => super::build_batch_prompt(cues, context, target),
-        }
+        strategy_for(self.target.adapter).batch_prompt(cues, context, target)
     }
 
-    pub(super) async fn post(&self, url: &str, body: &ChatReq<'_>) -> ChatAttempt {
+    pub(super) async fn post(&self, prompt: String) -> ChatAttempt {
         // A lease covers an actual HTTP attempt, including its response body.
         // Backoff does not occupy a slot; cancellation drops the lease.
-        let _permit = match self {
-            Self::Compatible {
-                limit: Some(limit), ..
-            } => Some(limit.acquire().await),
-            _ => None,
+        let _permit = match self.limit {
+            Some(limit) => Some(limit.acquire().await),
+            None => None,
         };
-        match self {
-            Self::Http(client) => send_http_request(client.post(url).json(body)).await,
-            Self::Compatible {
-                client,
-                target,
-                api_key,
-                ..
-            } => {
-                let prompt = body
-                    .messages
-                    .last()
-                    .map(|msg| msg.content.clone())
-                    .unwrap_or_default();
-                let payload = build_compatible_request(target, prompt);
-                let request_url = format!("{}/chat/completions", target.base_url);
-                let mut req = client.post(&request_url).json(&payload);
-                if let Some(key) = api_key.filter(|k| !k.is_empty()) {
-                    req = req.bearer_auth(key);
-                }
-                send_http_request(req).await
-            }
-            Self::Jsonl(sender) => {
-                let reply = match sender
-                    .chat(serde_json::to_value(body).expect("serialize chat request"))
-                    .await
-                {
-                    Ok(reply) => reply,
-                    Err(error) => return ChatAttempt::transient(error),
-                };
-                if let Some(error) = reply.error {
-                    let message = format!("{}: {}", error.code, error.message);
-                    return if is_context_overflow(&message) {
-                        ChatAttempt::Fatal {
-                            error: message,
-                            overflow: true,
-                        }
-                    } else {
-                        ChatAttempt::transient(message)
-                    };
-                }
-                let Some(response) = reply.response else {
-                    return ChatAttempt::transient("missing batch response");
-                };
-                let status = match reqwest::StatusCode::from_u16(response.status_code) {
-                    Ok(status) => status,
-                    Err(error) => return ChatAttempt::transient(error),
-                };
-                if let Some(outcome) = classify_status(status, &response.body, None) {
-                    return outcome;
-                }
-                decode(response.body)
-            }
+        let payload = build_compatible_request(self.target, prompt);
+        let request_url = chat_url(&self.target.base_url);
+        let mut req = self.client.post(&request_url).json(&payload);
+        if let Some(key) = self.api_key.filter(|k| !k.is_empty()) {
+            req = req.bearer_auth(key);
         }
+        send_http_request(req).await
     }
 }
 

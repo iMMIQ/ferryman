@@ -7,7 +7,6 @@ import type { Job } from "../lib/types";
 import {
   phases,
   pathLabel,
-  modelNames,
   time,
   statusLabel,
   errorText,
@@ -72,7 +71,7 @@ const fields = computed(() =>
     ? {
         文件名: job.value.filename,
         状态: statusLabel(job.value),
-        模型: job.value.model?.name || modelNames[job.value.preset],
+        模型: job.value.model?.name || "未配置模型",
         目标语言: job.value.target,
         输出方式: job.value.mode === "replace" ? "仅译文" : "双语对照",
         来源:
@@ -212,7 +211,7 @@ async function remove() {
             </td>
             <td>
               <span class="model-chip">{{
-                item.model?.name || modelNames[item.preset]
+                item.model?.name || "未配置模型"
               }}</span>
             </td>
             <td><StatusBadge :job="item" /></td>
@@ -246,9 +245,7 @@ async function remove() {
           {{ item.filename }}
         </button>
         <div class="card-meta">
-          <span
-            >{{ item.target }} ·
-            {{ item.model?.name || modelNames[item.preset] }}</span
+          <span>{{ item.target }} · {{ item.model?.name || "未配置模型" }}</span
           ><StatusBadge :job="item" />
         </div>
         <p v-if="item.error" class="job-error-summary">{{ item.error }}</p>

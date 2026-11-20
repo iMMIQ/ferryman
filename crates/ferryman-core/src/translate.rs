@@ -5,18 +5,17 @@ use std::time::Duration;
 
 mod adapter;
 mod chat;
+use chat::ChatAttempt;
 pub(crate) use chat::ChatClient;
-use chat::{ChatAttempt, ChatReq};
 
 pub(crate) const TRANSLATION_CACHE_VERSION: &str = "v3-index-orinfer";
 
-/// Translate `text` into `target_lang` with Index translation models.
+/// Translate `text` into `target_lang` through an OpenAI-compatible model.
 ///
 /// Retries a few times on transient HTTP / parse errors. A segment longer
 /// than the model's whole context window is split in half at a language
 /// boundary and each half translated separately (mirroring the batch path's
-/// overflow recovery), because dropping every long paragraph of a novel is
-/// exactly the failure mode the batch path already learned to avoid.
+/// overflow recovery).
 pub async fn translate(
     client: &reqwest::Client,
     endpoint: &str,
@@ -24,10 +23,14 @@ pub async fn translate(
     text: &str,
     target_lang: &str,
 ) -> Result<String> {
+    let target = crate::model_api::ModelTarget::from_endpoint(endpoint, model, 1);
     translate_using(
-        &ChatClient::Http(client),
-        endpoint,
-        model,
+        &ChatClient {
+            client,
+            target: &target,
+            api_key: None,
+            limit: None,
+        },
         text,
         target_lang,
     )
@@ -36,12 +39,10 @@ pub async fn translate(
 
 pub(crate) async fn translate_using(
     client: &ChatClient<'_>,
-    endpoint: &str,
-    model: &str,
     text: &str,
     target_lang: &str,
 ) -> Result<String> {
-    translate_single(client, endpoint, model, text, target_lang, 0).await
+    translate_single(client, text, target_lang, 0).await
 }
 
 /// Split budget for [`translate`]'s overflow recovery. Each level halves the
@@ -54,8 +55,6 @@ const SINGLE_MIN_SPLIT_CHARS: usize = 64;
 
 async fn translate_single(
     client: &ChatClient<'_>,
-    endpoint: &str,
-    model: &str,
     text: &str,
     target_lang: &str,
     depth: u32,
@@ -64,17 +63,13 @@ async fn translate_single(
     let trimmed = text.trim();
     let prompt = client.single_prompt(trimmed, target_lang);
 
-    let body = ChatReq::translation(model, prompt);
-
-    let url = crate::model_api::chat_url(endpoint);
-
     let mut last_err = String::new();
     let mut retry_after = None;
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
             backoff(attempt, retry_after).await;
         }
-        match client.post(&url, &body).await {
+        match client.post(prompt.clone()).await {
             ChatAttempt::Success(content) => return Ok(content.trim().to_string()),
             ChatAttempt::Transient {
                 error,
@@ -97,24 +92,10 @@ async fn translate_single(
                     );
                     // `Box::pin`: a recursive async fn's future would otherwise
                     // be infinitely sized (see `translate_split`).
-                    let left = Box::pin(translate_single(
-                        client,
-                        endpoint,
-                        model,
-                        &left,
-                        target_lang,
-                        depth + 1,
-                    ))
-                    .await?;
-                    let right = Box::pin(translate_single(
-                        client,
-                        endpoint,
-                        model,
-                        &right,
-                        target_lang,
-                        depth + 1,
-                    ))
-                    .await?;
+                    let left =
+                        Box::pin(translate_single(client, &left, target_lang, depth + 1)).await?;
+                    let right =
+                        Box::pin(translate_single(client, &right, target_lang, depth + 1)).await?;
                     let separator = if trimmed.chars().any(char::is_whitespace)
                         && !left.ends_with(char::is_whitespace)
                         && !right.starts_with(char::is_whitespace)
@@ -190,10 +171,14 @@ pub async fn translate_batch(
     context: &[&str],
     target_lang: &str,
 ) -> Vec<Option<String>> {
+    let target = crate::model_api::ModelTarget::from_endpoint(endpoint, model, 1);
     translate_batch_using(
-        &ChatClient::Http(client),
-        endpoint,
-        model,
+        &ChatClient {
+            client,
+            target: &target,
+            api_key: None,
+            limit: None,
+        },
         cues,
         context,
         target_lang,
@@ -203,31 +188,17 @@ pub async fn translate_batch(
 
 pub(crate) async fn translate_batch_using(
     client: &ChatClient<'_>,
-    endpoint: &str,
-    model: &str,
     cues: &[&str],
     context: &[&str],
     target_lang: &str,
 ) -> Vec<Option<String>> {
-    translate_split(client, endpoint, model, cues, context, target_lang).await
+    translate_split(client, cues, context, target_lang).await
 }
 
 /// Translate a slice of cues, halving it whenever the batch comes back missing
-/// ≥2 cues. Two failure modes trigger a split, both cured by smaller batches:
-/// the prompt overflowing the context window (input too long — every cue lost),
-/// or the model's output being truncated before every `<cN>` tag closes (it then
-/// drops the trailing cues). A single missing cue is left as-is — that's the
-/// by-design "one bad cue costs only itself" case, not worth a split. Each half
-/// is a fresh tagged batch with its own `<c1>…` numbering; the results are
-/// concatenated in order, so the caller's positional alignment (`trs[idx]` ↔
-/// cue `idx`) is preserved.
-///
-/// A lone oversized or truncated cue falls back to the bounded single-text
-/// splitter. Failed recovery leaves that cue untranslated.
+/// ≥2 cues.
 async fn translate_split(
     client: &ChatClient<'_>,
-    endpoint: &str,
-    model: &str,
     cues: &[&str],
     context: &[&str],
     target_lang: &str,
@@ -235,55 +206,17 @@ async fn translate_split(
     let SliceOutcome {
         translations,
         overflow,
-    } = translate_one_batch(client, endpoint, model, cues, context, target_lang).await;
+    } = translate_one_batch(client, cues, context, target_lang).await;
     let missing = cues.len() - translations.iter().filter(|t| t.is_some()).count();
     if missing >= 2 && cues.len() > 1 {
-        // The batch came back missing ≥2 cues. Two causes, both fixed by halving
-        // the slice so each side has more room: either the prompt overflowed the
-        // context window (`overflow` — input too long, every cue lost), or the
-        // model's output was truncated before every `<cN>` tag closed and it
-        // dropped the trailing cues. (A single missing cue is left as-is — that's
-        // the by-design "one bad cue costs only itself" case, not worth a split.)
-        // Each half is a fresh tagged batch with its own `<c1>…` numbering and
-        // reuses the same read-only `context` (the right half sees slightly older
-        // narrative, fine for fluency).
         let mid = cues.len() / 2;
         let (left, right) = cues.split_at(mid);
-        // `Box::pin` the recursive calls: a recursive `async fn`'s future would
-        // otherwise be infinitely sized (its size nests its own recursive
-        // future). Boxing makes it an opaque heap pointer.
-        let mut out = Box::pin(translate_split(
-            client,
-            endpoint,
-            model,
-            left,
-            context,
-            target_lang,
-        ))
-        .await;
-        out.extend(
-            Box::pin(translate_split(
-                client,
-                endpoint,
-                model,
-                right,
-                context,
-                target_lang,
-            ))
-            .await,
-        );
+        let mut out = Box::pin(translate_split(client, left, context, target_lang)).await;
+        out.extend(Box::pin(translate_split(client, right, context, target_lang)).await);
         out
     } else if overflow && cues.len() == 1 {
-        // Recover a single oversized/truncated cue using the bounded text
-        // splitter. Never accept a partial tagged response as a translation.
-        vec![
-            translate_using(client, endpoint, model, cues[0], target_lang)
-                .await
-                .ok(),
-        ]
+        vec![translate_using(client, cues[0], target_lang).await.ok()]
     } else {
-        // Complete, or ≤1 cue missing (a degenerate cue the model refused — kept
-        // original; already warned by `translate_one_batch` if it dropped all).
         translations
     }
 }
@@ -334,16 +267,11 @@ async fn backoff(attempt: u32, retry_after: Option<Duration>) {
 /// caller handles it).
 async fn translate_one_batch(
     client: &ChatClient<'_>,
-    endpoint: &str,
-    model: &str,
     cues: &[&str],
     context: &[&str],
     target_lang: &str,
 ) -> SliceOutcome {
     let prompt = client.batch_prompt(cues, context, target_lang);
-    let body = ChatReq::translation(model, prompt);
-
-    let url = crate::model_api::chat_url(endpoint);
 
     let mut best: Vec<Option<String>> = (0..cues.len()).map(|_| None).collect();
     let mut best_count = 0;
@@ -355,7 +283,7 @@ async fn translate_one_batch(
         if attempt > 0 {
             backoff(attempt, retry_after).await;
         }
-        match client.post(&url, &body).await {
+        match client.post(prompt.clone()).await {
             ChatAttempt::Success(content) => {
                 let parsed = parse_tagged(&content, cues.len());
                 let count = parsed.iter().filter(|x| x.is_some()).count();
@@ -545,7 +473,13 @@ mod tests {
                 let seen = seen.clone();
                 async move {
                     seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let prompt = body["messages"][0]["content"].as_str().unwrap();
+                    let prompt = body["messages"]
+                        .as_array()
+                        .unwrap()
+                        .last()
+                        .unwrap()["content"]
+                        .as_str()
+                        .unwrap();
                     let tagged = prompt.contains("<c1>");
                     let truncated = prompt.len() > 600 || prompt.contains("<c2>");
                     let content = if truncated { "BAD PARTIAL" } else if tagged { "<c1>complete</c1>" } else { "complete" };
@@ -761,7 +695,14 @@ mod tests {
             "/v1/chat/completions",
             axum::routing::post(
                 move |axum::Json(body): axum::Json<serde_json::Value>| async move {
-                    let content_len = body["messages"][0]["content"].as_str().unwrap().len();
+                    let content_len = body["messages"]
+                        .as_array()
+                        .unwrap()
+                        .last()
+                        .unwrap()["content"]
+                        .as_str()
+                        .unwrap()
+                        .len();
                     handler_requests.lock().unwrap().push(content_len);
                     if content_len > 600 {
                         // vLLM's context-length overflow 400.

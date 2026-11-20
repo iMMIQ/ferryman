@@ -138,11 +138,6 @@ a {
   font-size: var(--text-sm);
   overflow-wrap: anywhere;
 }
-.eyebrow {
-  display: block;
-  color: var(--muted);
-  font-size: var(--text-sm);
-}
 .notice {
   display: flex;
   flex-wrap: wrap;

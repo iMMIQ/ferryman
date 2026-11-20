@@ -29,8 +29,20 @@ use std::path::Path;
 
 pub mod ass;
 pub mod lrc;
-pub mod srt;
-pub mod vtt;
+
+/// Marker type for the SubRip (`.srt`) timed-cue grammar.
+pub struct Srt;
+
+impl SubFormat for Srt {
+    const NAME: &'static str = "srt";
+}
+
+/// Marker type for the WebVTT (`.vtt`) timed-cue grammar.
+pub struct Vtt;
+
+impl SubFormat for Vtt {
+    const NAME: &'static str = "vtt";
+}
 
 /// One subtitle cue as parsed from the source.
 ///
@@ -366,7 +378,7 @@ Second cue.
     #[test]
     fn segments_skip_passthrough_and_empty() {
         // cue index 0 = WEBVTT (passthrough), 1 = real, 2 = NOTE, 3 = real.
-        let doc = SubtitleDoc::<vtt::Vtt> {
+        let doc = SubtitleDoc::<Vtt> {
             cues: parse_timed(VTT_SAMPLE).unwrap(),
             _fmt: PhantomData,
         };

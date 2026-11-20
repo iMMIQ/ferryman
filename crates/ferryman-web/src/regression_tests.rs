@@ -40,7 +40,6 @@ pub(super) fn entry_at(base: &FsPath, status: JobStatus) -> JobEntry {
         record: JobRecord {
             id: Uuid::new_v4(),
             filename: "x.txt".into(),
-            preset: Preset::Index2B,
             model: None,
             target: "中文".into(),
             mode: OutputMode::Bilingual,

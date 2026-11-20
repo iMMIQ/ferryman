@@ -3,14 +3,13 @@ use super::jobs_api::JobPhase;
 use super::{now_epoch_seconds, JobEntry, JobRecord, JobStatus, StorageKind};
 use anyhow::{Context, Result};
 use ferryman::format::OutputMode;
-use ferryman::preset::Preset;
 use ferryman::settings::TranslationSettings;
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Clone)]
 pub(crate) struct JobStore {
@@ -62,38 +61,21 @@ impl JobStore {
                     connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
                 if version == 0 {
                     create_schema(connection)?;
-                } else if version == 1 {
-                    migrate_index_presets(connection)?;
-                } else if version != 2 && version != 3 && version != SCHEMA_VERSION {
+                } else if version != SCHEMA_VERSION {
                     anyhow::bail!(
                         "unsupported job database schema {version}; expected {SCHEMA_VERSION}"
                     );
                 }
-                let has_model: bool = connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('jobs') WHERE name='model_json')", [], |row| row.get(0))?;
-                if !has_model { connection.execute_batch("ALTER TABLE jobs ADD COLUMN model_json TEXT;")?; }
-                connection.execute_batch("CREATE TABLE IF NOT EXISTS model_sources (
-                    owner TEXT NOT NULL, id TEXT NOT NULL, source TEXT NOT NULL, definition TEXT NOT NULL,
-                    PRIMARY KEY(owner,id));")?;
                 connection.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS submissions (
-                    owner TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL,
-                    response TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY(owner, id));",
-                )?;
-                let has_sub_created: bool = connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('submissions') WHERE name='created_at')",
-                    [],
-                    |row| row.get(0),
-                )?;
-                if !has_sub_created {
-                    connection.execute_batch(
-                        "ALTER TABLE submissions ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;",
-                    )?;
-                }
-                connection.execute_batch(
-                    "CREATE INDEX IF NOT EXISTS submissions_created_idx ON submissions(created_at);
-                     PRAGMA user_version=4;",
+                    "CREATE TABLE IF NOT EXISTS model_sources (
+                        owner TEXT NOT NULL, id TEXT NOT NULL, source TEXT NOT NULL, definition TEXT NOT NULL,
+                        PRIMARY KEY(owner,id));
+                     CREATE TABLE IF NOT EXISTS submissions (
+                        owner TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL,
+                        response TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(owner, id));
+                     CREATE INDEX IF NOT EXISTS submissions_created_idx ON submissions(created_at);
+                     PRAGMA user_version=5;",
                 )?;
                 Ok(())
             })
@@ -238,19 +220,19 @@ impl JobStore {
             for entry in entries {
             transaction.execute(
                 "INSERT INTO jobs (
-                    id, owner, filename, preset, target_language, output_mode, status,
+                    id, owner, filename, target_language, output_mode, status,
                     total, completed, translated, failed_segments, error,
                     batch_size, context_segments, cache_enabled, result_available,
                     source_path, source_storage, save_path, save_storage,
                     job_dir, input_path, output_path, save_to, save_root, overwrite,
                     created_at, updated_at, model_json
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                    ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, ?16,
-                    ?17, ?18, ?19, ?20,
-                    ?21, ?22, ?23, ?24, ?25, ?26,
-                    ?27, ?28, ?29
+                    ?1, ?2, ?3, ?4, ?5, ?6,
+                    ?7, ?8, ?9, ?10, ?11,
+                    ?12, ?13, ?14, ?15,
+                    ?16, ?17, ?18, ?19,
+                    ?20, ?21, ?22, ?23, ?24, ?25,
+                    ?26, ?27, ?28
                  )",
                 rusqlite::params_from_iter(entry_params(&entry)?),
             )?;
@@ -271,14 +253,14 @@ impl JobStore {
         self.call(move |connection| {
             let changed = connection.execute(
                 "UPDATE jobs SET
-                    owner=?2, filename=?3, preset=?4, target_language=?5,
-                    output_mode=?6, status=?7, total=?8, completed=?9,
-                    translated=?10, failed_segments=?11, error=?12,
-                    batch_size=?13, context_segments=?14, cache_enabled=?15,
-                    result_available=?16, source_path=?17, source_storage=?18,
-                    save_path=?19, save_storage=?20, job_dir=?21, input_path=?22,
-                    output_path=?23, save_to=?24, save_root=?25, overwrite=?26,
-                    created_at=?27, updated_at=?28, model_json=?29
+                    owner=?2, filename=?3, target_language=?4,
+                    output_mode=?5, status=?6, total=?7, completed=?8,
+                    translated=?9, failed_segments=?10, error=?11,
+                    batch_size=?12, context_segments=?13, cache_enabled=?14,
+                    result_available=?15, source_path=?16, source_storage=?17,
+                    save_path=?18, save_storage=?19, job_dir=?20, input_path=?21,
+                    output_path=?22, save_to=?23, save_root=?24, overwrite=?25,
+                    created_at=?26, updated_at=?27, model_json=?28
                  WHERE id=?1",
                 rusqlite::params_from_iter(entry_params(&entry)?),
             )?;
@@ -565,7 +547,6 @@ fn create_schema(connection: &Connection) -> Result<()> {
             id TEXT PRIMARY KEY NOT NULL,
             owner TEXT NOT NULL,
             filename TEXT NOT NULL,
-            preset TEXT NOT NULL,
             target_language TEXT NOT NULL,
             output_mode TEXT NOT NULL,
             status TEXT NOT NULL,
@@ -590,7 +571,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
             overwrite INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
-            CHECK (preset IN ('index-translate-2b', 'index-translate-9b', 'index-translate-35b', '7b-fp8', '30b-fp8')),
+            model_json TEXT,
             CHECK (output_mode IN ('bilingual', 'replace')),
             CHECK (status IN ('queued', 'starting_model', 'translating', 'writing', 'completed', 'failed', 'cancelled')),
             CHECK (source_storage IS NULL OR source_storage IN ('documents', 'remote_fs')),
@@ -600,31 +581,9 @@ fn create_schema(connection: &Connection) -> Result<()> {
          CREATE INDEX jobs_status_created_idx ON jobs(status, created_at, id);
          CREATE INDEX jobs_owner_status_created_idx
             ON jobs(owner, status, created_at DESC, id DESC);
-         PRAGMA user_version=2;
+         PRAGMA user_version=5;
          COMMIT;",
     )?;
-    Ok(())
-}
-
-fn migrate_index_presets(connection: &mut Connection) -> Result<()> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let original: String = transaction.query_row(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'",
-        [],
-        |row| row.get(0),
-    )?;
-    let schema = format!("CREATE TABLE jobs_v2 {}", &original[original.find('(').context("invalid jobs schema")?..])
-        .replace("CHECK (preset IN ('7b-fp8', '30b-fp8'))", "CHECK (preset IN ('index-translate-2b', 'index-translate-9b', 'index-translate-35b', '7b-fp8', '30b-fp8'))");
-    transaction.execute_batch(&schema)?;
-    transaction.execute_batch("INSERT INTO jobs_v2 SELECT * FROM jobs;
-        UPDATE jobs_v2 SET preset=CASE preset WHEN '7b-fp8' THEN 'index-translate-2b' WHEN '30b-fp8' THEN 'index-translate-35b' ELSE preset END;
-        DROP TABLE jobs;
-        ALTER TABLE jobs_v2 RENAME TO jobs;
-        CREATE INDEX jobs_owner_created_idx ON jobs(owner, created_at DESC, id DESC);
-        CREATE INDEX jobs_status_created_idx ON jobs(status, created_at, id);
-        CREATE INDEX jobs_owner_status_created_idx ON jobs(owner, status, created_at DESC, id DESC);
-        PRAGMA user_version=2;")?;
-    transaction.commit()?;
     Ok(())
 }
 
@@ -651,7 +610,6 @@ fn entry_params(entry: &JobEntry) -> Result<Vec<rusqlite::types::Value>> {
         SqlValue::Text(entry.record.id.to_string()),
         SqlValue::Text(entry.owner.clone()),
         SqlValue::Text(entry.record.filename.clone()),
-        SqlValue::Text(entry.record.preset.as_str().to_string()),
         SqlValue::Text(entry.record.target.clone()),
         SqlValue::Text(entry.record.mode.as_str().to_string()),
         SqlValue::Text(entry.record.status.as_str().to_string()),
@@ -703,17 +661,10 @@ fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<JobEntry> {
             Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
         )
     };
-    let preset_value: String = row.get("preset")?;
-    let preset = match preset_value.as_str() {
-        "index-translate-2b" | "7b-fp8" => Preset::Index2B,
-        "index-translate-35b" | "30b-fp8" => Preset::Index35B,
-        "index-translate-9b" => Preset::Index9B,
-        _ => return Err(parse_error(3, format!("invalid preset {preset_value}"))),
-    };
     let mode_value: String = row.get("output_mode")?;
-    let mode = OutputMode::from_str(&mode_value).map_err(|error| parse_error(5, error))?;
+    let mode = OutputMode::from_str(&mode_value).map_err(|error| parse_error(4, error))?;
     let status_value: String = row.get("status")?;
-    let status = JobStatus::from_str(&status_value).map_err(|error| parse_error(6, error))?;
+    let status = JobStatus::from_str(&status_value).map_err(|error| parse_error(5, error))?;
     let source_storage = row
         .get::<_, Option<String>>("source_storage")?
         .map(|value| StorageKind::from_str(&value).map_err(|error| parse_error(17, error)))
@@ -737,7 +688,6 @@ fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<JobEntry> {
         record: JobRecord {
             id,
             filename: row.get("filename")?,
-            preset,
             model: row
                 .get::<_, Option<String>>("model_json")?
                 .map(|value| {
@@ -821,7 +771,6 @@ mod tests {
             record: JobRecord {
                 id,
                 filename: "notes.txt".to_string(),
-                preset: Preset::Index2B,
                 model: None,
                 target: "中文".to_string(),
                 mode: OutputMode::Bilingual,
@@ -847,63 +796,6 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ferryman-store-test-{}", Uuid::new_v4()));
         let store = JobStore::open(root.join("jobs.sqlite3")).await.unwrap();
         (root, store)
-    }
-
-    #[tokio::test]
-    async fn migrates_legacy_model_presets_and_accepts_all_index_sizes() {
-        let (root, store) = test_store().await;
-        let small = Uuid::new_v4();
-        let large = Uuid::new_v4();
-        store
-            .insert(test_entry("alice", small, 10, JobStatus::Queued), 10)
-            .await
-            .unwrap();
-        let mut entry = test_entry("alice", large, 11, JobStatus::Completed);
-        entry.record.preset = Preset::Index35B;
-        store.insert(entry, 10).await.unwrap();
-        store.call(|connection| {
-            connection.execute_batch("UPDATE jobs SET preset=CASE preset WHEN 'index-translate-2b' THEN '7b-fp8' ELSE '30b-fp8' END;")?;
-            let schema: String = connection.query_row("SELECT sql FROM sqlite_master WHERE name='jobs'", [], |row| row.get(0))?;
-            let legacy = schema.replace("CREATE TABLE jobs", "CREATE TABLE legacy_jobs")
-                .replace("CHECK (preset IN ('index-translate-2b', 'index-translate-9b', 'index-translate-35b', '7b-fp8', '30b-fp8'))", "CHECK (preset IN ('7b-fp8', '30b-fp8'))");
-            connection.execute_batch(&legacy)?;
-            connection.execute_batch("INSERT INTO legacy_jobs SELECT * FROM jobs; DROP TABLE jobs; ALTER TABLE legacy_jobs RENAME TO jobs; PRAGMA user_version=1;")?;
-            Ok(())
-        }).await.unwrap();
-        drop(store);
-        let store = JobStore::open(root.join("jobs.sqlite3")).await.unwrap();
-        assert_eq!(
-            store
-                .get("alice".into(), small)
-                .await
-                .unwrap()
-                .unwrap()
-                .record
-                .preset,
-            Preset::Index2B
-        );
-        assert_eq!(
-            store
-                .get("alice".into(), large)
-                .await
-                .unwrap()
-                .unwrap()
-                .record
-                .preset,
-            Preset::Index35B
-        );
-        let mut entry = test_entry("alice", Uuid::new_v4(), 12, JobStatus::Queued);
-        entry.record.preset = Preset::Index9B;
-        store.insert(entry, 10).await.unwrap();
-        assert_eq!(
-            store
-                .list_page("alice".into(), None, None, 50)
-                .await
-                .unwrap()
-                .total,
-            3
-        );
-        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[tokio::test]

@@ -21,7 +21,6 @@ use crate::engine::{Engine, Unit, UnitDone};
 use crate::format::{Document, Format, OutputMode, Segment, SegmentId, Strategy};
 use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -96,14 +95,6 @@ struct WriteOutcome {
 /// Run a whole batch through one shared concurrency pool with lazy file opening
 /// and progressive writing. See the module docs.
 pub async fn run_batch(engine: &Engine, inputs: Vec<PathBuf>, opts: BatchOpts) -> BatchSummary {
-    let pb = ProgressBar::new(0);
-    pb.set_style(
-        ProgressStyle::with_template("  [{bar:20.cyan/blue}] {pos}/{len} ({elapsed}) {msg}")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    pb.set_message("translating");
-
     let cancel = CancellationToken::new();
     let signal_cancel = cancel.clone();
     let signal_task = tokio::spawn(async move {
@@ -111,14 +102,12 @@ pub async fn run_batch(engine: &Engine, inputs: Vec<PathBuf>, opts: BatchOpts) -
             signal_cancel.cancel();
         }
     });
-    let summary = run_batch_impl(engine, inputs, opts, cancel, Some(pb), None).await;
+    let summary = run_batch_impl(engine, inputs, opts, cancel, None).await;
     signal_task.abort();
     summary
 }
 
 /// Run a batch under application-level cancellation and progress reporting.
-/// This is used by the Web job runner; unlike [`run_batch`], it has no terminal
-/// UI and never installs a process-wide Ctrl-C handler.
 pub async fn run_batch_controlled(
     engine: &Engine,
     inputs: Vec<PathBuf>,
@@ -126,7 +115,7 @@ pub async fn run_batch_controlled(
     cancel: CancellationToken,
     on_progress: ProgressCallback,
 ) -> BatchSummary {
-    run_batch_impl(engine, inputs, opts, cancel, None, Some(on_progress)).await
+    run_batch_impl(engine, inputs, opts, cancel, Some(on_progress)).await
 }
 
 async fn run_batch_impl(
@@ -134,7 +123,6 @@ async fn run_batch_impl(
     inputs: Vec<PathBuf>,
     opts: BatchOpts,
     cancel: CancellationToken,
-    pb: Option<ProgressBar>,
     on_progress: Option<ProgressCallback>,
 ) -> BatchSummary {
     let concurrency = engine.concurrency().max(1);
@@ -146,7 +134,6 @@ async fn run_batch_impl(
         next_file_idx: 0,
         write_tasks: JoinSet::new(),
         budget: None, // initialized from opts below
-        pb,
         on_progress,
         progress: BatchProgress::default(),
         translated: 0,
@@ -157,28 +144,6 @@ async fn run_batch_impl(
     };
     // Carry the global segment budget through each sequential lazy parse.
     state.budget = state.opts.limit;
-
-    if engine.uses_jsonl() {
-        // Retain one document's IR; the engine prepares bounded JSONL windows.
-        // Parsing, completion accounting and writing use the same state as HTTP.
-        while let Some(parse) = state.next_parse() {
-            let prepared = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break,
-                prepared = parse => prepared,
-            };
-            state.accept_parsed(prepared);
-            let mut units = Vec::new();
-            while let Some(unit) = state.next_unit() {
-                units.push(unit);
-            }
-            engine
-                .exec_jsonl_units(units, cancel.clone(), |done| state.on_done(done))
-                .await;
-        }
-        state.cancelled = cancel.is_cancelled();
-        return state.finish().await;
-    }
 
     let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
     let mut parsing = JoinSet::new();
@@ -307,7 +272,6 @@ struct BatchState {
     next_file_idx: usize,
     write_tasks: JoinSet<WriteOutcome>,
     budget: Option<usize>,
-    pb: Option<ProgressBar>,
     on_progress: Option<ProgressCallback>,
     progress: BatchProgress,
     translated: usize,
@@ -365,9 +329,6 @@ impl BatchState {
     fn accept_file(&mut self, fidx: usize, file: OpenFile) {
         let added = file.pending.iter().map(Unit::attempted).sum::<usize>();
         self.progress.total += added;
-        if let Some(pb) = &self.pb {
-            pb.inc_length(added as u64);
-        }
         self.report_progress();
         if file.pending.is_empty() {
             self.spawn_write(file);
@@ -376,12 +337,9 @@ impl BatchState {
         }
     }
 
-    /// A unit finished: route its pairs, advance the bar, and write the file if
+    /// A unit finished: route its pairs, advance progress, and write the file if
     /// it just completed.
     fn on_done(&mut self, done: UnitDone) {
-        if let Some(pb) = &self.pb {
-            pb.inc(done.attempted as u64);
-        }
         self.translated += done.pairs.len();
         self.failed += done.attempted - done.pairs.len();
         self.progress.completed += done.attempted;
@@ -464,9 +422,6 @@ impl BatchState {
                     tracing::error!(error = %join_err, "write task join failed");
                 }
             }
-        }
-        if let Some(pb) = &self.pb {
-            pb.finish_and_clear();
         }
         self.report_progress();
         BatchSummary {
@@ -760,7 +715,6 @@ mod tests {
             opts,
             CancellationToken::new(),
             None,
-            None,
         )
         .await;
         assert_eq!(summary.failed_files.len(), 1);
@@ -809,7 +763,6 @@ mod tests {
             opts.clone(),
             CancellationToken::new(),
             None,
-            None,
         )
         .await;
         assert_eq!(
@@ -835,7 +788,7 @@ mod tests {
         });
         let summary = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            run_batch_impl(&engine, inputs, opts, cancel, None, None),
+            run_batch_impl(&engine, inputs, opts, cancel, None),
         )
         .await
         .unwrap();

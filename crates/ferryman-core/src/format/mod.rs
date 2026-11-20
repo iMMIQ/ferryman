@@ -14,9 +14,7 @@ use crate::format::md::MdDoc;
 use crate::format::pdf::PdfDoc;
 use crate::format::subtitle::ass::Ass;
 use crate::format::subtitle::lrc::Lrc;
-use crate::format::subtitle::srt::Srt;
-use crate::format::subtitle::vtt::Vtt;
-use crate::format::subtitle::SubtitleDoc;
+use crate::format::subtitle::{Srt, SubtitleDoc, Vtt};
 use crate::format::txt::TxtDoc;
 use anyhow::{anyhow, Result};
 use std::path::Path;
@@ -41,17 +39,15 @@ pub struct Segment {
 }
 
 /// How translations are written back.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Deserialize, serde::Serialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, ts_rs::TS)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
-#[derive(ts_rs::TS)]
 pub enum OutputMode {
     /// Keep the original and add the translation alongside (bilingual).
-    #[value(name = "bilingual")]
+    #[cfg_attr(feature = "cli", value(name = "bilingual"))]
     Bilingual,
     /// Replace the original text with the translation.
-    #[value(name = "replace")]
+    #[cfg_attr(feature = "cli", value(name = "replace"))]
     Replace,
 }
 

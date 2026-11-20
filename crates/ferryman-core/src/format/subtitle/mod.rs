@@ -1,4 +1,4 @@
-//! Subtitle backend family — SRT, VTT, and (later) ASS/LRC.
+//! Subtitle backend family — SRT, VTT, ASS/SSA, and LRC.
 //!
 //! Subtitles are NOT translated cue-by-cue: each cue is short and only makes
 //! sense in the flow around it, so sending one line per request would starve

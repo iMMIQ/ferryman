@@ -62,7 +62,7 @@ const MAX_ACTIVE_JOBS: usize = 8;
 /// Hard cap on the streamed `file` field. The route disables the axum body
 /// limit so uploads stream to disk, so this is the real enforcement point.
 const MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
-/// Cap for scalar multipart fields (`preset`, `target`, ...). Without it a
+/// Cap for scalar multipart fields (`model_id`, `target`, ...). Without it a
 /// client could buffer an unbounded "target" value in memory.
 const MAX_TEXT_FIELD_BYTES: usize = 8 * 1024;
 const DEFAULT_JOB_PAGE_SIZE: usize = 50;

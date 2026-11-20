@@ -1,5 +1,5 @@
 //! Queue-to-worker scheduling: picks queued jobs and dispatches them with
-//! preset/output exclusivity constraints.
+//! output-path exclusivity constraints.
 
 use super::{claim_queued_job, mutate_job, AppState, JobStatus, MAX_ACTIVE_JOBS};
 use crate::runner::run_job;

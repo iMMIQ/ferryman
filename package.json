@@ -6,12 +6,13 @@
     "dev": "bun --bun vite --host 0.0.0.0",
     "build": "bun --bun vue-tsc --noEmit && bun --bun vite build",
     "typecheck": "bun --bun vue-tsc --noEmit",
-    "test:unit": "bun test tests/frontend.test.ts tests/dependency-age.test.ts",
+    "test:unit": "bun test tests/frontend.test.ts tests/dependency-age.test.ts tests/docs-check.test.ts",
     "test:smoke": "bun --bun playwright test --project=smoke",
-    "format": "bun --bun prettier --write web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs playwright.config.ts scripts/check-generated-types.mjs scripts/check-dependency-age.mjs tests/dependency-age.test.ts",
-    "format:check": "bun --bun prettier --check web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs playwright.config.ts scripts/check-generated-types.mjs scripts/check-dependency-age.mjs tests/dependency-age.test.ts",
+    "format": "bun --bun prettier --write web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs playwright.config.ts scripts/check-generated-types.mjs scripts/check-dependency-age.mjs scripts/check-docs.mjs tests/dependency-age.test.ts tests/docs-check.test.ts",
+    "format:check": "bun --bun prettier --check web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs playwright.config.ts scripts/check-generated-types.mjs scripts/check-dependency-age.mjs scripts/check-docs.mjs tests/dependency-age.test.ts tests/docs-check.test.ts",
     "types:generate": "rm -rf web/src/lib/generated && cargo test -p ferryman-web --all-targets export_frontend_types -- --ignored",
     "types:check": "bun scripts/check-generated-types.mjs",
+    "docs:check": "bun scripts/check-docs.mjs",
     "deps:check-age": "bun scripts/check-dependency-age.mjs"
   },
   "devDependencies": {

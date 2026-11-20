@@ -1,18 +1,37 @@
-import { reactive, ref, computed, watch, nextTick } from "vue";
+import {
+  reactive,
+  ref,
+  computed,
+  watch,
+  nextTick,
+  onMounted,
+  onUnmounted,
+} from "vue";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/vue-query";
 import { api } from "../lib/api";
 import { errorText, phase } from "../lib/format";
 import type { Job, JobPage, Phase } from "../lib/types";
+
+const MAX_BY_ID_ENTRIES = 200;
+
+type JobStreamEvent =
+  { type: "updated"; job: Job } | { type: "deleted"; id: string };
+
 export function useJobs() {
   const client = useQueryClient();
   const selectedPhase = ref<Phase>("all");
   const cursors = ref<(string | null)[]>([null]);
+  const sseConnected = ref(false);
   const listKey = computed(() => [
     "jobs",
     "list",
     selectedPhase.value,
     cursors.value.at(-1),
   ]);
+  const isFirstAllPage = computed(
+    () => selectedPhase.value === "all" && cursors.value.at(-1) === null,
+  );
+
   const list = useQuery({
     queryKey: listKey,
     queryFn: ({ signal, queryKey }) => {
@@ -21,20 +40,33 @@ export function useJobs() {
       if (queryKey[3]) query.set("cursor", queryKey[3]);
       return api<JobPage>(`/api/jobs?${query}`, { signal });
     },
-    // Reconcile even jobs that finish entirely between two active polls.
-    refetchInterval: (query) => (query.state.status === "error" ? 2500 : 10000),
+    // Reconcile even jobs that finish between active polls; slow down when SSE is live.
+    refetchInterval: (query) => {
+      if (query.state.status === "error") return 2500;
+      return sseConnected.value ? 30000 : 10000;
+    },
   });
   const recent = useQuery({
     queryKey: ["jobs", "list", "all", null],
     queryFn: ({ signal }) => api<JobPage>("/api/jobs?", { signal }),
-    refetchInterval: (query) => (query.state.status === "error" ? 2500 : 10000),
+    enabled: computed(() => !isFirstAllPage.value),
+    refetchInterval: (query) => {
+      if (query.state.status === "error") return 2500;
+      return sseConnected.value ? 30000 : 10000;
+    },
   });
   const active = useQuery({
     queryKey: ["jobs", "active"],
     queryFn: ({ signal }) =>
       api<{ jobs: Job[] }>("/api/jobs/active", { signal }),
-    refetchInterval: 2500,
+    refetchInterval: (query) => {
+      if (query.state.status === "error") return 2500;
+      const hasActive = (query.state.data?.jobs.length ?? 0) > 0;
+      if (sseConnected.value) return hasActive ? 15000 : 30000;
+      return hasActive ? 2500 : 10000;
+    },
   });
+
   const state = reactive({
     get jobs() {
       const live = new Map(
@@ -48,16 +80,20 @@ export function useJobs() {
       const live = new Map(
         active.data.value?.jobs.map((job) => [job.id, job]) ?? [],
       );
-      return (recent.data.value?.jobs ?? [])
-        .slice(0, 3)
-        .map((job) => live.get(job.id) ?? job);
+      const source = isFirstAllPage.value
+        ? list.data.value?.jobs
+        : recent.data.value?.jobs;
+      return (source ?? []).slice(0, 3).map((job) => live.get(job.id) ?? job);
     },
     byId: {} as Record<string, Job>,
     get recentLoaded() {
-      return !!recent.data.value;
+      return isFirstAllPage.value ? !!list.data.value : !!recent.data.value;
     },
     get recentError() {
-      const error = recent.error.value || active.error.value;
+      const baseError = isFirstAllPage.value
+        ? list.error.value
+        : recent.error.value;
+      const error = baseError || active.error.value;
       return error ? errorText(error) : "";
     },
     get loaded() {
@@ -93,17 +129,86 @@ export function useJobs() {
     pending: {} as Record<string, boolean>,
     errors: {} as Record<string, string>,
   });
+
+  function rememberJobs(items: Job[]) {
+    for (const job of items) state.byId[job.id] = job;
+    const keys = Object.keys(state.byId);
+    if (keys.length > MAX_BY_ID_ENTRIES) {
+      const keep = new Set([
+        ...(list.data.value?.jobs.map((j) => j.id) ?? []),
+        ...(active.data.value?.jobs.map((j) => j.id) ?? []),
+      ]);
+      for (const id of keys) {
+        if (!keep.has(id) && Object.keys(state.byId).length > MAX_BY_ID_ENTRIES)
+          delete state.byId[id];
+      }
+    }
+  }
+
+  function applyStreamEvent(event: JobStreamEvent) {
+    if (event.type === "deleted") {
+      delete state.byId[event.id];
+      void client.invalidateQueries({ queryKey: ["jobs"] });
+      return;
+    }
+    const job = event.job;
+    const previous = state.byId[job.id];
+    rememberJobs([job]);
+    const isTerminal = ["completed", "failed", "cancelled"].includes(
+      job.status,
+    );
+    client.setQueryData<{ jobs: Job[] }>(["jobs", "active"], (current) => {
+      if (!current) return current;
+      const without = current.jobs.filter((item) => item.id !== job.id);
+      return { jobs: isTerminal ? without : [job, ...without] };
+    });
+    if (!previous || phase(previous) !== phase(job) || isTerminal) {
+      void client.invalidateQueries({ queryKey: ["jobs", "list"] });
+    }
+  }
+
+  let eventSource: EventSource | null = null;
+  onMounted(() => {
+    if (typeof EventSource === "undefined") return;
+    try {
+      eventSource = new EventSource("/api/jobs/events");
+      eventSource.onopen = () => {
+        sseConnected.value = true;
+      };
+      eventSource.onerror = () => {
+        sseConnected.value = false;
+      };
+      eventSource.addEventListener("job", (message) => {
+        try {
+          applyStreamEvent(JSON.parse((message as MessageEvent).data));
+        } catch {
+          // Ignore malformed event payloads.
+        }
+      });
+      eventSource.addEventListener("resync", () => {
+        void client.invalidateQueries({ queryKey: ["jobs"] });
+      });
+    } catch {
+      sseConnected.value = false;
+    }
+  });
+  onUnmounted(() => {
+    eventSource?.close();
+    eventSource = null;
+    sseConnected.value = false;
+  });
+
   watch(list.data, (page) => {
     if (!page) return;
     if (!page.jobs.length && cursors.value.length > 1) cursors.value.pop();
-    for (const job of page.jobs) state.byId[job.id] = job;
+    rememberJobs(page.jobs);
   });
   watch(recent.data, (page) => {
-    for (const job of page?.jobs ?? []) state.byId[job.id] = job;
+    if (page?.jobs) rememberJobs(page.jobs);
   });
   watch(active.data, (current, previous) => {
     if (!current) return;
-    for (const job of current.jobs) state.byId[job.id] = job;
+    rememberJobs(current.jobs);
     const live = new Map(current.jobs.map((job) => [job.id, job]));
     const changed = previous?.jobs.some(
       (job) => !live.has(job.id) || phase(job) !== phase(live.get(job.id)!),

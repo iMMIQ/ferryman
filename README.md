@@ -157,13 +157,14 @@ preview, request races and per-job mutation locks. CI also runs strict frontend
 formatting, request-layer tests, the real-server smoke test and Rust tests.
 
 Frontend code is split by domain under `web/src`: `useJobs`, `useSubmission`,
-`useFolder`, and `useRuntime` own state; components render that state. Desktop
+`useFolder`, and `useModels` own state; components render that state. Desktop
 tables and mobile cards share actions and progress components. `lib/api.ts`
 centralizes Fetch timeouts/errors. Vue Query owns query keys, cancellation,
-request deduplication, polling and invalidation; polling pauses when the page is
-hidden. Mutations are not automatically retried, and business-level per-job locks
-prevent duplicate actions. Request snapshots and overwrite acknowledgement remain
-in `useSubmission`.
+request deduplication, polling and invalidation; `/api/jobs/events` streams
+real-time per-user Server-Sent Events (SSE) with adaptive polling fallback, and
+polling pauses when the page is hidden. Mutations are not automatically retried,
+and business-level per-job locks prevent duplicate actions. Request snapshots
+and overwrite acknowledgement remain in `useSubmission`.
 
 Wire types in `web/src/lib/generated` are generated from Rust with ts-rs; do not
 edit them manually. Run `bun run types:generate` after changing a DTO and include
@@ -221,7 +222,11 @@ refreshes show warnings and preserve previously discovered records. Discovery
 metadata is a candidate catalogue, not proof of Chat compatibility.
 
 API Keys are stored in the backend's owner-scoped SQLite configuration and are
-never returned by catalogue or job APIs. The database is mode `0600`. Job records
+never returned by catalogue or job APIs. The database is mode `0600`, and setting
+`FERRYMAN_SECRET_KEY` enables application-layer ChaCha20-Poly1305 encryption for
+stored API Keys at rest (legacy plaintext keys remain readable). `/healthz` and
+`/api/healthz` expose SQLite health checks, and `FERRYMAN_CACHE_MAX_BYTES` /
+`FERRYMAN_CACHE_TTL_SECONDS` bound per-user shared cache growth. Job records
 pin the model ID, base URL, adapter and token budgets; credentials are resolved
 for the same owner and destination. Moving an API to another URL does not reuse
 its saved key. Removing a connection or changing its destination requires
@@ -336,6 +341,16 @@ EPUB supports `--mode replace` (仅译文). It replaces translated leaf text whi
 preserving chapter markup, links, images, styles and archive assets; missing
 translations retain their original text. Inline styling is distributed across
 the translated text by the relative lengths of the original text runs.
+
+DOCX also supports `--mode replace` in the CLI, uploads and mounted-file jobs.
+It replaces body paragraph text across existing runs, retaining paragraph/run
+styles, links, bookmarks, images, tables and text boxes. Tabs and line breaks
+from translations become Word controls; untranslated paragraphs and non-body
+parts (including headers, footers and footnotes) remain unchanged.
+
+PDF font files, including configured fallbacks, are loaded and validated when
+opening the document. Missing glyphs in the actual translated text still require
+an appropriate fallback font.
 
 ## Resumability & interruption
 

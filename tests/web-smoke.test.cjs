@@ -243,6 +243,75 @@ test("built frontend uses real Rust config, storage, preview and job lifecycle A
     assert.equal(seen.at(-1).max_tokens, 1024);
     assert.equal(seen.at(-1).enable_thinking, undefined);
     assert.equal(seen.at(-1).top_k, undefined);
+    // Stored ZIP fixture: one Word body paragraph containing "Hello from DOCX".
+    const docx = Buffer.from(
+      "UEsDBBQAAAAAAAAAIQAVlbo5oQAAAKEAAAARAAAAd29yZC9kb2N1bWVudC54bWw8dzpkb2N1bWVudCB4bWxuczp3PSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvd29yZHByb2Nlc3NpbmdtbC8yMDA2L21haW4iPjx3OmJvZHk+PHc6cD48dzpyPjx3OnQ+SGVsbG8gZnJvbSBET0NYPC93OnQ+PC93OnI+PC93OnA+PC93OmJvZHk+PC93OmRvY3VtZW50PlBLAQIUAxQAAAAAAAAAIQAVlbo5oQAAAKEAAAARAAAAAAAAAAAAAACAAQAAAAB3b3JkL2RvY3VtZW50LnhtbFBLBQYAAAAAAQABAD8AAADQAAAAAAA=",
+      "base64",
+    );
+    await fs.writeFile(
+      path.join(documents, "local-development-user", "smoke.docx"),
+      docx,
+    );
+    const form = new FormData();
+    form.set("model_id", modelId);
+    form.set("target", "中文");
+    form.set("mode", "replace");
+    form.set("file", new Blob([docx]), "uploaded.docx");
+    const uploadedDocx = await fetch(`${origin}/api/jobs`, {
+      method: "POST",
+      body: form,
+    });
+    assert.equal(uploadedDocx.status, 201);
+    const uploadedDocxId = (await uploadedDocx.json()).id;
+    const selection = {
+      sources: [{ storage: "documents", path: "smoke.docx" }],
+      save_strategy: "sibling_suffix",
+      model_id: modelId,
+      target: "中文",
+      mode: "replace",
+    };
+    const docxPreview = await fetch(`${origin}/api/jobs/selection/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(selection),
+    });
+    assert.equal(docxPreview.status, 200);
+    const eligibleDocx = await docxPreview.json();
+    assert.equal(eligibleDocx.eligible_count, 1);
+    assert.equal(eligibleDocx.skipped_incompatible, 0);
+    assert.equal(eligibleDocx.files[0].skip_reason, null);
+    const mountedDocx = await fetch(`${origin}/api/jobs/selection`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(selection),
+    });
+    assert.equal(mountedDocx.status, 201);
+    const mountedDocxId = (await mountedDocx.json()).jobs[0].id;
+    for (const id of [uploadedDocxId, mountedDocxId]) {
+      await expect
+        .poll(
+          async () =>
+            (await (await fetch(`${origin}/api/jobs/${id}`)).json()).status,
+        )
+        .toBe("completed");
+      const download = await fetch(`${origin}/api/jobs/${id}/result`);
+      assert.equal(download.status, 200);
+      const output = Buffer.from(await download.arrayBuffer());
+      assert.equal(output.subarray(0, 4).toString("hex"), "504b0304");
+      assert(output.includes(Buffer.from("已翻译")));
+      assert(!output.includes(Buffer.from("Hello from DOCX")));
+      if (id === mountedDocxId)
+        assert.deepEqual(
+          output,
+          await fs.readFile(
+            path.join(
+              documents,
+              "local-development-user",
+              "smoke.translated.docx",
+            ),
+          ),
+        );
+    }
     assert.deepEqual(errors, []);
   } finally {
     if (child.exitCode === null && !spawnError) {

@@ -18,13 +18,13 @@ RUN apk add --no-cache musl-dev gcc binutils
 WORKDIR /app
 COPY .cargo .cargo
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY crates ./crates
 
 FROM rust-source AS web-binary
 ARG TARGETARCH
 RUN --mount=type=cache,id=ferryman-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=ferryman-target-${TARGETARCH},target=/app/target,sharing=locked \
-    cargo build --release --locked --no-default-features --bin ferryman-web \
+    cargo build --release --locked --no-default-features -p ferryman-web --bin ferryman-web \
     && mkdir /out && cp target/release/ferryman-web /out/ && strip /out/ferryman-web
 
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS web

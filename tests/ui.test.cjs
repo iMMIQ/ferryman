@@ -131,10 +131,10 @@ async function withPage(
               skip_reason: null,
             },
             {
-              source_path: "Books/manual.docx",
-              save_path: "Books/manual.docx",
+              source_path: "Books/already.translated.txt",
+              save_path: "Books/already.translated.txt",
               overwrite: true,
-              skip_reason: "DOCX 仅支持双语对照",
+              skip_reason: "已生成的译文，不重复翻译",
             },
           ],
         };
@@ -144,7 +144,7 @@ async function withPage(
           await route.abort("failed");
           return;
         }
-        data = { jobs: [{ id: "created" }], skipped_incompatible: 1 };
+        data = { jobs: [{ id: "created" }], skipped_generated: 1 };
       } else if (u.pathname === "/api/jobs") {
         if (state.invalidUpload) {
           await route.fulfill({
@@ -254,6 +254,7 @@ test("focused composer collapses uploads and restores keyboard focus after remov
     ).toHaveCount(1);
     await expect(page.locator(".page-heading p")).toHaveCount(0);
     await expect(page.locator(".jobs-workspace")).not.toBeVisible();
+    await page.locator('input[name="mode"][value="replace"]').check();
     await page.locator("#file-input").setInputFiles([
       {
         name: "first.epub",
@@ -267,7 +268,9 @@ test("focused composer collapses uploads and restores keyboard focus after remov
       },
     ]);
     await expect(page.locator("#drop-zone")).toHaveCount(0);
-    await expect(page.locator("#mode-hint")).toHaveText("DOCX 仅支持双语对照");
+    await expect(
+      page.locator('input[name="mode"][value="replace"]'),
+    ).toBeChecked();
     const remove = page.getByRole("button", {
       name: "移除 first.epub",
       exact: true,
@@ -460,8 +463,8 @@ test("multi-file validation and upload preview submit each selected file", async
     await expect(page.locator("#upload-validation")).toContainText(/不支持/);
     await expect(
       page.locator('input[name="mode"][value="replace"]'),
-    ).toBeDisabled();
-    await expect(page.locator("#mode-hint")).toBeVisible();
+    ).toBeEnabled();
+    await page.locator('input[name="mode"][value="replace"]').check();
     await page.locator("#submit-job").click();
     await page.locator("#submission-dialog").waitFor();
     await expect(page.locator("#submission-summary")).toContainText(/2 个任务/);
@@ -470,7 +473,10 @@ test("multi-file validation and upload preview submit each selected file", async
     await page.waitForFunction(
       () => !document.querySelector("#submit-job").disabled,
     );
-    assert.equal(state.posts.filter((p) => p.path === "/api/jobs").length, 2);
+    const uploads = state.posts.filter((p) => p.path === "/api/jobs");
+    assert.equal(uploads.length, 2);
+    for (const upload of uploads)
+      assert.match(upload.body, /name="mode"\r\n\r\nreplace/);
     await expect(page.locator("#upload-list li")).toHaveCount(0);
     await expect(page.locator(".submission-success")).toContainText(
       "已加入 2 个任务",
@@ -518,7 +524,7 @@ test("mounted preview shows skipped files and requires overwrite acknowledgement
     await page.locator("#submit-job").click();
     await page.locator("#submission-dialog").waitFor();
     await expect(page.locator("#submission-files")).toContainText(
-      /DOCX 仅支持/,
+      /已生成的译文/,
     );
     await expect(page.locator("#confirm-submit")).toBeDisabled();
     assert.equal(

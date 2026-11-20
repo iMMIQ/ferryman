@@ -8,5 +8,5 @@ icon: ./icon.png
 images:
   ferryman-web:
     context: ./
-    dockerfile: ./Dockerfile.web
+    dockerfile: ./docker/Dockerfile.lzc
     builder: local

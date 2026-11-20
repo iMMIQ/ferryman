@@ -36,6 +36,6 @@ done
 bun install --frozen-lockfile
 bun run build
 cp -R dist/web "$STAGE/assets"
-build_binary "$STAGE/ferryman-web" --no-default-features --features lazycat
+build_binary "$STAGE/ferryman-web" -p ferryman-web --no-default-features --features lazycat
 python3 scripts/check-artifacts.py write web "$STAGE"
 publish_stage

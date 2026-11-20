@@ -10,7 +10,7 @@
     "test:smoke": "bun --bun playwright test --project=smoke",
     "format": "bun --bun prettier --write web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs playwright.config.ts scripts/check-generated-types.mjs scripts/check-dependency-age.mjs tests/dependency-age.test.ts",
     "format:check": "bun --bun prettier --check web/src web/index.html vite.config.ts tsconfig.json tests/ui.test.cjs tests/frontend.test.ts tests/web-smoke.test.cjs playwright.config.ts scripts/check-generated-types.mjs scripts/check-dependency-age.mjs tests/dependency-age.test.ts",
-    "types:generate": "cargo test --all-targets export_frontend_types -- --ignored",
+    "types:generate": "rm -rf web/src/lib/generated && cargo test -p ferryman-web --all-targets export_frontend_types -- --ignored",
     "types:check": "bun scripts/check-generated-types.mjs",
     "deps:check-age": "bun scripts/check-dependency-age.mjs"
   },

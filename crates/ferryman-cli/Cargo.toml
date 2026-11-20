@@ -1,0 +1,25 @@
+[package]
+name = "ferryman-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line interface for Ferryman multi-format translation"
+
+[[bin]]
+name = "ferryman"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ferryman = { path = "../ferryman-core" }
+tokio.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+lopdf.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+zip.workspace = true

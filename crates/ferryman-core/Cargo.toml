@@ -1,0 +1,48 @@
+[package]
+name = "ferryman"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core document parsing, batching and translation engine for Ferryman"
+
+[dependencies]
+anyhow.workspace = true
+backon.workspace = true
+clap.workspace = true
+futures.workspace = true
+hex.workspace = true
+hmac.workspace = true
+html-escape.workspace = true
+httpdate.workspace = true
+indicatif.workspace = true
+lol_html.workspace = true
+lopdf.workspace = true
+pdf-extract.workspace = true
+percent-encoding.workspace = true
+pulldown-cmark.workspace = true
+reqwest.workspace = true
+roxmltree.workspace = true
+rustybuzz.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subsetter.workspace = true
+subtle.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+ts-rs.workspace = true
+ttf-parser.workspace = true
+unicode-bidi.workspace = true
+unicode-linebreak.workspace = true
+unicode-script.workspace = true
+unicode-segmentation.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+krilla.workspace = true

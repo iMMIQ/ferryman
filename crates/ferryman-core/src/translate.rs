@@ -1,0 +1,826 @@
+//! OpenAI-compatible translation client with model-specific prompt adapters.
+
+use anyhow::{anyhow, Result};
+use std::time::Duration;
+
+mod adapter;
+mod chat;
+pub(crate) use chat::ChatClient;
+use chat::{ChatAttempt, ChatReq};
+
+pub(crate) const TRANSLATION_CACHE_VERSION: &str = "v3-index-orinfer";
+
+/// Translate `text` into `target_lang` with Index translation models.
+///
+/// Retries a few times on transient HTTP / parse errors. A segment longer
+/// than the model's whole context window is split in half at a language
+/// boundary and each half translated separately (mirroring the batch path's
+/// overflow recovery), because dropping every long paragraph of a novel is
+/// exactly the failure mode the batch path already learned to avoid.
+pub async fn translate(
+    client: &reqwest::Client,
+    endpoint: &str,
+    model: &str,
+    text: &str,
+    target_lang: &str,
+) -> Result<String> {
+    translate_using(
+        &ChatClient::Http(client),
+        endpoint,
+        model,
+        text,
+        target_lang,
+    )
+    .await
+}
+
+pub(crate) async fn translate_using(
+    client: &ChatClient<'_>,
+    endpoint: &str,
+    model: &str,
+    text: &str,
+    target_lang: &str,
+) -> Result<String> {
+    translate_single(client, endpoint, model, text, target_lang, 0).await
+}
+
+/// Split budget for [`translate`]'s overflow recovery. Each level halves the
+/// text, so 6 levels admit a segment up to ~64× the context window before
+/// giving up (by then the halves are tiny and something else is wrong).
+const SINGLE_MAX_SPLIT_DEPTH: u32 = 6;
+/// Don't recurse below this many characters — halves this small aren't worth
+/// two more requests, and the model can't be overflowed by them anyway.
+const SINGLE_MIN_SPLIT_CHARS: usize = 64;
+
+async fn translate_single(
+    client: &ChatClient<'_>,
+    endpoint: &str,
+    model: &str,
+    text: &str,
+    target_lang: &str,
+    depth: u32,
+) -> Result<String> {
+    // Trim leading/trailing whitespace; keep internal structure as-is.
+    let trimmed = text.trim();
+    let prompt = client.single_prompt(trimmed, target_lang);
+
+    let body = ChatReq::translation(model, prompt);
+
+    let url = crate::model_api::chat_url(endpoint);
+
+    let mut last_err = String::new();
+    let mut retry_after = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            backoff(attempt, retry_after).await;
+        }
+        match client.post(&url, &body).await {
+            ChatAttempt::Success(content) => return Ok(content.trim().to_string()),
+            ChatAttempt::Transient {
+                error,
+                retry_after: server,
+            } => {
+                last_err = error;
+                retry_after = server;
+            }
+            ChatAttempt::Fatal { error, overflow } => {
+                if overflow
+                    && depth < SINGLE_MAX_SPLIT_DEPTH
+                    && trimmed.chars().count() >= SINGLE_MIN_SPLIT_CHARS
+                {
+                    let Some((left, right)) = split_at_language_boundary(trimmed) else {
+                        return Err(anyhow!("translation failed (overflow): {error}"));
+                    };
+                    tracing::warn!(
+                        chars = trimmed.chars().count(),
+                        "segment overflows context window; splitting in half"
+                    );
+                    // `Box::pin`: a recursive async fn's future would otherwise
+                    // be infinitely sized (see `translate_split`).
+                    let left = Box::pin(translate_single(
+                        client,
+                        endpoint,
+                        model,
+                        &left,
+                        target_lang,
+                        depth + 1,
+                    ))
+                    .await?;
+                    let right = Box::pin(translate_single(
+                        client,
+                        endpoint,
+                        model,
+                        &right,
+                        target_lang,
+                        depth + 1,
+                    ))
+                    .await?;
+                    let separator = if trimmed.chars().any(char::is_whitespace)
+                        && !left.ends_with(char::is_whitespace)
+                        && !right.starts_with(char::is_whitespace)
+                    {
+                        " "
+                    } else {
+                        ""
+                    };
+                    return Ok(format!("{left}{separator}{right}"));
+                }
+                return Err(anyhow!("translation failed (fatal response): {error}"));
+            }
+        }
+    }
+    Err(anyhow!("translation failed after retries: {}", last_err))
+}
+
+/// Split `text` in half at the nearest language boundary to the midpoint
+/// (whitespace or sentence/clause punctuation), so no word or sentence is cut
+/// in two. The boundary character stays at the end of the left half, so the
+/// concatenation of the two translated halves reads naturally. Returns `None`
+/// when the text has no usable boundary anywhere (a single unbroken run).
+fn split_at_language_boundary(text: &str) -> Option<(String, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mid = chars.len() / 2;
+    const BOUNDARIES: &[char] = &[
+        ' ', '\t', '\n', '\r', '.', '!', '?', ';', ':', ',', '，', '。', '！', '？', '；', '：',
+        '、',
+    ];
+    // Scan outward from the midpoint for the closest boundary character.
+    let boundary = (0..mid.max(chars.len() - mid))
+        .find_map(|offset| {
+            [mid.checked_sub(offset), Some(mid + offset)]
+                .into_iter()
+                .flatten()
+                .find(|&idx| idx < chars.len() && BOUNDARIES.contains(&chars[idx]))
+        })
+        // Include one trailing boundary run (e.g. `. `) in the left half.
+        .map(|mut idx| {
+            while idx + 1 < chars.len() && BOUNDARIES.contains(&chars[idx + 1]) {
+                idx += 1;
+            }
+            idx
+        })?;
+    let left: String = chars[..=boundary].iter().collect();
+    let right: String = chars[boundary + 1..].iter().collect();
+    if left.trim().is_empty() || right.trim().is_empty() {
+        return None;
+    }
+    Some((left, right))
+}
+
+/// Truncate `s` to at most `n` bytes for an error message, never slicing
+/// through a multi-byte code point (which would panic — common with CJK
+/// content, where byte index `n` routinely lands mid-character). Appends `…`
+/// when truncated. Floors `n` back to the nearest char boundary.
+/// Translate a batch of segments (subtitle cues, prose lines) into
+/// `target_lang`, returning one `Option<String>` per segment, aligned by
+/// position (`Some` = translated; `None` = the model skipped/failed it and the
+/// engine keeps the original). `context` carries a few preceding cues as
+/// read-only narrative context (not translated, not counted).
+///
+/// If the whole batch's prompt is too long for the model's context window (a
+/// 25-line prose batch can run to several thousand tokens — see the `max_tokens`
+/// note on `ChatReq`), the batch is split in half and each side translated
+/// separately; see [`translate_split`]. Retries, partial results, and the
+/// fatal-4xx rule live in [`translate_one_batch`].
+pub async fn translate_batch(
+    client: &reqwest::Client,
+    endpoint: &str,
+    model: &str,
+    cues: &[&str],
+    context: &[&str],
+    target_lang: &str,
+) -> Vec<Option<String>> {
+    translate_batch_using(
+        &ChatClient::Http(client),
+        endpoint,
+        model,
+        cues,
+        context,
+        target_lang,
+    )
+    .await
+}
+
+pub(crate) async fn translate_batch_using(
+    client: &ChatClient<'_>,
+    endpoint: &str,
+    model: &str,
+    cues: &[&str],
+    context: &[&str],
+    target_lang: &str,
+) -> Vec<Option<String>> {
+    translate_split(client, endpoint, model, cues, context, target_lang).await
+}
+
+/// Translate a slice of cues, halving it whenever the batch comes back missing
+/// ≥2 cues. Two failure modes trigger a split, both cured by smaller batches:
+/// the prompt overflowing the context window (input too long — every cue lost),
+/// or the model's output being truncated before every `<cN>` tag closes (it then
+/// drops the trailing cues). A single missing cue is left as-is — that's the
+/// by-design "one bad cue costs only itself" case, not worth a split. Each half
+/// is a fresh tagged batch with its own `<c1>…` numbering; the results are
+/// concatenated in order, so the caller's positional alignment (`trs[idx]` ↔
+/// cue `idx`) is preserved.
+///
+/// A lone oversized or truncated cue falls back to the bounded single-text
+/// splitter. Failed recovery leaves that cue untranslated.
+async fn translate_split(
+    client: &ChatClient<'_>,
+    endpoint: &str,
+    model: &str,
+    cues: &[&str],
+    context: &[&str],
+    target_lang: &str,
+) -> Vec<Option<String>> {
+    let SliceOutcome {
+        translations,
+        overflow,
+    } = translate_one_batch(client, endpoint, model, cues, context, target_lang).await;
+    let missing = cues.len() - translations.iter().filter(|t| t.is_some()).count();
+    if missing >= 2 && cues.len() > 1 {
+        // The batch came back missing ≥2 cues. Two causes, both fixed by halving
+        // the slice so each side has more room: either the prompt overflowed the
+        // context window (`overflow` — input too long, every cue lost), or the
+        // model's output was truncated before every `<cN>` tag closed and it
+        // dropped the trailing cues. (A single missing cue is left as-is — that's
+        // the by-design "one bad cue costs only itself" case, not worth a split.)
+        // Each half is a fresh tagged batch with its own `<c1>…` numbering and
+        // reuses the same read-only `context` (the right half sees slightly older
+        // narrative, fine for fluency).
+        let mid = cues.len() / 2;
+        let (left, right) = cues.split_at(mid);
+        // `Box::pin` the recursive calls: a recursive `async fn`'s future would
+        // otherwise be infinitely sized (its size nests its own recursive
+        // future). Boxing makes it an opaque heap pointer.
+        let mut out = Box::pin(translate_split(
+            client,
+            endpoint,
+            model,
+            left,
+            context,
+            target_lang,
+        ))
+        .await;
+        out.extend(
+            Box::pin(translate_split(
+                client,
+                endpoint,
+                model,
+                right,
+                context,
+                target_lang,
+            ))
+            .await,
+        );
+        out
+    } else if overflow && cues.len() == 1 {
+        // Recover a single oversized/truncated cue using the bounded text
+        // splitter. Never accept a partial tagged response as a translation.
+        vec![
+            translate_using(client, endpoint, model, cues[0], target_lang)
+                .await
+                .ok(),
+        ]
+    } else {
+        // Complete, or ≤1 cue missing (a degenerate cue the model refused — kept
+        // original; already warned by `translate_one_batch` if it dropped all).
+        translations
+    }
+}
+
+/// One attempt's worth of translations for a fixed cue slice, plus whether the
+/// prompt was too long for the model's context window (recoverable by
+/// [`translate_split`] halving the slice).
+struct SliceOutcome {
+    translations: Vec<Option<String>>,
+    /// The input overflowed the context window or the output was truncated;
+    /// the caller should retry smaller pieces.
+    overflow: bool,
+}
+
+/// Retry budget shared by the Single and Batch paths (4 attempts total).
+const MAX_ATTEMPTS: u32 = 4;
+
+/// Ceiling for any single backoff (including a server-supplied `Retry-After`)
+/// so a bogus header can't stall a worker slot for minutes.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Server delay is a floor within our explicit 30-second worker-slot budget.
+/// Apply this policy after library jitter, so jitter cannot shorten Retry-After
+/// or exceed the final cap. Long server delays are intentionally capped.
+fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    use backon::BackoffBuilder;
+    let delay = backon::ExponentialBuilder::default()
+        .with_min_delay(Duration::from_secs(1))
+        .with_max_delay(MAX_BACKOFF)
+        .with_jitter()
+        .with_max_times(MAX_ATTEMPTS as usize)
+        .build()
+        .nth(attempt.saturating_sub(1) as usize)
+        .unwrap_or(MAX_BACKOFF);
+    delay.max(retry_after.unwrap_or_default()).min(MAX_BACKOFF)
+}
+
+async fn backoff(attempt: u32, retry_after: Option<Duration>) {
+    tokio::time::sleep(retry_delay(attempt, retry_after)).await;
+}
+
+/// Send one cue slice as a tagged batch, retrying transient failures and
+/// keeping the attempt that translated the most cues (so a flaky batch still
+/// yields what it could). Never aborts on a partial result — a degenerate cue
+/// the model refuses costs only itself, not its batch-mates. A fatal 4xx (except
+/// 429) stops early. Sets `overflow` on a context-length-overflow 4xx so
+/// [`translate_split`] can react by splitting; never warns on overflow (the
+/// caller handles it).
+async fn translate_one_batch(
+    client: &ChatClient<'_>,
+    endpoint: &str,
+    model: &str,
+    cues: &[&str],
+    context: &[&str],
+    target_lang: &str,
+) -> SliceOutcome {
+    let prompt = client.batch_prompt(cues, context, target_lang);
+    let body = ChatReq::translation(model, prompt);
+
+    let url = crate::model_api::chat_url(endpoint);
+
+    let mut best: Vec<Option<String>> = (0..cues.len()).map(|_| None).collect();
+    let mut best_count = 0;
+    let mut last_err = String::new();
+    let mut retry_after = None;
+    let mut overflow = false;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            backoff(attempt, retry_after).await;
+        }
+        match client.post(&url, &body).await {
+            ChatAttempt::Success(content) => {
+                let parsed = parse_tagged(&content, cues.len());
+                let count = parsed.iter().filter(|x| x.is_some()).count();
+                if count > best_count {
+                    best_count = count;
+                    best = parsed;
+                }
+                if best_count == cues.len() {
+                    break; // perfect — stop retrying
+                }
+            }
+            ChatAttempt::Transient {
+                error,
+                retry_after: server,
+            } => {
+                last_err = error;
+                retry_after = server;
+            }
+            ChatAttempt::Fatal {
+                error,
+                overflow: is_overflow,
+            } => {
+                // A context-length overflow is recoverable by the caller
+                // splitting the batch, so flag it rather than giving up.
+                if is_overflow {
+                    overflow = true;
+                }
+                last_err = error;
+                break;
+            }
+        }
+    }
+    // Warn only for a genuinely dead slice (non-overflow fatal 4xx, or transient
+    // failures that never parsed). Overflow is handled by `translate_split`, so
+    // stay quiet here and let it split.
+    if best_count == 0 && !overflow {
+        tracing::warn!(
+            cues = cues.len(),
+            error = %last_err,
+            "batch produced no translations"
+        );
+    }
+    SliceOutcome {
+        translations: best,
+        overflow,
+    }
+}
+
+/// Build a delimiter-tagged prompt for a subtitle batch.
+///
+/// Wrap each segment in a unique tag so output can be aligned and retried.
+///
+/// Up to `context` preceding cues ride along as an untagged `Context:` section
+/// for fluency (not translated, not parsed).
+fn build_batch_prompt(cues: &[&str], context: &[&str], target: &str) -> String {
+    let mut out = format!(
+        "Please accurately translate the following text into {tgt}. You must \
+         retain the exact same number of <cN></cN> delimiters in the \
+         translation, in the same order. Strictly do not omit, escape, or \
+         translate these delimiters. Translate only the text between them; do \
+         not merge, split, add, or skip any.\n\n",
+        tgt = target
+    );
+    if !context.is_empty() {
+        out.push_str(
+            "The lines below under 'Context' are for context only — do NOT \
+             translate or wrap them in tags:\n\nContext:\n",
+        );
+        out.push_str(&context.join("\n"));
+        out.push_str("\n\n");
+    }
+    // Sanitize each cue for the model only (the document keeps the original):
+    // ASR often emits absurd repetition (e.g. 177× `あ` from a held vowel) that
+    // sends the model into a non-terminating loop. See [`sanitize_for_model`].
+    let items: Vec<String> = cues
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("<c{i}>{c}</c{i}>", i = i + 1, c = sanitize_for_model(c)))
+        .collect();
+    out.push_str(&items.join("\n"));
+    out
+}
+
+/// Collapse any run of more than `CAP` identical characters down to `CAP`.
+///
+/// ASR artifacts — a sustained vowel transcribed as 100+ copies of one char,
+/// or a stutter jam — make the model loop on the same token without emitting EOS
+/// (a 177×`あ` cue ran the decoder to the `max_tokens` cap, ~106s, before it
+/// stopped). Trimming the run keeps the cue meaningful (a drawn-out sound stays
+/// drawn-out, just bounded) and the model terminates normally. Applied only to
+/// the text sent to the model; the source file is written back verbatim.
+fn sanitize_for_model(s: &str) -> String {
+    const CAP: usize = 8;
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        let mut run = 1;
+        while run < CAP && chars.peek() == Some(&c) {
+            out.push(chars.next().unwrap());
+            run += 1;
+        }
+        // Drop the rest of the run (if any).
+        while chars.peek() == Some(&c) {
+            chars.next();
+        }
+    }
+    out
+}
+
+/// Parse a `<cN>…</cN>`-tagged response into up to `count` aligned
+/// translations, keyed by `N`.
+///
+/// Scans for each `<c<N>>` opener and its matching `</c<N>>` closer; the text
+/// between (outer whitespace trimmed, internal newlines preserved) is the
+/// translation of cue `N`. Returns a `Vec<Option<String>>` of length `count`:
+/// `Some` where cue `N`'s translation was found, `None` where the model skipped
+/// or dropped it. Mapping by number (not position) means a skipped cue only
+/// ever costs itself — its neighbors still land in the right place — so the
+/// caller can translate what the model returned and leave the rest original.
+/// That preserves the one-to-one correspondence (every cue is emitted, in
+/// order; nothing merged or split) without one degenerate cue sinking its whole
+/// batch. Spurious tags outside `1..=count` are ignored.
+pub(crate) fn parse_tagged(resp: &str, count: usize) -> Vec<Option<String>> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<u32, String> = BTreeMap::new();
+    let mut rest = resp;
+    while let Some(open) = rest.find("<c") {
+        let after = &rest[open + 2..];
+        let dend = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
+        if dend == 0 {
+            // `<c` not followed by digits — not one of our tags; skip past.
+            rest = after;
+            continue;
+        }
+        let Ok(n) = after[..dend].parse::<u32>() else {
+            rest = after;
+            continue;
+        };
+        let after_digits = &after[dend..];
+        if !after_digits.starts_with('>') {
+            rest = after_digits;
+            continue;
+        }
+        let content = &after_digits[1..]; // after '>'
+        let close = format!("</c{}>", n);
+        match content.find(&close) {
+            Some(end) => {
+                let text = content[..end].trim();
+                if !text.is_empty() {
+                    map.entry(n).or_insert(text.to_string());
+                }
+                rest = &content[end + close.len()..];
+            }
+            None => rest = content, // opener with no closer: skip it
+        }
+    }
+    (1..=count as u32).map(|n| map.get(&n).cloned()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_tagged_translations_remain_missing() {
+        assert_eq!(
+            parse_tagged("<c1>  </c1><c2>translated</c2>", 2),
+            vec![None, Some("translated".into())]
+        );
+        assert_eq!(
+            parse_tagged("<c1></c1><c1>recovered</c1>", 1),
+            vec![Some("recovered".into())]
+        );
+    }
+
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn truncated_single_and_batch_are_retranslated_in_smaller_pieces() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let prompt = body["messages"][0]["content"].as_str().unwrap();
+                    let tagged = prompt.contains("<c1>");
+                    let truncated = prompt.len() > 600 || prompt.contains("<c2>");
+                    let content = if truncated { "BAD PARTIAL" } else if tagged { "<c1>complete</c1>" } else { "complete" };
+                    axum::Json(serde_json::json!({"choices": [{"finish_reason": if truncated { "length" } else { "stop" }, "message": {"content": content}}]}))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let result = translate(&client, &endpoint, "model", &"word ".repeat(150), "en")
+            .await
+            .unwrap();
+        assert!(!result.contains("BAD"));
+        assert!(result.contains("complete complete"));
+        assert_eq!(
+            translate_batch(&client, &endpoint, "model", &["one", "two"], &[], "en").await,
+            vec![Some("complete".into()), Some("complete".into())]
+        );
+        assert!(calls.load(std::sync::atomic::Ordering::Relaxed) >= 6);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_response_is_retried_instead_of_returned_as_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move || {
+            let seen = seen.clone();
+            async move {
+                let content = if seen.fetch_add(1, Ordering::Relaxed) == 0 { " " } else { "complete" };
+                axum::Json(serde_json::json!({"choices": [{"finish_reason": "stop", "message": {"content": content}}]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert_eq!(
+            translate(&reqwest::Client::new(), &endpoint, "model", "hello", "en")
+                .await
+                .unwrap(),
+            "complete"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
+
+    #[test]
+    fn parse_tagged_perfect_alignment() {
+        let resp = "<c1>你好</c1>\n<c2>世界</c2>\n<c3>再见</c3>";
+        let trs = parse_tagged(resp, 3);
+        assert_eq!(
+            trs,
+            vec![
+                Some("你好".into()),
+                Some("世界".into()),
+                Some("再见".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_tagged_preserves_multiline_cues() {
+        let resp = "<c1>第一行\n第二行</c1>\n<c2>世界</c2>";
+        let trs = parse_tagged(resp, 2);
+        assert_eq!(
+            trs,
+            vec![Some("第一行\n第二行".into()), Some("世界".into())]
+        );
+    }
+
+    #[test]
+    fn parse_tagged_maps_by_number_not_position() {
+        // Out-of-order tags still map to the right cue (keyed by N).
+        let resp = "<c2>世界</c2>\n<c1>你好</c1>";
+        let trs = parse_tagged(resp, 2);
+        assert_eq!(trs, vec![Some("你好".into()), Some("世界".into())]);
+    }
+
+    #[test]
+    fn parse_tagged_recovers_partial_when_one_skipped() {
+        // The model dropped cue 2: cue 1 and 3 still map correctly, cue 2 is
+        // None (kept original by the caller). One bad cue costs only itself.
+        let resp = "<c1>你好</c1>\n<c3>再见</c3>";
+        let trs = parse_tagged(resp, 3);
+        assert_eq!(trs, vec![Some("你好".into()), None, Some("再见".into())]);
+    }
+
+    #[test]
+    fn parse_tagged_ignores_spurious_extra_tag() {
+        // A spurious c4 (outside 1..=count) is ignored, not a hard failure.
+        let resp = "<c1>你好</c1>\n<c2>世界</c2>\n<c3>再见</c3>\n<c4>多余</c4>";
+        let trs = parse_tagged(resp, 3);
+        assert_eq!(
+            trs,
+            vec![
+                Some("你好".into()),
+                Some("世界".into()),
+                Some("再见".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_tagged_shifted_keys_yield_partial() {
+        // Keys 2..=4 (none for cue 1): cue 1 is None, 2 and 3 land.
+        let resp = "<c2>你好</c2>\n<c3>世界</c3>\n<c4>再见</c4>";
+        let trs = parse_tagged(resp, 3);
+        assert_eq!(trs, vec![None, Some("你好".into()), Some("世界".into())]);
+    }
+
+    #[test]
+    fn parse_tagged_ignores_untagged_context() {
+        // Un-tagged lines (a Context section, prose, anything) must not leak in.
+        let resp = "Context:\nFoo\nBar\n\n<c1>你好</c1>\n<c2>世界</c2>";
+        let trs = parse_tagged(resp, 2);
+        assert_eq!(trs, vec![Some("你好".into()), Some("世界".into())]);
+    }
+
+    #[test]
+    fn parse_tagged_handles_double_digit_tags() {
+        // `</c1>` is not a substring of `</c10>`, so a 10-cue response parses
+        // without cue 1 bleeding into cue 10's region.
+        let items: Vec<String> = (1..=10)
+            .map(|i| format!("<c{i}>t{i}</c{i}>", i = i))
+            .collect();
+        let resp = items.join("\n");
+        let trs = parse_tagged(&resp, 10);
+        assert_eq!(trs.len(), 10);
+        assert_eq!(trs[0], Some("t1".into()));
+        assert_eq!(trs[9], Some("t10".into()));
+    }
+
+    #[test]
+    fn build_batch_prompt_wraps_each_cue_in_unique_tag() {
+        let p = build_batch_prompt(&["a", "b"], &["ctx1", "ctx2"], "中文");
+        // Official Delimiters instruction present.
+        assert!(p.contains("retain the exact same number of <cN></cN> delimiters"));
+        // Context block present and un-tagged.
+        assert!(p.contains("Context:\nctx1\nctx2"));
+        // Each cue wrapped in its own numbered tag, one per line.
+        assert!(p.contains("<c1>a</c1>"));
+        assert!(p.contains("<c2>b</c2>"));
+        // Context lines are NOT tagged.
+        assert!(!p.contains("<c0>"));
+    }
+
+    #[test]
+    fn build_batch_prompt_omits_context_section_when_empty() {
+        let p = build_batch_prompt(&["a"], &[], "中文");
+        assert!(!p.contains("Context:"));
+        assert!(p.contains("<c1>a</c1>"));
+    }
+
+    #[test]
+    fn sanitize_collapses_long_runs_keeps_short_ones() {
+        // A 177×`あ` ASR jam collapses to the cap; a normal line is untouched.
+        assert_eq!(sanitize_for_model(&"あ".repeat(177)), "あ".repeat(8));
+        assert_eq!(sanitize_for_model("あああ"), "あああ");
+        assert_eq!(sanitize_for_model("hello world"), "hello world");
+        // Runs of different chars are independent.
+        assert_eq!(sanitize_for_model("あああいいい"), "あああいいい");
+        assert_eq!(
+            sanitize_for_model(&format!("{}{}", "あ".repeat(50), "い".repeat(50))),
+            format!("{}{}", "あ".repeat(8), "い".repeat(8))
+        );
+        // Punctuation runs (ellipses) past the cap also collapse.
+        assert_eq!(sanitize_for_model(&".".repeat(20)), ".".repeat(8));
+    }
+
+    #[test]
+    fn split_at_language_boundary_cuts_between_words() {
+        // Midpoint falls inside "middle"; the nearest whitespace wins, and
+        // the boundary char (and any trailing run) stays with the left half.
+        let text = "aaaa bbbb cccc dddd";
+        let (left, right) = split_at_language_boundary(text).unwrap();
+        assert_eq!((left.as_str(), right.as_str()), ("aaaa bbbb ", "cccc dddd"));
+
+        // CJK sentence punctuation is a boundary too.
+        let cjk = "第一句很长。第二句也很长。";
+        let (left, right) = split_at_language_boundary(cjk).unwrap();
+        assert!(left.ends_with('。'));
+        assert!(!right.starts_with('。'));
+
+        // Concatenating the halves reproduces the input exactly.
+        assert_eq!(format!("{left}{right}"), cjk);
+    }
+
+    #[test]
+    fn split_at_language_boundary_rejects_unbroken_runs() {
+        assert!(split_at_language_boundary(&"あ".repeat(500)).is_none());
+        // A boundary that would leave one side empty is rejected too.
+        assert!(
+            split_at_language_boundary("   content").is_none() || {
+                let (l, r) = split_at_language_boundary("   content").unwrap();
+                !l.trim().is_empty() && !r.trim().is_empty()
+            }
+        );
+    }
+
+    /// A Single segment longer than the context window is split in half and
+    /// each half translated, instead of being dropped (the batch path's
+    /// overflow recovery, applied to Independent segments).
+    #[tokio::test]
+    async fn single_translates_overflowing_segments_by_halving() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let handler_requests = requests.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    let content_len = body["messages"][0]["content"].as_str().unwrap().len();
+                    handler_requests.lock().unwrap().push(content_len);
+                    if content_len > 600 {
+                        // vLLM's context-length overflow 400.
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({
+                                "error": {"message":
+                                    "This model's maximum context length is 4096 tokens. However, you requested 0 output tokens and your prompt contains at least 4097 input tokens. Please reduce the length of the input prompt."}
+                            })),
+                        )
+                            .into_response();
+                    }
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"content": format!("tr({content_len})")}}]
+                    }))
+                    .into_response()
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let long = "word ".repeat(100);
+        let result = translate(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            "model",
+            &long,
+            "中文",
+        )
+        .await
+        .unwrap();
+        // The halves came back as two translations joined together.
+        assert!(result.starts_with("tr(") && result.contains(") tr("));
+
+        let requests = requests.lock().unwrap();
+        assert!(requests[0] > 600, "first request should be the long prompt");
+        assert!(
+            requests.iter().skip(1).all(|len| *len <= 600),
+            "every follow-up request should be a half: {requests:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod retry_policy_tests {
+    use super::*;
+    #[test]
+    fn server_floor_and_final_cap_survive_jitter() {
+        for attempt in 1..20 {
+            for _ in 0..100 {
+                let delay = retry_delay(attempt, Some(Duration::from_secs(10)));
+                assert!((Duration::from_secs(10)..=MAX_BACKOFF).contains(&delay));
+                assert_eq!(
+                    retry_delay(attempt, Some(Duration::from_secs(120))),
+                    MAX_BACKOFF
+                );
+            }
+        }
+    }
+}

@@ -44,12 +44,7 @@ export function useSubmission(
     acknowledged: false,
     preview: null as Preview | null,
   });
-  const locked = computed(() => s.stage !== "editing"),
-    hasDocx = computed(
-      () =>
-        s.sourceMode === "upload" &&
-        s.files.some((f) => f.name.toLowerCase().endsWith(".docx")),
-    );
+  const locked = computed(() => s.stage !== "editing");
   const client = useQueryClient();
   const previewKey = ["submission-preview", useId()];
   const config = useQuery({
@@ -121,7 +116,6 @@ export function useSubmission(
         s.files.push(file);
     }
     s.validation = errors.join("；");
-    if (hasDocx.value) s.mode = "bilingual";
   }
   function request(): RequestData {
     const save =
@@ -134,7 +128,7 @@ export function useSubmission(
         : {}),
       model_id: s.model_id,
       target: s.target.trim(),
-      mode: hasDocx.value ? "bilingual" : s.mode,
+      mode: s.mode,
       settings: {
         batch_size: s.batch,
         context_segments: s.context,
@@ -390,5 +384,5 @@ export function useSubmission(
     void client.cancelQueries({ queryKey: previewKey });
     cancel();
   });
-  return { s, locked, hasDocx, add, preview, edit, submit, cancel, summary };
+  return { s, locked, add, preview, edit, submit, cancel, summary };
 }

@@ -736,23 +736,16 @@ dependencies = [
  "pulldown-cmark",
  "reqwest",
  "roxmltree",
- "rusqlite",
- "rustix",
  "rustybuzz",
- "safetensors",
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "strip-ansi-escapes",
  "subsetter",
  "subtle",
  "tempfile",
  "tokio",
- "tokio-rusqlite",
  "tokio-util",
- "tower-http 0.7.1",
  "tracing",
- "tracing-subscriber",
  "ts-rs",
  "ttf-parser",
  "unicode-bidi",
@@ -762,6 +755,78 @@ dependencies = [
  "uuid",
  "walkdir",
  "zip",
+]
+
+[[package]]
+name = "ferryman-agent"
+version = "0.4.2"
+dependencies = [
+ "anyhow",
+ "axum",
+ "ferryman",
+ "futures",
+ "hex",
+ "reqwest",
+ "rustix",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "strip-ansi-escapes",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+ "ts-rs",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "ferryman-cli"
+version = "0.4.2"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "ferryman",
+ "lopdf",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing-subscriber",
+ "zip",
+]
+
+[[package]]
+name = "ferryman-web"
+version = "0.4.2"
+dependencies = [
+ "anyhow",
+ "axum",
+ "ferryman",
+ "futures",
+ "hex",
+ "percent-encoding",
+ "reqwest",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "tokio",
+ "tokio-rusqlite",
+ "tokio-util",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+ "ts-rs",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]

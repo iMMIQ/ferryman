@@ -15,7 +15,7 @@ const props = defineProps<{
 }>();
 defineEmits<{ "manage-models": [] }>();
 const submission = useSubmission(props.completed);
-const { s, locked, hasDocx, summary } = submission;
+const { s, locked, summary } = submission;
 const pickerOpen = ref(false),
   pickerPurpose = ref<"source" | "save">("source"),
   fileInput = ref<HTMLInputElement>(),
@@ -23,7 +23,6 @@ const pickerOpen = ref(false),
 watch(
   () => s.sourceMode,
   () => {
-    if (hasDocx.value) s.mode = "bilingual";
     s.validation = "";
   },
 );
@@ -265,13 +264,9 @@ defineExpose({ chooseFile });
               {
                 value: 'replace',
                 label: '仅译文',
-                disabled: hasDocx,
               },
             ]"
           />
-          <p v-if="hasDocx" id="mode-hint" class="helper-text">
-            DOCX 仅支持双语对照
-          </p>
 
           <SegmentedControl
             v-if="s.sourceMode === 'mounted'"

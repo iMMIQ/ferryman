@@ -9,6 +9,8 @@ try {
     [
       "test",
       "--locked",
+      "-p",
+      "ferryman-web",
       "--all-targets",
       "export_frontend_types",
       "--",

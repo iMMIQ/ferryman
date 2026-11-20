@@ -1,0 +1,500 @@
+//! Job execution: model lease heartbeat, translation pipeline, and saving
+//! results back into user storage.
+
+use super::{mutate_job, AppState, JobEntry, JobStatus};
+use anyhow::{Context, Result};
+use ferryman::batch::{run_batch_controlled, BatchOpts, BatchProgress, ProgressCallback};
+use ferryman::cache::Cache;
+use ferryman::engine::Engine;
+
+use std::path::{Component, Path as FsPath, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::sync::watch;
+#[cfg(test)]
+use uuid::Uuid;
+
+async fn ensure_safe_output_parent(root: &FsPath, target: &FsPath) -> Result<PathBuf> {
+    let root = tokio::fs::canonicalize(root).await?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("output path has no parent"))?;
+    let relative = parent
+        .strip_prefix(&root)
+        .context("output path escapes the user directory")?;
+    let mut current = root.clone();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            anyhow::bail!("invalid output directory");
+        };
+        let next = current.join(part);
+        match tokio::fs::symlink_metadata(&next).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!("output directory contains a symbolic link")
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => anyhow::bail!("output parent is not a directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match tokio::fs::create_dir(&next).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let metadata = tokio::fs::symlink_metadata(&next).await?;
+                        anyhow::ensure!(
+                            metadata.is_dir() && !metadata.file_type().is_symlink(),
+                            "output parent is not a safe directory"
+                        );
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        current = tokio::fs::canonicalize(&next).await?;
+        if !current.starts_with(&root) {
+            anyhow::bail!("output directory escapes the user directory");
+        }
+    }
+    Ok(current)
+}
+
+async fn save_job_result(entry: &JobEntry) -> Result<()> {
+    let (Some(target), Some(root)) = (&entry.save_to, &entry.save_root) else {
+        return Ok(());
+    };
+    let parent = ensure_safe_output_parent(root, target).await?;
+    let filename = target
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("output path has no filename"))?;
+    let target = parent.join(filename);
+    let retry_base = entry.dir.join("retry-save-base");
+    let retry_replace = tokio::fs::try_exists(&retry_base).await?;
+    if retry_replace {
+        let metadata = tokio::fs::symlink_metadata(&target).await?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "retry target is not a regular file"
+        );
+        if files_are_identical(&entry.output, &target).await? {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            files_are_identical(&retry_base, &target).await?,
+            "保存位置在补译期间被修改，结果已保留在任务内，请下载后另存"
+        );
+    }
+    let overwrite = entry.overwrite || retry_replace;
+    match tokio::fs::symlink_metadata(&target).await {
+        Ok(metadata) if overwrite && metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) if overwrite => anyhow::bail!("overwrite target is not a regular file"),
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            if files_are_identical(&entry.output, &target).await? {
+                return Ok(());
+            }
+            anyhow::bail!("output file already exists")
+        }
+        Ok(_) => anyhow::bail!("output file already exists"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !overwrite => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("overwrite target no longer exists")
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let temporary = tokio::task::spawn_blocking(move || {
+        let mut builder = tempfile::Builder::new();
+        // User-visible outputs retain the previous create(0666 & umask) policy.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o666));
+        }
+        builder.tempfile_in(parent)
+    })
+    .await??;
+    let (file, temporary) = temporary.into_parts();
+    let copy_result = async {
+        let mut source = tokio::fs::File::open(&entry.output).await?;
+        let mut destination = tokio::fs::File::from_std(file);
+        tokio::io::copy(&mut source, &mut destination).await?;
+        destination.sync_all().await?;
+        drop(destination);
+        if retry_replace {
+            anyhow::ensure!(
+                files_are_identical(&retry_base, &target).await?,
+                "保存位置在补译期间被修改，结果已保留在任务内，请下载后另存"
+            );
+        }
+        let destination = target.clone();
+        tokio::task::spawn_blocking(move || {
+            if overwrite {
+                temporary.persist(destination)
+            } else {
+                temporary.persist_noclobber(destination)
+            }
+        })
+        .await??;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    copy_result.with_context(|| format!("save result to {}", target.display()))
+}
+
+pub(crate) async fn files_are_identical(left: &FsPath, right: &FsPath) -> Result<bool> {
+    let left_metadata = tokio::fs::metadata(left).await?;
+    let right_metadata = tokio::fs::metadata(right).await?;
+    if left_metadata.len() != right_metadata.len() {
+        return Ok(false);
+    }
+    let mut left = tokio::fs::File::open(left).await?;
+    let mut right = tokio::fs::File::open(right).await?;
+    let mut left_buffer = vec![0_u8; 64 * 1024];
+    let mut right_buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let left_read = left.read(&mut left_buffer).await?;
+        let right_read = right.read(&mut right_buffer).await?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+pub(crate) async fn run_job(state: &AppState, entry: JobEntry) -> Result<()> {
+    use tracing::Instrument;
+    let id = entry.record.id;
+    let span = tracing::info_span!("job", %id, owner = %entry.owner);
+    run_job_inner(state, entry).instrument(span).await
+}
+
+async fn run_job_inner(state: &AppState, entry: JobEntry) -> Result<()> {
+    let id = entry.record.id;
+    let cancel = state
+        .cancellations
+        .lock()
+        .await
+        .entry(id)
+        .or_default()
+        .clone();
+    if state
+        .active_jobs
+        .read()
+        .await
+        .get(&id)
+        .is_none_or(|entry| entry.record.status != JobStatus::StartingModel)
+    {
+        state.cancellations.lock().await.remove(&id);
+        return Ok(());
+    }
+
+    let result = async {
+        let mut target = entry
+            .record
+            .model
+            .clone()
+            .context("此任务来自旧的自部署版本，请配置模型 API 后重新提交文档")?;
+        let key = super::models::credential(state, &entry.owner, &target).await?;
+        target.concurrency =
+            super::models::request_concurrency(state, &entry.owner, &target).await?;
+        let request_limit = state.request_limits.for_model(&target, target.concurrency);
+        let client = state.translation_client.clone();
+        {
+            let _transition = super::lock_job(state, id).await;
+            anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
+            mutate_job(state, id, |job| job.status = JobStatus::Translating).await;
+        }
+
+        let cache_dir = state
+            .config
+            .data_dir
+            .join("users")
+            .join(&entry.owner)
+            .join("cache");
+        let cache = if entry.record.settings.cache_enabled {
+            Cache::open(Some(cache_dir))
+        } else {
+            None
+        };
+        let engine = Engine::new(
+            client,
+            target.base_url.clone(),
+            target.model_id.clone(),
+            entry.record.target.clone(),
+            target.concurrency,
+            cache,
+        )
+        .with_request_limit(request_limit)
+        .with_model_target(target.clone())
+        .with_api_key(Some(key))
+        .with_checkpoint(Cache::open(Some(entry.dir.join("checkpoint"))));
+
+        let (progress_tx, mut progress_rx) = watch::channel(BatchProgress::default());
+        let callback: ProgressCallback = Arc::new(move |progress| {
+            progress_tx.send_replace(progress);
+        });
+        let progress_state = state.clone();
+        let progress_task = tokio::spawn(async move {
+            while progress_rx.changed().await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                let progress = progress_rx.borrow_and_update().clone();
+                mutate_job(&progress_state, id, |job| {
+                    job.total = progress.total;
+                    job.completed = progress.completed;
+                    job.translated = progress.translated;
+                    job.failed_segments = progress.failed;
+                })
+                .await;
+            }
+        });
+        let summary = run_batch_controlled(
+            &engine,
+            vec![entry.input.clone()],
+            BatchOpts {
+                mode: entry.record.mode,
+                in_place: false,
+                output: Some(entry.output.clone()),
+                batch_size: entry.record.settings.batch_size,
+                context: entry.record.settings.context_segments,
+                limit: None,
+                prompt_char_budget: target.prompt_char_budget(),
+            },
+            cancel.clone(),
+            callback,
+        )
+        .await;
+        let _ = progress_task.await;
+
+        let transition = super::lock_job(state, id).await;
+        if cancel.is_cancelled() || summary.cancelled {
+            let result_available = tokio::fs::metadata(&entry.output)
+                .await
+                .is_ok_and(|metadata| metadata.is_file());
+            mutate_job(state, id, |job| {
+                job.status = JobStatus::Cancelled;
+                job.result_available = result_available;
+            })
+            .await;
+        } else if !summary.failed_files.is_empty() {
+            anyhow::bail!("{}", summary.failed_files[0].1);
+        } else {
+            // This durable state is the save commit boundary. Cancellation
+            // after this point is explicitly rejected by the API.
+            mutate_job(state, id, |job| job.status = JobStatus::Writing).await;
+            drop(transition);
+            if entry.save_to.is_some() {
+                save_job_result(&entry).await?;
+            }
+            mutate_job(state, id, |job| {
+                job.status = JobStatus::Completed;
+                job.total = summary.translated + summary.failed;
+                job.completed = job.total;
+                job.translated = summary.translated;
+                job.failed_segments = summary.failed;
+                job.error = None;
+                job.result_available = true;
+            })
+            .await;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    state.cancellations.lock().await.remove(&id);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn concurrent_outputs_share_a_new_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..8 {
+            let root = root_path.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                ensure_safe_output_parent(&root, &root.join(format!("new/nested/{index}.txt")))
+                    .await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert!(result.unwrap().is_ok());
+        }
+    }
+
+    use crate::{now_epoch_seconds, JobRecord, StorageKind};
+    use ferryman::format::OutputMode;
+    use ferryman::preset::Preset;
+    use ferryman::settings::TranslationSettings;
+    use std::env;
+
+    #[tokio::test]
+    async fn safe_output_parent_stays_under_document_root() {
+        let base = env::temp_dir().join(format!("ferryman-path-test-{}", Uuid::new_v4()));
+        let root = base.join("documents");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let target = root.join("Translations/Books/book.bilingual.epub");
+        let parent = ensure_safe_output_parent(&root, &target).await.unwrap();
+        assert!(parent.starts_with(tokio::fs::canonicalize(&root).await.unwrap()));
+        assert!(parent.ends_with("Translations/Books"));
+        tokio::fs::remove_dir_all(&base).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn safe_output_parent_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let base = env::temp_dir().join(format!("ferryman-link-test-{}", Uuid::new_v4()));
+        let root = base.join("documents");
+        let outside = base.join("outside");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        let target = root.join("escape/result.epub");
+        assert!(ensure_safe_output_parent(&root, &target).await.is_err());
+        tokio::fs::remove_dir_all(&base).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_results_are_copied_without_overwriting() {
+        let base = env::temp_dir().join(format!("ferryman-save-test-{}", Uuid::new_v4()));
+        let root = base.join("documents");
+        let job_dir = base.join("job");
+        let output = job_dir.join("result.txt");
+        let target = root.join("Translations/notes.bilingual.txt");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::create_dir_all(&job_dir).await.unwrap();
+        tokio::fs::write(&output, b"translated result")
+            .await
+            .unwrap();
+        let now = now_epoch_seconds();
+        let entry = JobEntry {
+            owner: "test".to_string(),
+            dir: job_dir,
+            input: base.join("input.txt"),
+            output,
+            save_to: Some(target.clone()),
+            save_root: Some(root),
+            overwrite: false,
+            record: JobRecord {
+                id: Uuid::new_v4(),
+                filename: "notes.txt".to_string(),
+                preset: Preset::Index2B,
+                model: None,
+                target: "中文".to_string(),
+                mode: OutputMode::Bilingual,
+                status: JobStatus::Writing,
+                total: 0,
+                completed: 0,
+                translated: 0,
+                failed_segments: 0,
+                error: None,
+                settings: TranslationSettings::default(),
+                result_available: false,
+                source_path: None,
+                source_storage: None,
+                save_path: Some("Translations/notes.bilingual.txt".to_string()),
+                save_storage: Some(StorageKind::Documents),
+                created_at: now,
+                updated_at: now,
+            },
+        };
+        save_job_result(&entry).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(&target).await.unwrap(),
+            b"translated result"
+        );
+        save_job_result(&entry).await.unwrap();
+        // Retrying must retain the saved copy until an improved result exists.
+        crate::jobs_api::prepare_retry_output(&entry).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(&target).await.unwrap(),
+            b"translated result"
+        );
+        tokio::fs::write(&entry.output, b"complete translation")
+            .await
+            .unwrap();
+        save_job_result(&entry).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(&target).await.unwrap(),
+            b"complete translation"
+        );
+        save_job_result(&entry).await.unwrap(); // crash recovery is idempotent
+        crate::jobs_api::prepare_retry_output(&entry).await.unwrap();
+        tokio::fs::write(&target, b"user edit").await.unwrap();
+        assert!(crate::jobs_api::prepare_retry_output(&entry).await.is_err());
+        assert!(save_job_result(&entry).await.is_err());
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"user edit");
+        tokio::fs::remove_dir_all(&base).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_results_atomically_overwrite_regular_files_when_requested() {
+        let base = env::temp_dir().join(format!("ferryman-overwrite-test-{}", Uuid::new_v4()));
+        let root = base.join("documents");
+        let job_dir = base.join("job");
+        let output = job_dir.join("result.txt");
+        let target = root.join("notes.txt");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::create_dir_all(&job_dir).await.unwrap();
+        tokio::fs::write(&target, b"original").await.unwrap();
+        tokio::fs::write(&output, b"translated result")
+            .await
+            .unwrap();
+        let now = now_epoch_seconds();
+        let entry = JobEntry {
+            owner: "test".to_string(),
+            dir: job_dir,
+            input: base.join("input.txt"),
+            output,
+            save_to: Some(target.clone()),
+            save_root: Some(root),
+            overwrite: true,
+            record: JobRecord {
+                id: Uuid::new_v4(),
+                filename: "notes.txt".to_string(),
+                preset: Preset::Index2B,
+                model: None,
+                target: "中文".to_string(),
+                mode: OutputMode::Bilingual,
+                status: JobStatus::Writing,
+                total: 0,
+                completed: 0,
+                translated: 0,
+                failed_segments: 0,
+                error: None,
+                settings: TranslationSettings::default(),
+                result_available: false,
+                source_path: Some("notes.txt".to_string()),
+                source_storage: Some(StorageKind::Documents),
+                save_path: Some("notes.txt".to_string()),
+                save_storage: Some(StorageKind::Documents),
+                created_at: now,
+                updated_at: now,
+            },
+        };
+
+        save_job_result(&entry).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(&target).await.unwrap(),
+            b"translated result"
+        );
+        crate::jobs_api::prepare_retry_output(&entry).await.unwrap();
+        assert!(target.exists());
+        tokio::fs::write(&entry.output, b"retry improved result")
+            .await
+            .unwrap();
+        save_job_result(&entry).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(&target).await.unwrap(),
+            b"retry improved result"
+        );
+        tokio::fs::remove_dir_all(&base).await.unwrap();
+    }
+}
